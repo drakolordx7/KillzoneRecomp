@@ -25,10 +25,10 @@ struct KzvuConfig
 	int clampMode = 0;
 
 	// PCSX2 gamefix IbitHack ("reduces VU recompilation"); Killzone's GameIndex entry enables it. With it, microVU
-	// loads I-bit immediates from micro memory at run time instead of baking them into the code, and leaves the lower
-	// words holding I immediates, and the lower words of IADDI/IADDIU/ISUBIU/ILW/ISW/LQ/SQ, out of the "has this
-	// program changed" comparison. A program that differs only in those words reuses the already-compiled code, which
-	// for the IADDI..SQ group means the OLD immediates keep running (a PCSX2 hack; Killzone is listed as fine with it).
+	// reads the I-bit immediates and the immediates of IADDI/IADDIU/ISUBIU/ILW/ISW/LQ/SQ from micro memory at run
+	// time instead of baking them into the code, and leaves those lower words out of the "has this program changed"
+	// comparison. A program that differs only in those words reuses the compiled code and sees the new immediates.
+	// The catch: a change to the opcode/register fields of such a word is not detected either.
 	bool iBitHack = true;
 
 	// PCSX2 speedhack "mVU flag hack" (on by default in PCSX2): skips status flag updates nobody reads.
