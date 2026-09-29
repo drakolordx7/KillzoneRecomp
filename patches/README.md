@@ -91,3 +91,8 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
     +-max), x/0 = +-max with sign fs xor ft (was Inf for DIV.S and 0 for VDIV), SQRT of |x|. Denormals are flushed
     by the host setting FTZ/DAZ on the game thread (src/kz_main.cpp).
   - `CVT.W.S` rounded to nearest; the EE truncates toward zero and saturates.
+
+- `0011-iop-batched-advance.patch`: `PS2Runtime::advanceIopEeCycles` ran the IOP on every EE checkpoint (nearly every
+  guest call) with a few cycles, paying the fixed per-run cost (SPU2 advance, service checks, thread selection) each
+  time; the IOP was ~50% of the game thread in-game. It now runs in quanta of `PS2X_IOP_BATCH` EE cycles (default
+  4096, ~14 us). Killzone in-game: ~14 -> ~18 frames/s; menu and in-game audio unchanged (WAV capture).
