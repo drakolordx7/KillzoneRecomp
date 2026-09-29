@@ -29,6 +29,20 @@
 #define CpuMicroVU1 kzvu_CpuMicroVU1
 #define vu1branch kzvu_vu1branch
 #define mVUdebugNow kzvu_mVUdebugNow
+#define EmuFolders KzvuEmuFolders
+
+// ---- EE recompiler state referenced by microVU_Macro.inl (COP2 macro mode, never run by kzvu; see KzvuEeRecStubs.cpp)
+#define pc kzvu_pc
+#define x86regs kzvu_x86regs
+#define s_saveX86regs kzvu_s_saveX86regs
+#define xmmregs kzvu_xmmregs
+#define s_saveXMMregs kzvu_s_saveXMMregs
+#define g_pCurInstInfo kzvu_g_pCurInstInfo
+#define g_x86AllocCounter kzvu_g_x86AllocCounter
+#define s_nBlockInterlocked kzvu_s_nBlockInterlocked
+#define g_cpuConstRegs kzvu_g_cpuConstRegs
+#define g_cpuHasConstReg kzvu_g_cpuHasConstReg
+#define g_cpuFlushedConstReg kzvu_g_cpuFlushedConstReg
 
 // ---- host hooks used by the pcsx2/common slice -------------------------------------------------------------------------
 #define Host KzvuHost

@@ -63,8 +63,8 @@ uint8_t* kzvuDataMem();
 constexpr uint32_t kKzvuCodeSize = 0x4000;
 constexpr uint32_t kKzvuDataSize = 0x4000;
 
-// MPG: copies `size` bytes to micro memory at `offset` (bytes, wrapped to 16 KB) and invalidates recompiled code
-// only if the bytes actually changed (PCSX2's VIF MPG does the same compare).
+// MPG: copies `size` bytes to micro memory at `offset` (bytes; a write past the end wraps to 0, like VIF1 MPG) and
+// marks the recompiled program for re-validation, unless the bytes were already identical.
 void kzvuWriteMicro(uint32_t offset, const void* src, uint32_t size);
 // Call after writing kzvuCodeMem() directly. Cheap: it only marks the current program for re-validation; the next
 // kzvuExecute() looks the program up by content among already-compiled programs before compiling anything.

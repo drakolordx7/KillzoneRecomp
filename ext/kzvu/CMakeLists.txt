@@ -73,6 +73,8 @@ target_compile_options(kzvu_flags INTERFACE "$<$<COMPILE_LANGUAGE:CXX>:/FI${KZVU
 add_library(kzvu_common OBJECT
 	${P2}/common/Assertions.cpp
 	${P2}/common/Console.cpp
+	${P2}/common/Error.cpp
+	${P2}/common/FileSystem.cpp
 	${P2}/common/Perf.cpp
 	${P2}/common/StringUtil.cpp
 	${P2}/common/SmallString.cpp
@@ -119,6 +121,7 @@ add_library(kzvu STATIC
 target_link_libraries(kzvu PRIVATE kzvu_flags)
 set_source_files_properties("${KZVU_ROOT}/src/kzvu.cpp" PROPERTIES COMPILE_OPTIONS "/FI${KZVU_ROOT}/shim/include/kzvu_prefix.h")
 target_include_directories(kzvu PUBLIC "${KZVU_ROOT}/include")
+target_link_libraries(kzvu INTERFACE pathcch.lib)
 
 if(KZVU_BUILD_TEST)
 	# PS2Recomp's cycle-accurate VU1Interpreter, compiled into the test only (differential reference + benchmark).
