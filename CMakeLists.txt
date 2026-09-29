@@ -11,6 +11,7 @@ add_subdirectory(ext/PS2Recomp)
 add_subdirectory(ext/kzgs)   # PCSX2 hardware GS as a library (ext/kzgs/README.md)
 add_subdirectory(ext/kzvu)   # PCSX2 microVU (VU1 recompiler) as a library (ext/kzvu/README.md)
 add_subdirectory(ext/kzipu)  # PCSX2 IPU (MPEG decoder) as a library (ext/kzipu/README.md)
+add_subdirectory(ext/kzspu2) # PCSX2 SPU2 (sound) as a library (ext/kzspu2/README.md)
 
 # Generated code lives outside the repo (derived from the game ELF). Point KZ_GENERATED_DIR at it.
 set(KZ_GENERATED_DIR "${CMAKE_SOURCE_DIR}/generated" CACHE PATH "PS2Recomp output for SCUS_974.02")
@@ -30,7 +31,7 @@ add_library(kz_port STATIC
     "${KZ_IMGUI_DIR}/backends/imgui_impl_sdl3.cpp"
     "${KZ_IMGUI_DIR}/backends/imgui_impl_sdlrenderer3.cpp")
 target_include_directories(kz_port PRIVATE "${CMAKE_SOURCE_DIR}/src" "${KZ_IMGUI_DIR}" "${KZ_IMGUI_DIR}/backends")
-target_link_libraries(kz_port PRIVATE ps2_runtime SDL3::SDL3 imgui kzgs kzvu kzipu)
+target_link_libraries(kz_port PRIVATE ps2_runtime SDL3::SDL3 imgui kzgs kzvu kzipu kzspu2)
 target_compile_definitions(kz_port PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 
 add_executable(killzone

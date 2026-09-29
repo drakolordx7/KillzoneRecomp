@@ -24,3 +24,21 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
   parsed. Only the payload of a DIRECT is re-wrapped in a synthesized IMAGE tag when an image is pending. Raw
   continuation is kept only for a DIRECT cut off at the end of a DMA buffer (`m_vif1PendingDirectQwc`). Verified byte
   for byte against real PCSX2's EE RAM through a PINE savestate.
+- `0006-spu2-host-audio.patch`: SPU2 hook for sound (`ps2xIOP/include/ps2x/iop/iop_host_spu2.h`). With a host SPU2
+  installed (`src/kz_audio.cpp` installs kzspu2), the IOP emulator routes these to it:
+  - SPU2 register accesses (0x1F900000-0x1F9007FF; 32-bit accesses are split into 16-bit ones);
+  - IOP DMA ch4/ch7 starts. CHCR.TR stays set until the SPU2 finishes, and MADR reads report its progress;
+  - the host's SPU2 IRQ and DMA-end requests, which become IOP interrupts 9, 0x24 and 0x28.
+
+  `runCycles` advances the SPU2 every time slice. While all threads sleep, it does not skip past the SPU2's next DMA
+  event, or more than 32 samples. Without hooks, the old stub (fake DMA-end interrupt, no sound) is unchanged.
+
+  Two IOP emulator fixes that Killzone's sound needs (independent of the hook):
+  - `sceSifGetOtherData` (sifcmd #23) now copies EE memory into IOP RAM. It was a no-op, and PSOUND_R.IRX pulls
+    every sound bank from EE RAM with it.
+  - `WaitEventFlag` from code that runs outside an IOP thread (module start, RPC server functions) used to return at
+    once. It now advances IOP time to the next pending interrupt, guest callback or SPU2 event until the flag is
+    set, giving up if nothing pending could set it or after 1 s of IOP time.
+    Returning early left libsd's "transfer done" flag set by the later DMA interrupt. The flag was then stale, so
+    the next `sceSdVoiceTransStatus` reported a running upload as finished, and every following `sceSdVoiceTrans`
+    was refused as busy.
