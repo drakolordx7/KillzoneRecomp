@@ -1,0 +1,383 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index e44feef..57e79fb 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -4,6 +4,7 @@
+ #include "../iop_emulator_const.h"
+ 
+ #include <algorithm>
++#include <cstdio>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -40,6 +41,7 @@ namespace ps2x::iop::detail
+         m_nextSemaphoreId = 1;
+         m_nextEventFlagId = 1;
+         m_currentThread = nullptr;
++        m_outsideSemaphoreWait = 0;
+     }
+ 
+     bool IopKernel::dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
+@@ -397,7 +399,16 @@ namespace ps2x::iop::detail
+             }
+             if (it->second.current < it->second.maximum)
+                 ++it->second.current;
+-            wakeOneSemaphore(id);
++            if (m_outsideSemaphoreWait == id)
++            {
++                // An RPC server function / module start routine is blocked on this semaphore (see
++                // setOutsideSemaphoreWait). It stands for the RPC server thread, which outranks the signaller:
++                // keep the count for it and end the signaller's slice so it cannot take the semaphore back first.
++                if (m_currentThread != nullptr && &cpu == &m_currentThread->cpu) // not from an interrupt handler
++                    cpu.yielded = true;
++            }
++            else
++                wakeOneSemaphore(id);
+             setV0(0);
+             return true;
+         }
+@@ -668,6 +679,33 @@ namespace ps2x::iop::detail
+         }
+     }
+ 
++    int IopKernel::semaphoreCount(int id) const
++    {
++        const auto semaphore = m_semaphores.find(id);
++        return semaphore == m_semaphores.end() ? -1 : semaphore->second.current;
++    }
++
++    std::string IopKernel::describeThreads() const
++    {
++        static const char *const kStateNames[] = {"dormant", "ready", "running", "sleep", "delay", "sema", "event", "suspended", "dead"};
++        std::string out;
++        char line[160];
++        for (const IopThread *thread : m_threadList)
++        {
++            const unsigned state = static_cast<unsigned>(thread->state);
++            std::snprintf(line, sizeof(line), " [t%d %s pc=0x%x ra=0x%x wait=%d prio=%u wake=%d]",
++                          thread->id, state < 9u ? kStateNames[state] : "?", thread->cpu.pc, thread->cpu.gpr[31],
++                          thread->waitId, thread->priority, thread->wakeupCount);
++            out += line;
++        }
++        for (const auto &[id, semaphore] : m_semaphores)
++        {
++            std::snprintf(line, sizeof(line), " [s%d %d/%d]", id, semaphore.current, semaphore.maximum);
++            out += line;
++        }
++        return out;
++    }
++
+     void IopKernel::sleepCurrent(IopCpuState &cpu)
+     {
+         if (m_currentThread == nullptr)
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index e1a59bd..17e93e7 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -5,6 +5,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <map>
++#include <string>
+ #include <vector>
+ 
+ namespace ps2x::iop::detail
+@@ -71,6 +72,14 @@ namespace ps2x::iop::detail
+         [[nodiscard]] bool inThread() const noexcept { return m_currentThread != nullptr; }
+         // WaitEventFlag(id, bits, mode) would return now. False for an unknown flag.
+         [[nodiscard]] bool eventFlagSatisfied(int id, uint32_t bits, uint32_t mode) const;
++        // Code running outside any IOP thread (RPC server functions, module start routines) that must wait for a
++        // semaphore: while set, SignalSema(id) keeps the count for that waiter instead of waking a kernel waiter,
++        // and ends the signalling thread's slice. 0 = none.
++        void setOutsideSemaphoreWait(int id) noexcept { m_outsideSemaphoreWait = id; }
++        // Current count of a semaphore, -1 for an unknown id.
++        [[nodiscard]] int semaphoreCount(int id) const;
++        // One line per thread (id, state, pc, wait id, priority); debug aid.
++        [[nodiscard]] std::string describeThreads() const;
+ 
+     private:
+         struct Semaphore
+@@ -107,5 +116,6 @@ namespace ps2x::iop::detail
+         uint32_t m_nextSemaphoreId = 1;
+         uint32_t m_nextEventFlagId = 1;
+         IopThread *m_currentThread = nullptr;
++        int m_outsideSemaphoreWait = 0;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index c4bc946..cc95dfb 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -18,6 +18,9 @@
+ #include "imports/iop_vblank.h"
+ #include "iop_emulator_const.h"
+ #include "ps2x/iop/iop_host_spu2.h"
++#include "iop_trace.h"
++
++#include <cstdio>
+ 
+ #include <algorithm>
+ #include <cctype>
+@@ -354,12 +357,24 @@ namespace ps2x::iop::detail
+ 
+             if (iequals(call.library, "thbase") || iequals(call.library, "threadman"))
+             {
++                if (iopSyncTrace() && (call.ordinal == 24u || call.ordinal == 33u) && !kernel.inThread())
++                    std::fprintf(stderr, "[iop-sync] %s outside a thread, ra=0x%x\n",
++                                 call.ordinal == 24u ? "SleepThread" : "DelayThread", cpu.gpr[31]);
+                 return kernel.dispatchThreadImport(call.ordinal, cpu, totalCycles)
+                            ? ImportDisposition::Handled
+                            : ImportDisposition::Missing;
+             }
+             if (iequals(call.library, "thsemap"))
+             {
++                if ((call.ordinal == 8u || call.ordinal == 9u) && !kernel.inThread())
++                {
++                    if (iopSyncTrace() && kernel.semaphoreCount(static_cast<int>(a0)) == 0)
++                        std::fprintf(stderr, "[iop-sync] %s(%d) outside a thread, count=0, ra=0x%x cycle=%llu%s\n",
++                                     call.ordinal == 8u ? "WaitSema" : "PollSema", static_cast<int>(a0), cpu.gpr[31],
++                                     static_cast<unsigned long long>(totalCycles), kernel.describeThreads().c_str());
++                    if (call.ordinal == 8u)
++                        (void)waitSemaphoreOutsideThread(static_cast<int>(a0));
++                }
+                 return kernel.dispatchSemaphoreImport(call.ordinal, cpu)
+                            ? ImportDisposition::Handled
+                            : ImportDisposition::Missing;
+@@ -641,6 +656,33 @@ namespace ps2x::iop::detail
+             servicingGuestCallbacks = false;
+         }
+ 
++        // PS2X_IOP_SYNC_TRACE: once per IOP second, the thread states and the words listed in PS2X_IOP_WATCH
++        // (comma-separated IOP addresses).
++        uint64_t nextTraceCycle = 0;
++        bool inScheduler = false; // runCycles or an outside-thread wait is running IOP threads
++        void traceHeartbeat()
++        {
++            if (totalCycles < nextTraceCycle)
++                return;
++            nextTraceCycle = totalCycles + kIopClockHz;
++            std::string line = "[iop-sync] cycle=" + std::to_string(totalCycles) + kernel.describeThreads();
++            if (const char *watch = std::getenv("PS2X_IOP_WATCH"))
++            {
++                char item[48];
++                for (const char *p = watch; *p;)
++                {
++                    char *end = nullptr;
++                    const unsigned long address = std::strtoul(p, &end, 0);
++                    if (end == p)
++                        break;
++                    std::snprintf(item, sizeof(item), " %lx=%x", address, memory.read32(static_cast<uint32_t>(address)));
++                    line += item;
++                    p = *end == ',' ? end + 1 : end;
++                }
++            }
++            std::fprintf(stderr, "%s\n", line.c_str());
++        }
++
+         // Earliest IOP cycle at which anything can happen while every thread is idle (thread wake, DMA/callback
+         // completion, timer, SPU2 event or idle-step bound), valid until something external touches the IOP.
+         // runCycles is called on nearly every EE checkpoint with a few cycles; while the IOP sleeps this lets those
+@@ -659,36 +701,14 @@ namespace ps2x::iop::detail
+                 return;
+             }
+             idleUntil = 0;
++            if (iopSyncTrace())
++                traceHeartbeat();
++            const SchedulerGuard guard{inScheduler};
+             try
+             {
+                 const uint64_t target = totalCycles + cycles;
+                 while (totalCycles < target)
+-                {
+-                    advanceSpu2();
+-                    servicePendingDmaInterrupts();
+-                    servicePendingGuestCallbacks();
+-                    timrman.serviceDue(totalCycles, *this);
+-                    IopThread *next = kernel.beginNextReady(totalCycles);
+-                    if (!next)
+-                    {
+-                        uint64_t nextWake = kernel.nextWakeCycle(UINT64_MAX);
+-                        for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
+-                            nextWake = std::min(nextWake, completionCycle);
+-                        if (!pendingGuestCallbacks.empty())
+-                            nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+-                        nextWake = timrman.nextEventCycle(nextWake);
+-                        nextWake = limitIdleSkip(nextWake);
+-                        idleUntil = nextWake > totalCycles ? nextWake : 0;
+-                        totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
+-                        continue;
+-                    }
+-                    idleUntil = 0;
+-                    const uint64_t before = totalCycles;
+-                    runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
+-                    kernel.endTimeslice(*next, kThreadReturnSentinel);
+-                    if (totalCycles == before)
+-                        ++totalCycles;
+-                }
++                    idleUntil = scheduleStep(target);
+                 advanceSpu2();
+             }
+             catch (...)
+@@ -697,6 +717,87 @@ namespace ps2x::iop::detail
+             }
+         }
+ 
++        struct SchedulerGuard
++        {
++            bool &flag;
++            const bool previous;
++            explicit SchedulerGuard(bool &f) : flag(f), previous(f) { flag = true; }
++            ~SchedulerGuard() { flag = previous; }
++        };
++
++        // One scheduler step toward `target`: service due interrupts/callbacks/timers, then run the best ready
++        // thread for a slice or, with every thread idle, advance the clock to the next event (at most `target`).
++        // Returns the idle wake cycle (the idle fast path bound), 0 when a thread ran.
++        uint64_t scheduleStep(uint64_t target)
++        {
++            advanceSpu2();
++            servicePendingDmaInterrupts();
++            servicePendingGuestCallbacks();
++            timrman.serviceDue(totalCycles, *this);
++            IopThread *next = kernel.beginNextReady(totalCycles);
++            if (!next)
++            {
++                uint64_t nextWake = kernel.nextWakeCycle(UINT64_MAX);
++                for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
++                    nextWake = std::min(nextWake, completionCycle);
++                if (!pendingGuestCallbacks.empty())
++                    nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
++                nextWake = timrman.nextEventCycle(nextWake);
++                nextWake = limitIdleSkip(nextWake);
++                const uint64_t idleWake = nextWake > totalCycles ? nextWake : 0;
++                totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
++                return idleWake;
++            }
++            const uint64_t before = totalCycles;
++            runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
++            kernel.endTimeslice(*next, kThreadReturnSentinel);
++            if (totalCycles == before)
++                ++totalCycles;
++            return 0;
++        }
++
++        // RPC server functions and module start routines run synchronously (callFunction), outside any IOP thread.
++        // WaitSema there used to return at once without taking the semaphore, so the caller ran its critical section
++        // while the IOP thread holding the semaphore was preempted inside its own. Killzone's PFILE_R.IRX: the RPC
++        // appends a read request to the streaming queue while the streaming thread is between `head = cur->next`
++        // and `if (head == 0) tail = 0`; the tail is then lost, the next request is never linked, and the EE waits
++        // forever for its completion (boot/loading hang at 0x14A028).
++        // On a real IOP the RPC server thread blocks and the holder runs until SignalSema. Do the same: run the IOP
++        // threads (and due interrupts/timers) until the semaphore is signalled, then take it. Not from an interrupt
++        // handler or guest callback, nor while the scheduler is already running a thread; gives up after 1 s of IOP
++        // time. PS2X_IOP_OUTSIDE_SEMA_WAIT=0 restores the old behaviour.
++        bool waitSemaphoreOutsideThread(int id)
++        {
++            static const bool enabled = []() {
++                const char *v = std::getenv("PS2X_IOP_OUTSIDE_SEMA_WAIT");
++                return !(v && v[0] == '0');
++            }();
++            if (kernel.semaphoreCount(id) != 0)
++                return true; // available, or an unknown id (WaitSema reports it)
++            if (!enabled || inScheduler || servicingDmaInterrupts || servicingGuestCallbacks)
++                return false;
++            const SchedulerGuard guard{inScheduler};
++            const uint64_t start = totalCycles;
++            const uint64_t limit = totalCycles + kIopClockHz;
++            kernel.setOutsideSemaphoreWait(id);
++            try
++            {
++                while (kernel.semaphoreCount(id) == 0 && totalCycles < limit)
++                    (void)scheduleStep(limit);
++            }
++            catch (...)
++            {
++                kernel.setOutsideSemaphoreWait(0);
++                throw;
++            }
++            kernel.setOutsideSemaphoreWait(0);
++            const bool available = kernel.semaphoreCount(id) > 0;
++            if (iopSyncTrace() || !available)
++                std::fprintf(stderr, "[iop-sync] WaitSema(%d) outside a thread waited %llu cycles: %s\n", id,
++                             static_cast<unsigned long long>(totalCycles - start), available ? "taken" : "TIMED OUT");
++            return available;
++        }
++
+         ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
+         {
+             ModuleLoadResult result{true, -1, -1};
+diff --git a/ps2xIOP/src/emulator/iop_trace.h b/ps2xIOP/src/emulator/iop_trace.h
+new file mode 100644
+index 0000000..a4735aa
+--- /dev/null
++++ b/ps2xIOP/src/emulator/iop_trace.h
+@@ -0,0 +1,21 @@
++#pragma once
++
++#include <cstdint>
++#include <cstdlib>
++
++namespace ps2x::iop::detail
++{
++    // PS2X_IOP_SYNC_TRACE (debug aid, stderr): 1 = contended semaphore waits outside a thread plus a once per IOP
++    // second thread/semaphore dump (and PS2X_IOP_WATCH words); 2 = also every RPC request and IOP->EE SIF command.
++    inline int iopSyncTraceLevel() noexcept
++    {
++        static const int level = []()
++        {
++            const char *v = std::getenv("PS2X_IOP_SYNC_TRACE");
++            return v ? std::atoi(v) : 0;
++        }();
++        return level;
++    }
++
++    inline bool iopSyncTrace() noexcept { return iopSyncTraceLevel() > 0; }
++}
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index 8be2a05..a6bbb13 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -4,6 +4,9 @@
+ #include "../core/iop_kernel.h"
+ #include "../core/iop_memory.h"
+ #include "ps2x/iop/iop_host.h"
++#include "../iop_trace.h"
++
++#include <cstdio>
+ 
+ #include <algorithm>
+ #include <array>
+@@ -197,7 +200,15 @@ namespace ps2x::iop::detail
+             std::memcpy(packet.data() + 4u, &extraDestination, sizeof(extraDestination));
+             std::memcpy(packet.data() + 8u, &commandId, sizeof(commandId));
+ 
+-            if (!m_host.sendSifCommand(commandId, packet.data(), packetSize))
++            const bool delivered = m_host.sendSifCommand(commandId, packet.data(), packetSize);
++            if (iopSyncTraceLevel() >= 2)
++            {
++                uint32_t words[4] = {};
++                std::memcpy(words, packet.data() + 16u, std::min<uint32_t>(16u, packetSize - 16u));
++                std::fprintf(stderr, "[iop-sync] SendCmd cid=0x%x delivered=%d data=%08x %08x %08x %08x ra=0x%x\n",
++                             commandId, delivered ? 1 : 0, words[0], words[1], words[2], words[3], cpu.gpr[31]);
++            }
++            if (!delivered)
+             {
+                 // A command without an EE handler is still a completed DMA on  real hardware. Only malformed packets fail above.
+             }
+@@ -298,6 +309,16 @@ namespace ps2x::iop::detail
+             return result;
+ 
+         RpcServer &server = serverIt->second;
++        if (iopSyncTraceLevel() >= 2)
++        {
++            uint32_t words[16] = {};
++            (void)m_host.readGuest(request.send.address, words, std::min<uint32_t>(request.send.size, sizeof(words)));
++            std::fprintf(stderr, "[iop-sync] Rpc sid=0x%x fn=0x%x mode=%u send=%u:", request.sid, request.function,
++                         request.mode, request.send.size);
++            for (uint32_t i = 0; i < std::min<uint32_t>(16u, (request.send.size + 3u) / 4u); ++i)
++                std::fprintf(stderr, " %08x", words[i]);
++            std::fprintf(stderr, "\n");
++        }
+         if (request.send.size != 0u && server.buffer != 0u)
+         {
+             const uint32_t copySize = std::min<uint32_t>(request.send.size, IopMemory::RamSize - std::min(server.buffer, IopMemory::RamSize));

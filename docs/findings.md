@@ -145,3 +145,27 @@ The ELF is stripped, so Sony library functions are identified by `ps2_analyzer`'
   - with the fixes, full scene: 10.7 and 10.3 (two runs)
 - **Boot hang:** with `PS2X_IOP_BATCH` at its default (4096), 2 of 4 boots hung at dma=18. The game thread spins in
   FUN_00149f30 at 0x14a028, waiting for an IOP file read. With `PS2X_IOP_BATCH=1`, 0 of 4 boots hung.
+  Root cause found and fixed 2026-09-29 (patch 0013), see "FilePS2 / PFILE_R.IRX" below; it hangs at batch 1 too.
+
+## FilePS2 / PFILE_R.IRX (2026-09-29)
+- EE side: FUN_00149f30 double-buffers a file into two halves. Each half has a pending-bytes counter, at +0x34 and
+  +0x38 of the stream object. The EE sets a counter to the request size, then sends the request with
+  FUN_0014bc08/0014bd00/0014bdf8: nowait sceSifCallRpc on client 0x55B710, sid 0x66662012, fn 800 (one request) or
+  0x330 (two). The 0x20-byte request is {mode 0x8100000/0x1100000, device, file, offset, size, EE buffer, EE
+  counter address}. The loops at 0x14a028/0x14a1c0 spin until both counters are <= 0.
+- IOP side (PFILE_R.IRX, loaded at 0x10000; offsets below are module offsets):
+  - The RPC server FUN_00002f00 (0x800/0x330 -> FUN_00001c1c) appends a node to the streaming queue: head 0x4094,
+    tail 0x4098, queued counts 0x406C/0x4070. The queue lock is semaphore 0x409C.
+  - The streaming thread FUN_000022a4 (prio 0x33) picks a request (FUN_00001e9c), reads with sceCdRead or ioman,
+    and DMAs the data with sceSifSetDma.
+  - Per 32 KB chunk it reports progress with `sceSifSendCmd(0, {counter, remaining, ...})` (FUN_00002c64). The
+    game's EE cmd-0 handler stores `remaining` into the EE counter, and the final chunk sends 0.
+  - The thread then unlinks the node under the lock.
+- The hang: the emulator runs RPC server functions outside any IOP thread, where `WaitSema` did not block. An append
+  that landed while the streaming thread was preempted between `v0 = cur->next` (0x26C4) and `if (v0 == 0) tail = 0`
+  (0x26D8) was lost. Its completion command was never sent, so the counter stayed positive. Details, evidence and
+  hang counts: patches/README.md, 0013.
+- PSOUND_R.IRX's RPC also waits on a held semaphore from RPC context (seen in traces, ra 0x71260); patch 0013 covers
+  it. From code reading, PFILE_R's close path (FUN_00001278, RPC 0x210) polls with DelayThread while a file has
+  running requests. DelayThread outside a thread still returns at once. In traced boots it ran outside a thread only
+  once per boot, from USBD at start, never from PFILE_R.
