@@ -28,6 +28,7 @@
 #define CpuMicroVU0 kzvu_CpuMicroVU0
 #define CpuMicroVU1 kzvu_CpuMicroVU1
 #define vu1branch kzvu_vu1branch
+#define vu0branch kzvu_vu0branch
 #define mVUdebugNow kzvu_mVUdebugNow
 #define EmuFolders KzvuEmuFolders
 

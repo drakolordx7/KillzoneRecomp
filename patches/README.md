@@ -54,6 +54,18 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
     the next `sceSdVoiceTransStatus` reported a running upload as finished, and every following `sceSdVoiceTrans`
     was refused as busy.
 
+- `0007-vu0-microvu.patch`: VU0 micro mode hook, plus a VCALLMSR fix.
+  - **Host VU0 (`include/runtime/ps2_host_vu0.h`, `ps2SetHostVu0`).** When a host VU0 is installed before
+    `initialize()`, the runtime's VU0 code/data memory is the host's (not freed by the runtime), and
+    `executeVU0Microprogram` (VCALLMS, VCALLMSR) hands the call to it: `callms(ctx, startPc, codeGeneration)` runs
+    the program to completion with the COP2 registers in `ctx` as VU0's register file. Without a hook, or while the
+    runtime's VU0 memory is not the host's, the built-in interpreter runs as before. `src/kz_vu.cpp` installs
+    kzvu's microVU0 (`KZ_VU0=interp` keeps the interpreter).
+  - **VCALLMSR start address.** Generated code computes it from `ctx->vi[27]`, but `vi[]` only holds the 16 integer
+    registers, so that read lands inside `vu0_r`. CTC2 to $vi27 writes `ctx->vu0_cmsar0`, so `vu0StartMicroProgram`
+    (called only for VCALLMSR) now starts at `(vu0_cmsar0 & 0x1FF) * 8`. Killzone uses VCALLMSR at 0x31A8D8 and
+    0x31A994 (FUN_0031a068). The generated code itself is unchanged (regenerating means a full rebuild).
+
 - `0008-runtime-unwind-arena-iop-import-cache.patch`: stability and speed fixes found while getting into gameplay.
   - **Yield/return confusion (random crashes).** `dispatchGuestBranch` treated "callee came back with pc == its own
     entry" as a normal return. A checkpoint yield at a recursive call (Lua) or at a loop head that is the function's
@@ -70,3 +82,12 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
     zeroed chunk). The host now moves them to a region the game never uses (Killzone: 0x80000-0x100000).
   - **IOP import decode cache.** `IopImportRegistry::decode` runs on every IOP instruction and scanned up to 64 KB
     back for each stub's import table; resolved stubs are now cached per pc (cleared on reset/unload).
+
+- `0009-ps2-float-semantics.patch` (recompiler + `ps2_runtime_macros.h`, needs regen + full rebuild):
+  - `RSQRT.S fd, fs, ft` was emitted as `1/sqrt(fs)`; the EE computes `fs / sqrt(ft)`. Killzone uses it in 382
+    functions (vector normalisation), so normals and lighting came out wrong. VU0 macro `VRSQRT` had the same bug
+    (ignored fs).
+  - PS2 float semantics for EE FPU and VU0 macro ops: no Inf/NaN (exponent-255 inputs and overflow saturate to
+    +-max), x/0 = +-max with sign fs xor ft (was Inf for DIV.S and 0 for VDIV), SQRT of |x|. Denormals are flushed
+    by the host setting FTZ/DAZ on the game thread (src/kz_main.cpp).
+  - `CVT.W.S` rounded to nearest; the EE truncates toward zero and saturates.

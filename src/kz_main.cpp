@@ -19,6 +19,7 @@
 #include "kz_audio.h"
 
 #include <SDL3/SDL.h>
+#include <xmmintrin.h>
 
 #include <atomic>
 #include <cmath>
@@ -306,6 +307,8 @@ int main(int argc, char *argv[])
 
         std::atomic<bool> runtimeDone{false};
         std::thread runtimeThread([&]() {
+            // The PS2 FPU/VUs flush denormals to zero; recompiled float code runs on SSE, so match it (FTZ | DAZ).
+            _mm_setcsr(_mm_getcsr() | 0x8040u);
             runtime.run();
             runtimeDone.store(true);
         });

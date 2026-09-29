@@ -1,6 +1,7 @@
-# kzvu: PCSX2's VU1 as a static library
+# kzvu: PCSX2's VU1 (and VU0 micro mode) as a static library
 
-kzvu compiles PCSX2's VU1 execution into one static library, `kzvu.lib`. It contains two cores:
+kzvu compiles PCSX2's VU1 execution, and VU0 micro mode (VCALLMS/VCALLMSR programs), into one static library,
+`kzvu.lib`. It contains two cores for each VU:
 
 - microVU, PCSX2's x86-64 recompiler for VU microcode. This is the default.
 - PCSX2's VU interpreter, as a fallback. It also serves as a second reference in the tests.
@@ -312,14 +313,83 @@ Benchmark: the transform program, 10,000 runs.
 | kzvu interpreter | 8000-8600 | 4.4-4.7x slower |
 | PS2Recomp VU1Interpreter | 55000 | 30x slower |
 
+## VU0 micro mode
+
+VU0 runs the microprograms the EE starts with VCALLMS/VCALLMSR (PS2Recomp's old path: `VU1Interpreter` in VU0 mode,
+reset and run with a 4096-cycle budget on every call). kzvu runs them on microVU0 (`vu0UseJit`, default) or PCSX2's
+VU0 interpreter (`VU0microInterp.cpp`, now compiled in).
+
+```cpp
+uint8_t* kzvu0CodeMem();  uint8_t* kzvu0DataMem();       // 4 KB each, kzvu-owned, same reason as VU1's
+void kzvu0MicroWritten(uint32_t offset, uint32_t size);   // after VIF0 MPG / EE stores to micro memory
+void kzvu0SetRegs(const Kzvu0Regs&);  void kzvu0GetRegs(Kzvu0Regs&);  // VF, VI, ACC, status/MAC/clip, R, I, Q
+uint32_t kzvu0Execute(uint32_t startPcBytes, uint32_t maxCycles);   // VCALLMS; 0xFFFFFFFF = continue at TPC
+bool kzvu0Running();  uint32_t kzvu0VpuStat();  uint32_t kzvu0TPC();  uint64_t kzvu0Cycles();  uint64_t kzvu0Calls();
+```
+
+- **Registers:** VU0's register file is the EE's COP2 register file, so the host copies it in before each call and
+  out afterwards (`Kzvu0Regs`). `kzvu0SetRegs` seeds the flags the way PCSX2's `vu0ExecMicro` does: the interpreter's
+  copies, and microVU's four flag instances (status in microVU's internal bit layout). Q is written to both of
+  microVU's Q instances.
+- **M bit:** microVU0 ends a block after an M-bit instruction (the point where a real VU0 lets an interlocked COP2
+  transfer through) with VBS0 still set. `kzvu0Execute` resumes until the E bit, so a call always runs the whole
+  program, as the old path did. Killzone's VU0 micro memory contains no M bits in any captured state.
+- **VU1 registers at 0x4000+:** VU0 loads/stores to qwords 0x400-0x43F reach VU1's VF/VI (microVU and PCSX2's
+  interpreter both map them onto kzvu's VU1 state; PS2Recomp's interpreter wraps them into VU0 memory instead). No
+  captured Killzone program touches them.
+- **Clamping:** `vu0ClampMode` (-1 = `clampMode`). The game uses 3 (`src/kz_vu.cpp`): once a level loads, NaN/Inf
+  values reach VU0 inputs through memory from the EE side (VU0 never made one from finite inputs in the measured
+  runs), which a PS2 cannot produce, and with mode 0 they propagate through VU0 results (measured:
+  gameplay drops from ~9-10 to ~1.3 frames/s). Mode 3 clamps them to +-max with the sign kept, which is what the old
+  interpreter path did and how the PS2 treats exponent 255. On finite inputs the clamp mode makes no difference in
+  the captured programs.
+- **Code cache:** microVU0 and microVU1 share one 128 MB allocation (PCSX2's two regions, back to back).
+- **D/T bits:** DE0/TE0 (FBRST bits 2/3, via `kzvuSetFBRST`) stop VU0 as in PCSX2; `kzvu0VpuStat` says which.
+
+### Test (`test/kzvu0_test.cpp`)
+
+`kzvu0_test [--clamp N] [capture dir ...]` (default: `test/vu0_captures`, clamp 3). Exit code 0 = pass.
+
+1. Synthetic programs with known results on the JIT and PCSX2's interpreter: FMAC + LQ/SQ with registers passed in,
+   the 4 KB data wrap, VU1 VF/VI read and written through 0x4000+, M bits in the middle of a program, ITOF0 of
+   integer bit patterns, and a 2000-iteration loop (6005 cycles). The old path stops that loop at its 4096-cycle
+   budget (vf2.x = 1024 instead of 2001); no captured game program comes close to 4096 cycles.
+2. Captured game calls (`Kzvu0Capture`, `include/kzvu0_capture.h`), written by the game with `KZ_VU0_DUMP=<dir>`
+   (`KZ_VU0_DUMP_AFTER`, `_PER`, `_MAX`, `_FINITE=1`; see `src/kz_vu.cpp`). Each is replayed from its input state on
+   the JIT, PCSX2's interpreter and PS2Recomp's interpreter run exactly like the runtime's old path. Fails if the JIT
+   replay does not reproduce the in-game result bit for bit; everything else is reported.
+
+`test/vu0_captures`: 103 calls from the first mission (gameplay, t > 100 s), one or three per (program, EE call
+site), taken with `KZ_VU0_DUMP_FINITE=1`, so no input holds a NaN/Inf. Programs 0x000, 0x020, 0x270, 0x2c0, 0x4f0,
+0x520, 0x6c8, 0x7b0, 0x870, 0xc80, 0xd18 (0x7b0 and 0x870 are FUN_00505a78's). Result (RelWithDebInfo):
+
+- 303 checks, 0 failures. JIT replay == in-game result: 103/103.
+- JIT vs PS2Recomp (old path): bit-identical VF/VI/ACC/Q/memory in 91 of 103. The 12 others are all program 0xd18
+  (EE callers 0x3BD50C/0x3BD540/0x3BD588/0x3BE5AC): its `FMAND vi1, vi3` reads the MAC flag of an FMAC issued a few
+  instructions earlier, PS2Recomp's flag pipeline gives vi1 = 0x10 where microVU gives 0, the following IBEQ goes the
+  other way and the results differ completely (e.g. Q 0.667 vs 0.499). PCSX2's interpreter takes the same path as
+  microVU (it differs from microVU only in float lanes there).
+- JIT vs PCSX2 interpreter: 26 captures differ, all float lanes: 1-54 ulp in ACC/MADD chains, and in three captures a
+  lane that is the tiny difference of two nearly equal values (e.g. 0 vs 1.2e-7). Where they differ, the JIT and PS2Recomp
+  agree bit for bit (except 0xd18), so these are PCSX2 interpreter rounding, not JIT errors.
+- No captured program reads or writes VU1 registers, contains M bits, and the longest takes 92 cycles (95 on PS2Recomp).
+
+On 80 calls captured at clamp mode 0 (72 of them with NaN/Inf in their inputs; not in the repo), the JIT and PS2Recomp
+differ in 28 at `--clamp 0` and in 12 at `--clamp 3` (programs 0x870, 0xc80, 0x020, 0xd18: NaN operands handled
+differently by the two clamping schemes, plus 0xd18's branch).
+
 ## License
 
 GPL-3.0+. kzvu consists of PCSX2 code plus GPL shims. Anything that links kzvu is a GPL-3 derivative work.
 
 ## Known gaps
 
-- **VU1 only.** There is no VU0 micro mode and no COP2 macro mode (its code is compiled but stubbed out). The VU0
-  structures exist only because microVU1 reads VU0's VPU_STAT and FBRST.
+- **No COP2 macro mode.** VU0 micro mode is provided (see above); COP2 macro instructions stay in the host's
+  generated code (microVU's macro recompiler is compiled but stubbed out).
+- **VU0 runs synchronously.** A VCALLMS runs to its E bit before the EE continues. EE code that feeds a running VU0
+  program through interlocked transfers at M-bit points would not work; Killzone's VU0 code has no M bits.
+- **`kzvuSetVI(16)`** (VU1 status) seeds microVU's status instances with the architectural value, not microVU's
+  internal layout (`kzvu0SetRegs` does it right). Nothing in the game sets VU1's status flag, so it is unfixed.
 - **Cycle counts** are PCSX2's model. They are close to PS2Recomp's but not identical: in the tests the transform
   takes 538 vs 568 cycles, and XGKICK 9 (JIT) / 13 (interpreter) vs 12. Budget accounting in slices can differ by a
   cycle.
@@ -331,6 +401,5 @@ GPL-3.0+. kzvu consists of PCSX2 code plus GPL shims. Anything that links kzvu i
 - **Not provided:** no savestate support, and no MTVU (VU1 on its own thread).
 - **Configurations:** only Release and RelWithDebInfo are tested. A Debug build keeps references to code that the
   optimizer normally drops. Those references are stubbed, but Debug has not been exercised.
-- **Test data:** the test uses synthetic microprograms. No Killzone microcode has been run through the three
-  implementations yet. Extracting the game's MPG uploads, or recording them at run time, and replaying them
-  differentially is the next check worth doing.
+- **Test data:** `kzvu_test` (VU1) uses synthetic microprograms only. VU0 has captured Killzone calls
+  (`kzvu0_test`); recording VU1 MSCAL states the same way is the next check worth doing.

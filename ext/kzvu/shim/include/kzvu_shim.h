@@ -109,5 +109,5 @@ namespace kzvu
 	bool AllocCodeCache(u32 bytes, std::string* err);
 	void FreeCodeCache();
 
-	u32 TakeInterrupts();             // hwIntcIrq(INTC_VU1) raised since the last call (D/T bit)
+	u32 TakeInterrupts(u32 mask);     // hwIntcIrq(INTC_VU0/VU1) bits in `mask` raised since the last call (D/T bit)
 } // namespace kzvu
