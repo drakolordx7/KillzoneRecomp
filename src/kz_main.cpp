@@ -14,6 +14,7 @@
 #include "kz_timing.h"
 #include "kz_vu.h"
 #include "kz_ipu.h"
+#include "kz_audio.h"
 
 #include <SDL3/SDL.h>
 
@@ -253,9 +254,11 @@ int main(int argc, char *argv[])
             return 1;
         }
         kzIpuInstall();
+        kzAudioInstall();
         PS2Runtime runtime;
         kzVuBindRuntime(runtime);
         kzIpuBindRuntime(runtime);
+        kzAudioBindRuntime(runtime);
         static PS2Runtime *s_runtime = &runtime;
         kzInputSetScriptClock([]() -> double {
             return static_cast<double>(s_runtime->memory().gs().vsyncTick.load(std::memory_order_relaxed)) / kzTimingRate();
