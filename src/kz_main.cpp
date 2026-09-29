@@ -200,6 +200,12 @@ int main(int argc, char *argv[])
 
         if (opts.sampleSeconds > 0)
             kzStartStackSampler(opts.sampleSeconds, 24, "work/stacks.txt");
+        if (const char *prof = std::getenv("KZ_PROFILE"))
+        {
+            double start = 0, duration = 20;
+            std::sscanf(prof, "%lf,%lf", &start, &duration);
+            kzStartProfiler(start, duration, "work/profile.txt");
+        }
 
         PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
         if (!cfg.isoPath.empty())

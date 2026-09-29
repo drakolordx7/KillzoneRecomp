@@ -347,6 +347,9 @@ bool kzGsAttach(PS2Runtime &runtime, void *hwnd, int windowHeight, const KzConfi
     PS2HostGs hooks;
     hooks.gifPacket = &onGifPacket;
     hooks.vsync = &onVsync;
+    // Killzone never reads GS memory back (traces: only host->local transfers), so kzgs alone consumes the GIF
+    // stream. KZ_SW_GS=1 keeps the runtime's software GS processing in parallel (debug).
+    hooks.exclusive = !(std::getenv("KZ_SW_GS") && std::getenv("KZ_SW_GS")[0] == '1');
     ps2SetHostGs(hooks);
     s.attached = true;
     std::cout << "[kz] hardware GS attached (upscale " << kc.upscale << "x)" << std::endl;

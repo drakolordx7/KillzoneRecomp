@@ -223,6 +223,10 @@ namespace
     {
         if (!g_pace)
             return;
+        // Called on every SPU2 advance (i.e. every IOP time slice); reading the clock each time was measurable.
+        static uint32_t calls = 0;
+        if ((++calls & 255u) != 0u)
+            return;
         const auto now = std::chrono::steady_clock::now();
         if (now - g_paceLastAdjust < std::chrono::milliseconds(50))
             return;
