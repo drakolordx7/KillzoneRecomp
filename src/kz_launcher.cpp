@@ -1,6 +1,7 @@
 #include "kz_launcher.h"
 
 #include "kz_iso.h"
+#include "kz_input.h"
 
 #include <SDL3/SDL.h>
 #include <imgui.h>
@@ -10,9 +11,20 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <vector>
+
+namespace
+{
+    // KZ_LAUNCHER_TAB=<name>: opens that tab (screenshots of other tabs in the self-test).
+    ImGuiTabItemFlags forcedTab(const char *name)
+    {
+        static const char *forced = std::getenv("KZ_LAUNCHER_TAB");
+        return forced && _stricmp(forced, name) == 0 ? ImGuiTabItemFlags_SetSelected : 0;
+    }
+}
 
 namespace
 {
@@ -172,7 +184,7 @@ namespace
 
         if (ImGui::BeginTabBar("tabs"))
         {
-            if (ImGui::BeginTabItem("Display"))
+            if (ImGui::BeginTabItem("Display", nullptr, forcedTab("Display")))
             {
                 enumCombo<KzWindowMode>("Window mode", cfg.windowMode,
                                         {{KzWindowMode::Borderless, "Borderless fullscreen"},
@@ -208,7 +220,7 @@ namespace
                                     "rate (60 = original feel, 120 and up = high refresh).");
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Graphics"))
+            if (ImGui::BeginTabItem("Graphics", nullptr, forcedTab("Graphics")))
             {
                 enumCombo<KzRenderer>("Renderer", cfg.renderer,
                                       {{KzRenderer::D3D11, "Direct3D 11"}, {KzRenderer::D3D12, "Direct3D 12"}, {KzRenderer::Vulkan, "Vulkan"}});
@@ -230,15 +242,31 @@ namespace
                 ImGui::Checkbox("Film-grain noise filter (original look)", &cfg.noiseFilter);
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Controls"))
+            if (ImGui::BeginTabItem("Controls", nullptr, forcedTab("Controls")))
             {
                 ImGui::SliderFloat("Mouse sensitivity", &cfg.mouseSensitivity, 0.1f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
                 ImGui::Checkbox("Invert mouse Y", &cfg.invertY);
                 ImGui::Checkbox("Raw mouse input", &cfg.rawMouse);
                 ImGui::SliderFloat("Controller stick deadzone", &cfg.stickDeadzone, 0.0f, 0.5f, "%.2f");
                 ImGui::Spacing();
-                ImGui::TextDisabled("Keyboard / mouse bindings live in killzone.ini, [Bindings] section\n"
-                                    "(Key=Action, e.g. Mouse1=R1, W=MoveForward). Controllers are detected automatically.");
+                ImGui::TextDisabled("Mouse aim is applied directly to the player's view (no stick acceleration).\n"
+                                    "Controllers are detected automatically. To rebind keys, edit [Bindings] in killzone.ini.");
+                static const auto bindings = kzInputDescribeBindings(kzConfigPath());
+                if (ImGui::BeginTable("bindings", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerV,
+                                      ImVec2(0, std::max(60.0f, ImGui::GetContentRegionAvail().y - 104.0f))))
+                {
+                    ImGui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                    ImGui::TableSetupColumn("Action");
+                    for (const auto &[key, action] : bindings)
+                    {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextUnformatted(key.c_str());
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextUnformatted(action.c_str());
+                    }
+                    ImGui::EndTable();
+                }
                 if (ImGui::Button("Open killzone.ini"))
                 {
                     kzSaveConfig(kzConfigPath(), cfg);
@@ -247,7 +275,7 @@ namespace
                 }
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Audio"))
+            if (ImGui::BeginTabItem("Audio", nullptr, forcedTab("Audio")))
             {
                 ImGui::SliderInt("Master volume", &cfg.masterVolume, 0, 100, "%d%%");
                 ImGui::EndTabItem();

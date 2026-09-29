@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <utility>
+#include <vector>
 
 union SDL_Event;
 
@@ -54,6 +56,12 @@ void kzInputSetAimPatchActive(bool active);
 
 // Clock for KZ_INPUT_SCRIPT event times (seconds). Default: wall time.
 void kzInputSetScriptClock(double (*clock)());
+
+// Raw Key=Target pairs from killzone.ini [Bindings], or the defaults when the section is missing.
+std::vector<std::pair<std::string, std::string>> kzInputBindingPairs(const std::filesystem::path &bindingsIni);
+
+// Current key -> in-game action list (defaults or killzone.ini [Bindings]) for the launcher.
+std::vector<std::pair<std::string, std::string>> kzInputDescribeBindings(const std::filesystem::path &bindingsIni);
 
 // Self-test of binding parsing and pad composition (no devices needed). Returns number of failures.
 int kzInputSelfTest();

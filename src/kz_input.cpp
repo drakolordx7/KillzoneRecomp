@@ -57,15 +57,18 @@ namespace
         {"LookLeft", KzVirtualAxis::LookLeft}, {"LookRight", KzVirtualAxis::LookRight},
     };
 
-    // Provisional PC defaults. The pad targets follow common PS2 FPS layouts and must be checked against the game's
-    // own controls screen (docs/findings.md#controls); every entry is overridable in killzone.ini [Bindings].
+    // PC defaults, derived from the game's own default controller map (profile settings +0xEC, docs/findings.md
+    // "Controls"): R1 fire, R2 secondary fire, X action/use, O switch weapon, L1 grenade, square special item,
+    // triangle reload, L2 crouch, L3 sprint, R3 zoom mode, Start pause, Select objectives. Killzone has no jump.
+    // Every entry is overridable in killzone.ini [Bindings].
     constexpr std::pair<const char *, const char *> kDefaultBindings[] = {
+        {"Mouse1", "R1"}, {"Mouse2", "R3"}, {"Mouse3", "R2"}, {"R", "Triangle"}, {"G", "L1"},
+        {"E", "Cross"}, {"F", "Cross"}, {"Q", "Circle"}, {"WheelUp", "Circle"}, {"WheelDown", "Circle"},
+        {"C", "L2"}, {"Left Ctrl", "L2"}, {"Left Shift", "L3"}, {"X", "Square"}, {"Mouse4", "Square"},
+        {"Space", "Cross"}, {"Return", "Cross"},
         {"W", "MoveForward"}, {"S", "MoveBack"}, {"A", "StrafeLeft"}, {"D", "StrafeRight"},
         {"Up", "LookUp"}, {"Down", "LookDown"}, {"Left", "LookLeft"}, {"Right", "LookRight"},
-        {"Mouse1", "R1"}, {"Mouse2", "L1"}, {"R", "R2"}, {"G", "L2"},
-        {"Space", "Cross"}, {"C", "Circle"}, {"Left Ctrl", "Circle"}, {"E", "Square"}, {"F", "Square"},
-        {"Q", "Triangle"}, {"WheelUp", "Triangle"}, {"WheelDown", "Triangle"}, {"Left Shift", "L3"}, {"V", "R3"},
-        {"Escape", "Start"}, {"Return", "Cross"}, {"Tab", "Select"},
+        {"Escape", "Start"}, {"Tab", "Select"}, {"Backspace", "Triangle"},
         {"1", "Up"}, {"2", "Right"}, {"3", "Down"}, {"4", "Left"},
     };
 
@@ -177,8 +180,10 @@ namespace
     {
         if (_strnicmp(name.c_str(), "Mouse", 5) == 0 && name.size() == 6 && name[5] >= '1' && name[5] <= '5')
         {
+            // Mouse1 left, Mouse2 right, Mouse3 middle, Mouse4/5 side buttons (SDL numbers middle 2, right 3).
+            static constexpr int kSdlButton[6] = {0, SDL_BUTTON_LEFT, SDL_BUTTON_RIGHT, SDL_BUTTON_MIDDLE, SDL_BUTTON_X1, SDL_BUTTON_X2};
             b.kind = SourceKind::MouseButton;
-            b.code = name[5] - '0'; // SDL_BUTTON_LEFT == 1
+            b.code = kSdlButton[name[5] - '0'];
             return true;
         }
         if (_stricmp(name.c_str(), "WheelUp") == 0)
@@ -223,7 +228,7 @@ namespace
         return b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
     }
 
-    std::vector<Binding> loadBindings(const std::filesystem::path &ini)
+    std::vector<std::pair<std::string, std::string>> loadBindingPairs(const std::filesystem::path &ini)
     {
         std::vector<std::pair<std::string, std::string>> pairs;
         std::ifstream in(ini);
@@ -249,6 +254,12 @@ namespace
         if (!any)
             for (const auto &[k, v] : kDefaultBindings)
                 pairs.emplace_back(k, v);
+        return pairs;
+    }
+
+    std::vector<Binding> loadBindings(const std::filesystem::path &ini)
+    {
+        const auto pairs = loadBindingPairs(ini);
         std::vector<Binding> out;
         for (const auto &[src, dst] : pairs)
         {
@@ -337,6 +348,13 @@ namespace
         data[5] = toStickByte(ry);
         data[6] = toStickByte(lx);
         data[7] = toStickByte(ly);
+        // DualShock 2 pressure bytes (used when the game switches the pad to pressure mode): right, left, up, down,
+        // triangle, circle, cross, square, L1, R1, L2, R2.
+        static constexpr uint16_t kPressureOrder[12] = {KZ_PAD_RIGHT, KZ_PAD_LEFT, KZ_PAD_UP, KZ_PAD_DOWN,
+                                                        KZ_PAD_TRIANGLE, KZ_PAD_CIRCLE, KZ_PAD_CROSS, KZ_PAD_SQUARE,
+                                                        KZ_PAD_L1, KZ_PAD_R1, KZ_PAD_L2, KZ_PAD_R2};
+        for (int i = 0; i < 12; ++i)
+            data[8 + i] = (pressed & kPressureOrder[i]) ? 0xFF : 0x00;
     }
 }
 
@@ -553,9 +571,10 @@ int kzInputSelfTest()
     check((pressed & KZ_PAD_R1) != 0, "Mouse1 -> R1");
     s.wheelUpUntil = 100;
     compose(s, d, 50);
-    check((static_cast<uint16_t>(~(d[2] | (d[3] << 8))) & KZ_PAD_TRIANGLE) != 0, "WheelUp pulse -> Triangle");
+    check((static_cast<uint16_t>(~(d[2] | (d[3] << 8))) & KZ_PAD_CIRCLE) != 0, "WheelUp pulse -> Circle (switch weapon)");
+    check(d[17] == 0xFF, "R1 pressure byte");
     compose(s, d, 200);
-    check((static_cast<uint16_t>(~(d[2] | (d[3] << 8))) & KZ_PAD_TRIANGLE) == 0, "WheelUp pulse expires");
+    check((static_cast<uint16_t>(~(d[2] | (d[3] << 8))) & KZ_PAD_CIRCLE) == 0, "WheelUp pulse expires");
     s.keys.fill(false);
     s.mouseButtons.fill(false);
     s.wheelUpUntil = 0;
@@ -566,4 +585,34 @@ int kzInputSelfTest()
 void kzInputSetScriptClock(double (*clock)())
 {
     g_scriptClock = clock;
+}
+
+std::vector<std::pair<std::string, std::string>> kzInputBindingPairs(const std::filesystem::path &bindingsIni);
+
+std::vector<std::pair<std::string, std::string>> kzInputDescribeBindings(const std::filesystem::path &bindingsIni)
+{
+    // In-game meaning of each pad target under Killzone's default controller map.
+    static const std::pair<const char *, const char *> kMeaning[] = {
+        {"MoveForward", "Move forward"}, {"MoveBack", "Move back"}, {"StrafeLeft", "Strafe left"},
+        {"StrafeRight", "Strafe right"}, {"LookUp", "Look up"}, {"LookDown", "Look down"}, {"LookLeft", "Look left"},
+        {"LookRight", "Look right"}, {"R1", "Fire"}, {"R2", "Secondary fire"}, {"Cross", "Use / confirm"},
+        {"Circle", "Switch weapon"}, {"L1", "Throw grenade"}, {"Square", "Special item"}, {"Triangle", "Reload / back"},
+        {"L2", "Crouch"}, {"L3", "Sprint"}, {"R3", "Zoom"}, {"Start", "Pause"}, {"Select", "Objectives"},
+        {"Up", "D-pad up"}, {"Down", "D-pad down"}, {"Left", "D-pad left"}, {"Right", "D-pad right"},
+    };
+    std::vector<std::pair<std::string, std::string>> out;
+    for (const auto &[src, dst] : kzInputBindingPairs(bindingsIni))
+    {
+        std::string meaning = dst;
+        for (const auto &[pad, text] : kMeaning)
+            if (_stricmp(pad, dst.c_str()) == 0)
+                meaning = text;
+        out.emplace_back(src, meaning);
+    }
+    return out;
+}
+
+std::vector<std::pair<std::string, std::string>> kzInputBindingPairs(const std::filesystem::path &bindingsIni)
+{
+    return loadBindingPairs(bindingsIni);
 }
