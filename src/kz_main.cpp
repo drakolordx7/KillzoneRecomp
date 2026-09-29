@@ -1,10 +1,11 @@
 // Killzone runner entry point. Replaces ps2xRuntime/src/main.cpp so we control boot paths.
 //
-// Usage: killzone.exe [--elf <path to SCUS_974.02>] [--iso <path to Killzone ISO>]
+// Usage: killzone.exe [--elf <path to SCUS_974.02>] [--iso <path to Killzone ISO>] [--sample <seconds>]
 // Defaults: --elf game/SCUS_974.02 (relative to the working directory); --iso unset.
 // The ELF's directory is mounted as cdrom0:. The ISO, when given, backs raw sceCdRead sector reads.
 
 #include "ps2_runtime.h"
+#include "kz_sampler.h"
 #if defined(PS2X_ENABLE_DEBUG_UI)
 #include "ps2_debug_panel.h"
 #endif
@@ -22,6 +23,7 @@ namespace
     {
         std::filesystem::path elf = "game/SCUS_974.02";
         std::filesystem::path iso;
+        int sampleSeconds = 0; // --sample N: dump all thread stacks to work/stacks.txt every N seconds
     };
 
     Options parseArgs(int argc, char *argv[])
@@ -34,6 +36,8 @@ namespace
                 opts.elf = argv[++i];
             else if (arg == "--iso" && i + 1 < argc)
                 opts.iso = argv[++i];
+            else if (arg == "--sample" && i + 1 < argc)
+                opts.sampleSeconds = std::atoi(argv[++i]);
             else
                 std::cerr << "[kz] ignoring unknown argument: " << arg << std::endl;
         }
@@ -52,6 +56,9 @@ int main(int argc, char *argv[])
             std::cerr << "[kz] ELF not found: " << elf.string() << std::endl;
             return 1;
         }
+
+        if (opts.sampleSeconds > 0)
+            kzStartStackSampler(opts.sampleSeconds, 24, "work/stacks.txt");
 
         PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
         if (!opts.iso.empty())
