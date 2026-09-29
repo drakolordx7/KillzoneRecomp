@@ -1,8 +1,147 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_host_gs.h b/ps2xRuntime/include/runtime/ps2_host_gs.h
+new file mode 100644
+index 0000000..0256fe0
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_host_gs.h
+@@ -0,0 +1,16 @@
++#pragma once
++
++#include <cstdint>
++
++// Optional host GS (e.g. a hardware renderer) fed alongside the built-in GS frontend.
++// gifPacket: every GIF packet in arbiter order, with its PATH (1..3); sizeBytes is a multiple of 16.
++// vsync: guest VBlankStart, after CSR.FIELD was updated; field = interlace field being displayed (0/1).
++// Both are called on the EE game thread.
++struct PS2HostGs
++{
++    void (*gifPacket)(int path, const uint8_t *data, uint32_t sizeBytes) = nullptr;
++    void (*vsync)(uint64_t tick, int field) = nullptr;
++};
++
++void ps2SetHostGs(const PS2HostGs &hooks);
++const PS2HostGs &ps2HostGs();
+diff --git a/ps2xRuntime/include/runtime/ps2_pad_provider.h b/ps2xRuntime/include/runtime/ps2_pad_provider.h
+new file mode 100644
+index 0000000..2833818
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_pad_provider.h
+@@ -0,0 +1,10 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++// Optional host pad provider. When set, PSPadBackend::readState calls it first; returning true means `data` (32-byte
++// DualShock2 reply: [0]=0x01? [1]=0x73 analog, [2..3]=buttons active-low, [4..7]=RX,RY,LX,LY, [8..19]=pressures)
++// was filled and the built-in raylib mapping is skipped.
++using PS2PadProvider = bool (*)(int port, int slot, uint8_t *data, size_t size);
++void ps2SetPadProvider(PS2PadProvider provider);
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..d7acaff 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,3 +1,4 @@
++#include "runtime/ps2_host_gs.h"
+ #include "runtime/ee_scheduler.h"
+ 
+ #include "ps2_log.h"
+@@ -1888,6 +1889,8 @@ void EeScheduler::processEvent(const EeEvent &event)
+         }
+         m_vsyncFlagAddress = 0u;
+         m_vsyncTickAddress = 0u;
++        if (const auto hostVsync = ps2HostGs().vsync)
++            hostVsync(m_vsyncTick, (m_vsyncTick & 1u) != 0u ? 1 : 0);
+         completeVSync(m_vsyncTick);
+         if (m_gsVSyncCallback != 0u && m_runtime.hasFunction(m_gsVSyncCallback))
+         {
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index c289ba0..52809f3 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -1,7 +1,23 @@
+ #include "runtime/gs/ps2_gif_arbiter.h"
++#include "runtime/ps2_host_gs.h"
+ #include <algorithm>
+ #include <cstring>
+ 
++namespace
++{
++    PS2HostGs g_hostGs{};
++}
++
++void ps2SetHostGs(const PS2HostGs &hooks)
++{
++    g_hostGs = hooks;
++}
++
++const PS2HostGs &ps2HostGs()
++{
++    return g_hostGs;
++}
++
+ GifArbiter::GifArbiter(ProcessPacketFn processFn)
+     : m_processFn(std::move(processFn))
+ {
+@@ -56,6 +72,8 @@ void GifArbiter::drain()
+         auto &pkt = m_queue[i];
+         if (!pkt.data.empty())
+         {
++            if (g_hostGs.gifPacket)
++                g_hostGs.gifPacket(static_cast<int>(pkt.pathId), pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+         }
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 8590f14..f150a3f 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,4 +1,6 @@
+ #include "runtime/ps2_pad.h"
++#include "runtime/ps2_pad_provider.h"
++#include <atomic>
+ #include "ps2_host_backend.h"
+ #include <cstring>
+ 
+@@ -25,10 +27,25 @@ namespace
+     constexpr uint16_t PAD_L2 = 0x0100u;
+ }
+ 
+-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
++namespace
++{
++    std::atomic<PS2PadProvider> g_padProvider{nullptr};
++}
++
++void ps2SetPadProvider(PS2PadProvider provider)
++{
++    g_padProvider.store(provider, std::memory_order_release);
++}
++
++bool PSPadBackend::readState(int port, int slot, uint8_t *data, size_t size)
+ {
+     if (!data || size < 32)
+         return false;
++    if (PS2PadProvider provider = g_padProvider.load(std::memory_order_acquire))
++    {
++        if (provider(port, slot, data, size))
++            return true;
++    }
+ 
+     std::memset(data, 0, 32);
+     data[0] = 0x01;
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..c44ae12 100644
+index 45cb9d2..1eec50a 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
-@@ -26,6 +26,8 @@
+@@ -12,6 +12,7 @@
+ #include "Kernel/Stubs/MPEG.h"
+ #include "ps2_host_backend.h"
+ #include "ps2_iop_host.h"
++#include "runtime/ps2_host_gs.h"
+ #include "ps2x/iop/iop_subsystem.h"
+ 
+ #include <iostream>
+@@ -26,6 +27,8 @@
  #include <thread>
  #include <unordered_map>
  #include <sstream>
@@ -11,7 +150,7 @@ index 45cb9d2..c44ae12 100644
  
  namespace ps2_stubs
  {
-@@ -713,6 +715,38 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -713,6 +716,38 @@ bool PS2Runtime::syncCoreSubsystems()
      return true;
  }
  
@@ -50,7 +189,7 @@ index 45cb9d2..c44ae12 100644
  bool PS2Runtime::initialize(const char *title)
  {
      try
-@@ -731,12 +765,21 @@ bool PS2Runtime::initialize(const char *title)
+@@ -731,12 +766,21 @@ bool PS2Runtime::initialize(const char *title)
  #if defined(PLATFORM_VITA)
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
@@ -77,7 +216,24 @@ index 45cb9d2..c44ae12 100644
          if (m_debugUiInitCallback)
          {
              m_debugUiInitCallback(*this, m_debugUiUserData);
-@@ -2357,10 +2400,15 @@ void PS2Runtime::run()
+@@ -2165,12 +2209,14 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
+     ps2TraceGuestWrite(rdram, GIF_TADR, 4u, tadr, 0u, "WRITE32", ctx);
+     m_memory.writeIORegister(GIF_TADR, tadr);
+     ps2TraceGuestWrite(rdram, GIF_CHCR, 4u, chcr, 0u, "WRITE32", ctx);
+-    if (m_memory.tryProcessNativeGifImageUploadChain(m_gs, tadr, chcr))
++    // The native fast paths feed the built-in GS directly and would bypass a host GS attached to the arbiter.
++    const bool hostGsAttached = ps2HostGs().gifPacket != nullptr;
++    if (!hostGsAttached && m_memory.tryProcessNativeGifImageUploadChain(m_gs, tadr, chcr))
+     {
+         drainCompletedDmacHandlers(rdram);
+         return;
+     }
+-    if (m_memory.tryProcessNativeGifPackedChain(m_gs, tadr, chcr))
++    if (!hostGsAttached && m_memory.tryProcessNativeGifPackedChain(m_gs, tadr, chcr))
+     {
+         drainCompletedDmacHandlers(rdram);
+         return;
+@@ -2357,10 +2403,15 @@ void PS2Runtime::run()
  
      RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
  
@@ -96,7 +252,7 @@ index 45cb9d2..c44ae12 100644
  
      std::atomic<bool> gameThreadFinished{false};
  
-@@ -2385,8 +2433,51 @@ void PS2Runtime::run()
+@@ -2385,8 +2436,51 @@ void PS2Runtime::run()
          }
          gameThreadFinished.store(true, std::memory_order_release); });
  
@@ -149,7 +305,7 @@ index 45cb9d2..c44ae12 100644
      {
          PS2_IF_AGRESSIVE_LOGS({
              tick++;
-@@ -2465,8 +2556,11 @@ void PS2Runtime::run()
+@@ -2465,8 +2559,11 @@ void PS2Runtime::run()
          m_debugUiShutdownCallback(*this, m_debugUiUserData);
          m_debugUiInitialized = false;
      }

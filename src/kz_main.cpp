@@ -6,9 +6,17 @@
 
 #include "ps2_runtime.h"
 #include "kz_sampler.h"
-#if defined(PS2X_ENABLE_DEBUG_UI)
-#include "ps2_debug_panel.h"
-#endif
+#include "kz_config.h"
+#include "kz_input.h"
+#include "kz_iso.h"
+#include "kz_launcher.h"
+#include "kz_gs.h"
+
+#include <SDL3/SDL.h>
+
+#include <atomic>
+#include <thread>
+#include "runtime/ps2_pad_provider.h"
 
 #include <cstdlib>
 #include <exception>
@@ -24,6 +32,8 @@ namespace
         std::filesystem::path elf = "game/SCUS_974.02";
         std::filesystem::path iso;
         int sampleSeconds = 0; // --sample N: dump all thread stacks to work/stacks.txt every N seconds
+        bool selfTest = false;  // --selftest: run unit checks (config, input, disc, launcher render) and exit
+        bool noLauncher = false; // --no-launcher: boot straight into the game
     };
 
     Options parseArgs(int argc, char *argv[])
@@ -38,10 +48,97 @@ namespace
                 opts.iso = argv[++i];
             else if (arg == "--sample" && i + 1 < argc)
                 opts.sampleSeconds = std::atoi(argv[++i]);
+            else if (arg == "--selftest")
+                opts.selfTest = true;
+            else if (arg == "--no-launcher")
+                opts.noLauncher = true;
             else
                 std::cerr << "[kz] ignoring unknown argument: " << arg << std::endl;
         }
         return opts;
+    }
+}
+
+namespace
+{
+    SDL_Window *createGameWindow(const KzConfig &cfg)
+    {
+        const SDL_DisplayID display = SDL_GetPrimaryDisplay();
+        const SDL_DisplayMode *desktop = SDL_GetDesktopDisplayMode(display);
+        const int deskW = desktop ? desktop->w : 1920, deskH = desktop ? desktop->h : 1080;
+        int w = cfg.width > 0 ? cfg.width : deskW;
+        int h = cfg.height > 0 ? cfg.height : deskH;
+        SDL_WindowFlags flags = SDL_WINDOW_HIGH_PIXEL_DENSITY;
+        if (cfg.windowMode == KzWindowMode::Windowed)
+        {
+            if (cfg.width == 0)
+            {
+                w = deskW * 3 / 4;
+                h = deskH * 3 / 4;
+            }
+            flags |= SDL_WINDOW_RESIZABLE;
+        }
+        else
+        {
+            flags |= SDL_WINDOW_FULLSCREEN;
+        }
+        SDL_Window *win = SDL_CreateWindow("Killzone", w, h, flags);
+        if (!win)
+            return nullptr;
+        if (cfg.windowMode == KzWindowMode::Fullscreen)
+        {
+            SDL_DisplayMode mode{};
+            if (SDL_GetClosestFullscreenDisplayMode(display, w, h, 0.0f, true, &mode))
+                SDL_SetWindowFullscreenMode(win, &mode); // exclusive
+        }
+        else if (cfg.windowMode == KzWindowMode::Borderless)
+        {
+            SDL_SetWindowFullscreenMode(win, nullptr); // borderless desktop
+        }
+        SDL_SyncWindow(win);
+        return win;
+    }
+
+    int runSelfTest()
+    {
+        int failures = 0;
+        // config round-trip through a temp file
+        KzConfig a;
+        a.windowMode = KzWindowMode::Fullscreen;
+        a.fpsLimit = 144;
+        a.upscale = 4;
+        a.aspect = KzAspect::Classic4x3;
+        a.mouseSensitivity = 2.5f;
+        a.invertY = true;
+        a.isoPath = "C:/games/Killzone (USA).iso";
+        const auto tmp = std::filesystem::temp_directory_path() / "kz_selftest.ini";
+        if (!kzSaveConfig(tmp, a)) { std::cerr << "[selftest] FAIL: save config" << std::endl; ++failures; }
+        const KzConfig b = kzLoadConfig(tmp);
+        if (b.windowMode != a.windowMode || b.fpsLimit != 144 || b.upscale != 4 || b.aspect != a.aspect ||
+            b.mouseSensitivity != 2.5f || !b.invertY || b.isoPath != a.isoPath)
+        {
+            std::cerr << "[selftest] FAIL: config round-trip" << std::endl;
+            ++failures;
+        }
+        std::filesystem::remove(tmp);
+        const KzConfig d = kzLoadConfig(std::filesystem::temp_directory_path() / "kz_missing.ini");
+        if (d.windowMode != KzWindowMode::Borderless || d.fpsLimit != 0) { std::cerr << "[selftest] FAIL: defaults" << std::endl; ++failures; }
+        kzInputInit(std::filesystem::temp_directory_path() / "kz_missing.ini");
+        failures += kzInputSelfTest();
+        // disc check against the user's image when present (not required for the test to pass)
+        const KzConfig saved = kzLoadConfig(kzConfigPath());
+        if (!saved.isoPath.empty())
+            std::cout << "[selftest] disc: " << kzCheckDisc(saved.isoPath).message << std::endl;
+        if (kzCheckDisc(std::filesystem::temp_directory_path() / "kz_missing.iso").ok)
+        {
+            std::cerr << "[selftest] FAIL: missing disc accepted" << std::endl;
+            ++failures;
+        }
+        KzConfig shot = saved;
+        const std::string png = (std::filesystem::current_path() / "work" / "launcher.png").string();
+        std::cout << "[selftest] launcher render -> " << png << ": " << (kzLauncherScreenshot(shot, png.c_str()) ? "ok" : "unavailable") << std::endl;
+        std::cout << "[selftest] " << (failures ? "FAILED" : "passed") << " (" << failures << " failures)" << std::endl;
+        return failures ? 1 : 0;
     }
 }
 
@@ -50,6 +147,18 @@ int main(int argc, char *argv[])
     try
     {
         const Options opts = parseArgs(argc, argv);
+        if (opts.selfTest)
+            return runSelfTest();
+        kzConfig() = kzLoadConfig(kzConfigPath());
+        KzConfig &cfg = kzConfig();
+        if (!opts.iso.empty())
+            cfg.isoPath = std::filesystem::absolute(opts.iso).string();
+        const bool headless = std::getenv("PS2X_HEADLESS") && std::getenv("PS2X_HEADLESS")[0] == '1';
+        if (!headless && !opts.noLauncher && (cfg.showLauncher || !kzCheckDisc(cfg.isoPath).ok))
+        {
+            if (!kzRunLauncher(cfg))
+                return 0;
+        }
         const std::filesystem::path elf = std::filesystem::absolute(opts.elf).lexically_normal();
         if (!std::filesystem::exists(elf))
         {
@@ -61,34 +170,119 @@ int main(int argc, char *argv[])
             kzStartStackSampler(opts.sampleSeconds, 24, "work/stacks.txt");
 
         PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
-        if (!opts.iso.empty())
+        if (!cfg.isoPath.empty())
         {
-            paths.cdImage = std::filesystem::absolute(opts.iso).lexically_normal();
+            paths.cdImage = std::filesystem::path(cfg.isoPath).lexically_normal();
             std::cout << "[kz] CD image: " << paths.cdImage.string() << std::endl;
         }
         PS2Runtime::setIoPaths(paths);
 
+        kzInputInit(kzConfigPath());
+        ps2SetPadProvider(&kzPadProvider);
+
+        // The runtime's raylib window/present loop is replaced by our SDL window + kzgs, so the runtime always runs
+        // window-less. Automation (PS2X_HEADLESS=1 already set by the caller) also skips our window: kzgs renders
+        // offscreen and KZ_SHOT_DIR/KZ_SHOT_INTERVAL save frames.
+        const bool automation = headless;
+        _putenv_s("PS2X_HEADLESS", "1");
+
+        SDL_Window *window = nullptr;
+        void *hwnd = nullptr;
+        int winW = 1280, winH = 896;
+        if (!automation)
+        {
+            if (!SDL_InitSubSystem(SDL_INIT_VIDEO))
+            {
+                std::cerr << "[kz] SDL video init failed: " << SDL_GetError() << std::endl;
+                return 1;
+            }
+            window = createGameWindow(cfg);
+            if (!window)
+            {
+                SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Killzone", SDL_GetError(), nullptr);
+                return 1;
+            }
+            hwnd = SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+            SDL_GetWindowSizeInPixels(window, &winW, &winH);
+            SDL_SetWindowRelativeMouseMode(window, true);
+            kzInputSetCaptured(true);
+        }
+
         PS2Runtime runtime;
-#if defined(PS2X_ENABLE_DEBUG_UI)
-        PS2DebugPanel debugPanel;
-        runtime.setDebugUiCallbacks(
-            [](PS2Runtime &, void *userData) { static_cast<PS2DebugPanel *>(userData)->initialize(); },
-            [](PS2Runtime &rt, void *userData) { static_cast<PS2DebugPanel *>(userData)->draw(rt); },
-            [](PS2Runtime &, void *userData) { static_cast<PS2DebugPanel *>(userData)->shutdown(); },
-            &debugPanel);
-#endif
         if (!runtime.initialize("Killzone"))
         {
             std::cerr << "[kz] failed to initialize PS2 runtime" << std::endl;
             return 1;
         }
+        std::string gsError;
+        if (!kzGsAttach(runtime, hwnd, winH, cfg, &gsError))
+        {
+            const std::string msg = "Could not start the renderer: " + gsError;
+            std::cerr << "[kz] " << msg << std::endl;
+            if (window)
+                SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Killzone", msg.c_str(), window);
+            return 1;
+        }
+        if (const char *dir = std::getenv("KZ_SHOT_DIR"))
+            kzGsSetScreenshotSchedule(dir, std::getenv("KZ_SHOT_INTERVAL") ? std::atoi(std::getenv("KZ_SHOT_INTERVAL")) : 5);
         if (!runtime.loadELF(elf.string()))
         {
             std::cerr << "[kz] failed to load ELF: " << elf.string() << std::endl;
             return 1;
         }
 
-        runtime.run();
+        std::atomic<bool> runtimeDone{false};
+        std::thread runtimeThread([&]() {
+            runtime.run();
+            runtimeDone.store(true);
+        });
+
+        bool focused = true;
+        while (!runtimeDone.load())
+        {
+            if (window)
+            {
+                SDL_Event e;
+                while (SDL_PollEvent(&e))
+                {
+                    kzInputOnEvent(e);
+                    switch (e.type)
+                    {
+                    case SDL_EVENT_QUIT:
+                    case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+                        runtime.requestStop();
+                        break;
+                    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+                        kzGsResize(e.window.data1, e.window.data2);
+                        break;
+                    case SDL_EVENT_WINDOW_FOCUS_LOST:
+                        focused = false;
+                        SDL_SetWindowRelativeMouseMode(window, false);
+                        kzInputSetCaptured(false);
+                        break;
+                    case SDL_EVENT_WINDOW_FOCUS_GAINED:
+                    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+                        if (!focused || !SDL_GetWindowRelativeMouseMode(window))
+                        {
+                            focused = true;
+                            SDL_SetWindowRelativeMouseMode(window, true);
+                            kzInputSetCaptured(true);
+                        }
+                        break;
+                    default:
+                        break;
+                    }
+                }
+            }
+            kzInputPoll();
+            SDL_Delay(1);
+        }
+        runtime.requestStop();
+        runtimeThread.join();
+        kzGsDetach();
+        kzInputShutdown();
+        if (window)
+            SDL_DestroyWindow(window);
 
         std::cout.flush();
         std::cerr.flush();
