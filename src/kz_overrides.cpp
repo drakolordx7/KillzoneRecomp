@@ -6,6 +6,7 @@
 
 #include "game_overrides.h"
 #include "kz_sif_modules.h"
+#include "kz_ipu.h"
 #include "ps2_runtime.h"
 
 #include <cstdint>
@@ -32,7 +33,7 @@ namespace
         PS2Runtime::RecompiledFunction fn;
         const char *name;
     };
-    // Video (.pss) playback needs the IPU (MPEG decoder), which is not emulated yet: the movie object's open method
+    // Without the IPU (KZ_IPU=off or kzipu init failure) video playback cannot work: the movie object's open method
     // (vtable 0x52EA78 +0x10, FUN_002ded00) reports failure so every caller skips its video (attract loop, cutscenes).
     void kzMovieOpenUnavailable(uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
@@ -41,7 +42,7 @@ namespace
     }
 
     const CustomBinding kCustom[] = {
-        {0x002DED00u, &kzMovieOpenUnavailable, "movie open (no IPU yet)"},
+
         {0x002B5D88u, &kzSceSifSearchModuleByName, "sceSifSearchModuleByName"},
         {0x002B5CF8u, &kzSceSifUnloadModule, "sceSifUnloadModule"},
         {0x003D7490u, &kzLgkbmInit, "lgkbm init"},
@@ -54,6 +55,8 @@ namespace
             if (!ps2_game_overrides::bindAddressHandler(runtime, b.address, b.handler))
                 std::cerr << "[kz] failed to bind " << b.handler << " @0x" << std::hex << b.address << std::dec << std::endl;
         }
+        if (!kzIpuActive() && !runtime.replaceFunction(0x002DED00u, &kzMovieOpenUnavailable))
+            std::cerr << "[kz] failed to bind movie-open skip" << std::endl;
         for (const CustomBinding &c : kCustom)
         {
             if (!runtime.replaceFunction(c.address, c.fn))

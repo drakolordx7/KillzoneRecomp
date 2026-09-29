@@ -25,6 +25,65 @@ index 0000000..6cbed58
 +// takes effect from the next scheduled vblank.
 +void ps2SetVblankPeriodMicros(uint32_t micros);
 +uint32_t ps2VblankPeriodMicros();
+diff --git a/ps2xRuntime/include/runtime/ps2_host_ipu.h b/ps2xRuntime/include/runtime/ps2_host_ipu.h
+new file mode 100644
+index 0000000..8aa9091
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_host_ipu.h
+@@ -0,0 +1,28 @@
++#pragma once
++
++#include <cstdint>
++
++// Optional host IPU (MPEG decoder), e.g. kzipu. When set, PS2Memory routes to it: IPU registers
++// (0x10002000-0x1000203F), DMA channels 3/4 (IPU_FROM 0x1000B000, IPU_TO 0x1000B400; `handles` decides), 64-bit
++// accesses to those, the IPU FIFO ports (0x10007000 out, 0x10007010 in), the DMAC master enable (D_CTRL / D_ENABLEW)
++// and a poll on D_STAT reads. Called on the EE game thread.
++struct PS2HostIpu
++{
++    bool (*handles)(uint32_t physAddr) = nullptr;
++    uint32_t (*read32)(uint32_t physAddr) = nullptr;
++    void (*write32)(uint32_t physAddr, uint32_t value) = nullptr;
++    uint64_t (*read64)(uint32_t physAddr) = nullptr;
++    void (*write64)(uint32_t physAddr, uint64_t value) = nullptr;
++    void (*fifoWrite)(const void *qword) = nullptr; // 16 bytes into the input FIFO
++    void (*fifoRead)(void *qword) = nullptr;        // 16 bytes from the output FIFO
++    void (*dmacEnable)(bool enabled) = nullptr;
++    void (*poll)() = nullptr;
++};
++
++void ps2SetHostIpu(const PS2HostIpu &hooks);
++const PS2HostIpu &ps2HostIpu();
++
++// Provided by the runtime (valid after PS2Memory::initialize): completes DMA channel `channel` the way the DMAC does
++// (clears CHCR.STR in the runtime's register mirror, sets D_STAT bit `channel` and CIS, queues the cause for the game's
++// DMAC handlers; the host then calls PS2Runtime::drainCompletedDmacHandlers).
++void ps2HostCompleteDmac(uint32_t channel);
+diff --git a/ps2xRuntime/include/runtime/ps2_host_vu.h b/ps2xRuntime/include/runtime/ps2_host_vu.h
+new file mode 100644
+index 0000000..79ebec1
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_host_vu.h
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include <cstdint>
++
++// Optional host VU1 (e.g. a recompiling VU). When set before PS2Memory::initialize(), VU1 code/data memory is the
++// host's (never freed by the runtime), and MSCAL/MSCNT from VIF1 run the host VU instead of the built-in interpreter.
++// codeGeneration increments whenever VU1 code memory was written (MPG or direct stores) since the runtime started;
++// the host uses it to invalidate recompiled programs. vpuStat is VU0 VPU_STAT; the host updates the VU1 bits.
++// Called on the EE game thread.
++struct PS2HostVu1
++{
++    uint8_t *codeMem = nullptr; // 16 KB
++    uint8_t *dataMem = nullptr; // 16 KB
++    void (*mscal)(uint32_t startPcBytes, uint32_t top, uint32_t itop, uint32_t fbrst, uint64_t codeGeneration, uint32_t *vpuStat) = nullptr;
++    void (*mscnt)(uint32_t top, uint32_t itop, uint32_t fbrst, uint64_t codeGeneration, uint32_t *vpuStat) = nullptr;
++};
++
++void ps2SetHostVu1(const PS2HostVu1 &hooks);
++const PS2HostVu1 &ps2HostVu1();
 diff --git a/ps2xRuntime/include/runtime/ps2_pad_provider.h b/ps2xRuntime/include/runtime/ps2_pad_provider.h
 new file mode 100644
 index 0000000..2833818
@@ -42,7 +101,7 @@ index 0000000..2833818
 +using PS2PadProvider = bool (*)(int port, int slot, uint8_t *data, size_t size);
 +void ps2SetPadProvider(PS2PadProvider provider);
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..9a16b89 100644
+index c5e31c4..a62d03a 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -1,3 +1,5 @@
@@ -87,7 +146,32 @@ index c5e31c4..9a16b89 100644
                    EeEvent{EeEventType::VBlankStart, 0, 0});
      publishSnapshot();
  }
-@@ -1850,8 +1859,8 @@ void EeScheduler::processDueDeadlines()
+@@ -388,10 +397,24 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+     return false;
+ }
+ 
++namespace
++{
++    // COP0 Count runs at the EE clock (294.912 MHz). Recompiled `mfc0 Count` reads ctx->cop0_count, which nothing
++    // else advances, so games that time themselves with Count (fades, frame timers) would see time stand still.
++    uint32_t hostCop0Count()
++    {
++        static const auto start = std::chrono::steady_clock::now();
++        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
++        return static_cast<uint32_t>(static_cast<uint64_t>(static_cast<double>(ns) * 0.294912));
++    }
++}
++
+ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+ {
+     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+     m_eeCycle += elapsed;
++    if (R5900Context *ctx = currentContext())
++        ctx->cop0_count = hostCop0Count();
+     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
+     m_runtime.advanceIopEeCycles(elapsed);
+     if (m_pendingEeTimerInterrupts != 0u)
+@@ -1850,8 +1873,8 @@ void EeScheduler::processDueDeadlines()
                  scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                                scheduled.hostDeadline + kVBlankDuration,
                                EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
@@ -98,7 +182,7 @@ index c5e31c4..9a16b89 100644
                                EeEvent{EeEventType::VBlankStart, 0, 0});
              }
              processEvent(scheduled.event);
-@@ -1888,6 +1897,8 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -1888,6 +1911,8 @@ void EeScheduler::processEvent(const EeEvent &event)
          }
          m_vsyncFlagAddress = 0u;
          m_vsyncTickAddress = 0u;
@@ -107,7 +191,7 @@ index c5e31c4..9a16b89 100644
          completeVSync(m_vsyncTick);
          if (m_gsVSyncCallback != 0u && m_runtime.hasFunction(m_gsVSyncCallback))
          {
-@@ -2144,3 +2155,13 @@ void EeScheduler::publishIdleDebugContext()
+@@ -2144,3 +2169,13 @@ void EeScheduler::publishIdleDebugContext()
          publishDebugContext(selected->activeContext());
      }
  }
@@ -158,6 +242,205 @@ index c289ba0..52809f3 100644
              m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
          }
      }
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..4dce5fb 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1,3 +1,6 @@
++#include "runtime/ps2_host_vu.h"
++#include "runtime/ps2_host_ipu.h"
++#include <functional>
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_address.h"
+ #include "runtime/gs/gs_frontend.h"
+@@ -10,6 +13,45 @@
+ #include <string>
+ #include <vector>
+ 
++namespace
++{
++    PS2HostVu1 g_hostVu1{};
++    bool g_vu1MemoryHostOwned = false;
++    PS2HostIpu g_hostIpu{};
++    std::function<void(uint32_t)> g_completeDmac;
++
++    bool hostIpuHandles(uint32_t physAddr)
++    {
++        return g_hostIpu.handles && g_hostIpu.handles(physAddr);
++    }
++}
++
++void ps2SetHostIpu(const PS2HostIpu &hooks)
++{
++    g_hostIpu = hooks;
++}
++
++const PS2HostIpu &ps2HostIpu()
++{
++    return g_hostIpu;
++}
++
++void ps2HostCompleteDmac(uint32_t channel)
++{
++    if (g_completeDmac)
++        g_completeDmac(channel);
++}
++
++void ps2SetHostVu1(const PS2HostVu1 &hooks)
++{
++    g_hostVu1 = hooks;
++}
++
++const PS2HostVu1 &ps2HostVu1()
++{
++    return g_hostVu1;
++}
++
+ namespace
+ {
+     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
+@@ -267,12 +309,14 @@ PS2Memory::~PS2Memory()
+ 
+     if (m_vu1Code)
+     {
+-        delete[] m_vu1Code;
++        if (!g_vu1MemoryHostOwned)
++            delete[] m_vu1Code;
+         m_vu1Code = nullptr;
+     }
+     if (m_vu1Data)
+     {
+-        delete[] m_vu1Data;
++        if (!g_vu1MemoryHostOwned)
++            delete[] m_vu1Data;
+         m_vu1Data = nullptr;
+     }
+     if (m_vu0Code)
+@@ -303,8 +347,11 @@ bool PS2Memory::initialize(size_t ramSize)
+         delete[] m_gsVRAM;
+         delete[] m_vu0Code;
+         delete[] m_vu0Data;
+-        delete[] m_vu1Code;
+-        delete[] m_vu1Data;
++        if (!g_vu1MemoryHostOwned)
++        {
++            delete[] m_vu1Code;
++            delete[] m_vu1Data;
++        }
+         m_rdram = nullptr;
+         m_scratchpad = nullptr;
+         ps2SetScratchpadHostPtr(nullptr);
+@@ -375,12 +422,29 @@ bool PS2Memory::initialize(size_t ramSize)
+         std::memset(m_vu0Code, 0, PS2_VU0_CODE_SIZE);
+         std::memset(m_vu0Data, 0, PS2_VU0_DATA_SIZE);
+ 
+-        m_vu1Code = new uint8_t[PS2_VU1_CODE_SIZE];
+-        m_vu1Data = new uint8_t[PS2_VU1_DATA_SIZE];
++        if (ps2HostVu1().codeMem && ps2HostVu1().dataMem)
++        {
++            g_vu1MemoryHostOwned = true;
++            m_vu1Code = ps2HostVu1().codeMem;
++            m_vu1Data = ps2HostVu1().dataMem;
++        }
++        else
++        {
++            g_vu1MemoryHostOwned = false;
++            m_vu1Code = new uint8_t[PS2_VU1_CODE_SIZE];
++            m_vu1Data = new uint8_t[PS2_VU1_DATA_SIZE];
++        }
+         std::memset(m_vu1Code, 0, PS2_VU1_CODE_SIZE);
+         std::memset(m_vu1Data, 0, PS2_VU1_DATA_SIZE);
+         markVU0CodeModified();
+         markVU1CodeModified();
++        g_completeDmac = [this](uint32_t channel)
++        {
++            static constexpr uint32_t kChannelBase[10] = {0x10008000u, 0x10009000u, 0x1000A000u, 0x1000B000u, 0x1000B400u,
++                                                          0x1000C000u, 0x1000C400u, 0x1000C800u, 0x1000D000u, 0x1000D400u};
++            if (channel < 10u)
++                completeDmacChannel(kChannelBase[channel], channel);
++        };
+ 
+         // Initialize VIF registers
+         memset(&vif0_regs, 0, sizeof(vif0_regs));
+@@ -821,6 +885,8 @@ uint64_t PS2Memory::read64(uint32_t address)
+ 
+     // 64-bit IO read: compose from the two adjacent 32-bit IO register slots
+     // to avoid any side-effects from read32 handlers.
++    if (hostIpuHandles(physAddr) && g_hostIpu.read64)
++        return g_hostIpu.read64(physAddr);
+     if (isIoRegister(address))
+     {
+         uint32_t lo = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
+@@ -840,6 +906,13 @@ __m128i PS2Memory::read128(uint32_t address)
+     const bool scratch = isScratchpad(address);
+     uint32_t physAddr = translateAddress(address);
+ 
++    if (!scratch && physAddr == 0x10007000u && g_hostIpu.fifoRead) // IPU_out_FIFO
++    {
++        alignas(16) uint8_t fifoData[16];
++        g_hostIpu.fifoRead(fifoData);
++        return _mm_load_si128(reinterpret_cast<const __m128i *>(fifoData));
++    }
++
+     if (scratch)
+     {
+         inRange(physAddr, sizeof(__m128i), PS2_SCRATCHPAD_SIZE, "read128 scratchpad", address);
+@@ -1011,6 +1084,12 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
+         throw std::runtime_error("Unaligned 64-bit write at address: 0x" + std::to_string(address));
+     }
+ 
++    if (!isScratchpad(address) && hostIpuHandles(translateAddress(address)) && g_hostIpu.write64)
++    {
++        g_hostIpu.write64(translateAddress(address), value);
++        return;
++    }
++
+     if (isGsPrivReg(address))
+     {
+         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+@@ -1070,6 +1149,13 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+     const bool scratch = isScratchpad(address);
+     uint32_t physAddr = translateAddress(address);
+ 
++    if (!scratch && physAddr == 0x10007010u && g_hostIpu.fifoWrite) // IPU_in_FIFO
++    {
++        alignas(16) uint8_t fifoData[16];
++        _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
++        g_hostIpu.fifoWrite(fifoData);
++        return;
++    }
+     if (!scratch && physAddr == 0x10004000u) // VIF0_FIFO
+     {
+         alignas(16) uint8_t fifoData[16];
+@@ -1124,6 +1210,17 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+ 
+ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ {
++    if (hostIpuHandles(address))
++    {
++        g_hostIpu.write32(address, value);
++        return true;
++    }
++    if ((address == 0x1000E000u || address == 0x1000F590u) && g_hostIpu.dmacEnable) // D_CTRL / D_ENABLEW
++    {
++        const uint32_t dctrl = address == 0x1000E000u ? value : (m_ioRegisters.count(0x1000E000u) ? m_ioRegisters[0x1000E000u] : 1u);
++        const uint32_t denable = address == 0x1000F590u ? value : (m_ioRegisters.count(0x1000F590u) ? m_ioRegisters[0x1000F590u] : 0u);
++        g_hostIpu.dmacEnable((dctrl & 1u) != 0u && (denable & 0x10000u) == 0u);
++    }
+     size_t timerIndex = 0u;
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+@@ -2280,6 +2377,10 @@ int PS2Memory::pollDmaRegisters()
+ 
+ uint32_t PS2Memory::readIORegister(uint32_t address)
+ {
++    if (hostIpuHandles(address))
++        return g_hostIpu.read32(address);
++    if (address == 0x1000E010u && g_hostIpu.poll)
++        g_hostIpu.poll();
+     size_t timerIndex = 0u;
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
 diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
 index 8590f14..f150a3f 100644
 --- a/ps2xRuntime/src/lib/ps2_pad.cpp
@@ -197,18 +480,19 @@ index 8590f14..f150a3f 100644
      std::memset(data, 0, 32);
      data[0] = 0x01;
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..1eec50a 100644
+index 45cb9d2..67a3c31 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
-@@ -12,6 +12,7 @@
+@@ -12,6 +12,8 @@
  #include "Kernel/Stubs/MPEG.h"
  #include "ps2_host_backend.h"
  #include "ps2_iop_host.h"
 +#include "runtime/ps2_host_gs.h"
++#include "runtime/ps2_host_vu.h"
  #include "ps2x/iop/iop_subsystem.h"
  
  #include <iostream>
-@@ -26,6 +27,8 @@
+@@ -26,6 +28,8 @@
  #include <thread>
  #include <unordered_map>
  #include <sstream>
@@ -217,7 +501,33 @@ index 45cb9d2..1eec50a 100644
  
  namespace ps2_stubs
  {
-@@ -713,6 +716,38 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -675,6 +679,12 @@ bool PS2Runtime::syncCoreSubsystems()
+                                      {
+                                          cpuContext = &m_cpuContext;
+                                      }
++                                     if (const auto hostMscal = ps2HostVu1().mscal)
++                                     {
++                                         hostMscal(startPC, top, itop, cpuContext->vu0_fbrst,
++                                                   m_memory.getVU1CodeGeneration(), &cpuContext->vu0_vpu_stat);
++                                         return;
++                                     }
+                                      m_vu1.state().dBitEnabled =
+                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                      m_vu1.state().tBitEnabled =
+@@ -693,6 +703,12 @@ bool PS2Runtime::syncCoreSubsystems()
+                                      {
+                                          cpuContext = &m_cpuContext;
+                                      }
++                                     if (const auto hostMscnt = ps2HostVu1().mscnt)
++                                     {
++                                         hostMscnt(top, itop, cpuContext->vu0_fbrst,
++                                                   m_memory.getVU1CodeGeneration(), &cpuContext->vu0_vpu_stat);
++                                         return;
++                                     }
+                                      m_vu1.state().dBitEnabled =
+                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                      m_vu1.state().tBitEnabled =
+@@ -713,6 +729,38 @@ bool PS2Runtime::syncCoreSubsystems()
      return true;
  }
  
@@ -256,7 +566,7 @@ index 45cb9d2..1eec50a 100644
  bool PS2Runtime::initialize(const char *title)
  {
      try
-@@ -731,12 +766,21 @@ bool PS2Runtime::initialize(const char *title)
+@@ -731,12 +779,21 @@ bool PS2Runtime::initialize(const char *title)
  #if defined(PLATFORM_VITA)
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
@@ -283,7 +593,7 @@ index 45cb9d2..1eec50a 100644
          if (m_debugUiInitCallback)
          {
              m_debugUiInitCallback(*this, m_debugUiUserData);
-@@ -2165,12 +2209,14 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
+@@ -2165,12 +2222,14 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
      ps2TraceGuestWrite(rdram, GIF_TADR, 4u, tadr, 0u, "WRITE32", ctx);
      m_memory.writeIORegister(GIF_TADR, tadr);
      ps2TraceGuestWrite(rdram, GIF_CHCR, 4u, chcr, 0u, "WRITE32", ctx);
@@ -300,7 +610,7 @@ index 45cb9d2..1eec50a 100644
      {
          drainCompletedDmacHandlers(rdram);
          return;
-@@ -2357,10 +2403,15 @@ void PS2Runtime::run()
+@@ -2357,10 +2416,15 @@ void PS2Runtime::run()
  
      RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
  
@@ -319,7 +629,7 @@ index 45cb9d2..1eec50a 100644
  
      std::atomic<bool> gameThreadFinished{false};
  
-@@ -2385,8 +2436,51 @@ void PS2Runtime::run()
+@@ -2385,8 +2449,51 @@ void PS2Runtime::run()
          }
          gameThreadFinished.store(true, std::memory_order_release); });
  
@@ -372,7 +682,7 @@ index 45cb9d2..1eec50a 100644
      {
          PS2_IF_AGRESSIVE_LOGS({
              tick++;
-@@ -2465,8 +2559,11 @@ void PS2Runtime::run()
+@@ -2465,8 +2572,11 @@ void PS2Runtime::run()
          m_debugUiShutdownCallback(*this, m_debugUiUserData);
          m_debugUiInitialized = false;
      }

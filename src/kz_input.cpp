@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -94,6 +95,79 @@ namespace
     {
         static State s;
         return s;
+    }
+
+    double (*g_scriptClock)() = nullptr;
+
+    // KZ_INPUT_SCRIPT="t:button[:dur];..." for automated runs: presses `button` (a pad button name, or
+    // lx/ly/rx/ry with =value e.g. ly=-1) at t seconds after the first pad read, for dur seconds (default 0.15).
+    struct ScriptEvent
+    {
+        double t, dur;
+        uint16_t mask;
+        int axis; // 0 none, 1 lx, 2 ly, 3 rx, 4 ry
+        float value;
+    };
+
+    std::vector<ScriptEvent> &script()
+    {
+        static std::vector<ScriptEvent> events = []() {
+            std::vector<ScriptEvent> out;
+            const char *env = std::getenv("KZ_INPUT_SCRIPT");
+            if (!env)
+                return out;
+            std::string all(env);
+            size_t pos = 0;
+            while (pos < all.size())
+            {
+                size_t end = all.find(';', pos);
+                std::string item = all.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+                pos = end == std::string::npos ? all.size() : end + 1;
+                const size_t c1 = item.find(':');
+                if (c1 == std::string::npos)
+                    continue;
+                ScriptEvent ev{std::atof(item.c_str()), 0.15, 0, 0, 0.0f};
+                std::string what = item.substr(c1 + 1);
+                if (const size_t c2 = what.find(':'); c2 != std::string::npos)
+                {
+                    ev.dur = std::atof(what.c_str() + c2 + 1);
+                    what.resize(c2);
+                }
+                if (const size_t eq = what.find('='); eq != std::string::npos)
+                {
+                    static const char *axes[] = {"", "lx", "ly", "rx", "ry"};
+                    for (int a = 1; a <= 4; ++a)
+                        if (_stricmp(what.substr(0, eq).c_str(), axes[a]) == 0)
+                            ev.axis = a;
+                    ev.value = static_cast<float>(std::atof(what.c_str() + eq + 1));
+                }
+                else
+                    for (const auto &n : kButtonNames)
+                        if (_stricmp(n.name, what.c_str()) == 0)
+                            ev.mask = n.mask;
+                if (ev.mask || ev.axis)
+                    out.push_back(ev);
+            }
+            return out;
+        }();
+        return events;
+    }
+
+    void applyScript(uint16_t &pressed, float &lx, float &ly, float &rx, float &ry)
+    {
+        auto &events = script();
+        if (events.empty())
+            return;
+        const double t = g_scriptClock ? g_scriptClock() : SDL_GetTicks() / 1000.0;
+        for (const ScriptEvent &e : events)
+        {
+            if (t < e.t || t >= e.t + e.dur)
+                continue;
+            pressed |= e.mask;
+            float *axis[] = {nullptr, &lx, &ly, &rx, &ry};
+            if (e.axis)
+                *axis[e.axis] = e.value;
+        }
     }
 
     bool parseSource(const std::string &name, Binding &b)
@@ -246,6 +320,7 @@ namespace
             ry += s.stickMouseDy / kCountsForFullDeflection;
         }
         s.stickMouseDx = s.stickMouseDy = 0.0f;
+        applyScript(pressed, lx, ly, rx, ry);
         if (s.r2 > 0.5f) pressed |= KZ_PAD_R2;
         if (s.l2 > 0.5f) pressed |= KZ_PAD_L2;
 
@@ -460,4 +535,9 @@ int kzInputSelfTest()
     s.wheelUpUntil = 0;
     s.bindings = saved;
     return failures;
+}
+
+void kzInputSetScriptClock(double (*clock)())
+{
+    g_scriptClock = clock;
 }
