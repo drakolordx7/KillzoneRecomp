@@ -1,0 +1,329 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..9a8d42e 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -8,6 +11,39 @@
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
++#include <cstdio>
++
++extern bool g_ps2GuestUnwinding; // ps2_runtime.cpp
++
++// Scheduler-level trace ring: every guest entry (thread/invocation, pc, ra, sp) and what it came back with.
++// Printed when the scheduler hits a pc with no recompiled function.
++namespace
++{
++    struct SchedTrace
++    {
++        char what; // 'E' enter, 'X' exit, 'I' invocation pushed, 'D' invocation done
++        int thread;
++        uint32_t depth, pc, ra, sp;
++    };
++    SchedTrace g_schedTrace[256];
++    uint32_t g_schedTracePos = 0;
++    inline void schedTrace(char what, int thread, size_t depth, const R5900Context &c)
++    {
++        g_schedTrace[g_schedTracePos++ & 255u] = SchedTrace{what, thread, static_cast<uint32_t>(depth), c.pc,
++                                                            getRegU32(&c, 31), getRegU32(&c, 29)};
++    }
++    void dumpSchedTrace()
++    {
++        std::fprintf(stderr, "[sched-trace] oldest first:\n");
++        for (uint32_t i = 0; i < 256u; ++i)
++        {
++            const SchedTrace &t = g_schedTrace[(g_schedTracePos + i) & 255u];
++            if (!t.what)
++                continue;
++            std::fprintf(stderr, "  %c th=%d d=%u pc=0x%x ra=0x%x sp=0x%x\n", t.what, t.thread, t.depth, t.pc, t.ra, t.sp);
++        }
++    }
++}
+ 
+ namespace
+ {
+@@ -204,6 +247,7 @@ void EeScheduler::run()
+             running->resumeCompletion = {};
+             try
+             {
++                g_ps2GuestUnwinding = false;
+                 completion(running->activeContext());
+             }
+             catch (const EeDispatcherTransfer &)
+@@ -234,6 +278,7 @@ void EeScheduler::run()
+             {
+                 GuestInvocation completed = std::move(running->invocations.back());
+                 running->invocations.pop_back();
++                schedTrace('D', running->id, running->invocations.size(), running->activeContext());
+                 if (completed.onComplete)
+                 {
+                     try
+@@ -263,6 +312,7 @@ void EeScheduler::run()
+                 SET_GPR_U32(&invocation.context, 29, invocationStackTop());
+             }
+             running->invocations.push_back(std::move(invocation));
++            schedTrace('I', running->id, running->invocations.size(), context);
+             continue;
+         }
+ 
+@@ -274,6 +324,7 @@ void EeScheduler::run()
+             }
+             else
+             {
++                dumpSchedTrace();
+                 m_runtime.reportMissingFunction(m_rdram,
+                                                 &context,
+                                                 context.pc,
+@@ -296,12 +347,16 @@ void EeScheduler::run()
+         {
+             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+             m_guestExecuting.store(true, std::memory_order_release);
++            schedTrace('E', running->id, running->invocations.size(), context);
++            g_ps2GuestUnwinding = false;
+             function(m_rdram, &context, &m_runtime);
++            schedTrace('X', running->id, running->invocations.size(), context);
+             m_guestExecuting.store(false, std::memory_order_release);
+             m_insideInterrupt = false;
+         }
+         catch (const EeDispatcherTransfer &)
+         {
++            schedTrace('T', running->id, running->invocations.size(), context);
+             m_guestExecuting.store(false, std::memory_order_release);
+             m_insideInterrupt = false;
+         }
+@@ -358,6 +413,18 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+ {
+     accountCycles(cycles);
+ 
++    // PS2X_STRESS_YIELD=N: yield to the scheduler at every Nth checkpoint (debug aid for resume bugs).
++    static const uint32_t stressYield = []() {
++        const char *v = std::getenv("PS2X_STRESS_YIELD");
++        return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u;
++    }();
++    static uint32_t stressCount = 0;
++    if (stressYield != 0u && ++stressCount >= stressYield)
++    {
++        stressCount = 0;
++        return true;
++    }
++
+     if (m_checkpointPending.load(std::memory_order_acquire) ||
+         m_stopRequested.load(std::memory_order_acquire))
+     {
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..19bd2d6 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1342,6 +1423,25 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
+     }
+ }
+ 
++// Set when guest code gives control back to the EE scheduler (checkpoint yield, or a branch the dispatcher cannot
++// follow in place): every generated frame on the host stack must then return. Cleared by the scheduler before it
++// enters guest code again. Without it a yield whose pc equals the callee's entry (a recursive call, or a loop head at
++// the first instruction) looked like "the callee returned" and the caller resumed early (random crashes in Lua code).
++bool g_ps2GuestUnwinding = false;
++
++namespace
++{
++    uint32_t g_arenaHeapBase = 0u, g_arenaHeapLimit = 0u, g_arenaStackFloor = 0u, g_arenaStackTop = 0u;
++}
++
++void ps2SetRuntimeArena(uint32_t heapBase, uint32_t heapLimit, uint32_t stackFloor, uint32_t stackTop)
++{
++    g_arenaHeapBase = heapBase;
++    g_arenaHeapLimit = heapLimit;
++    g_arenaStackFloor = stackFloor;
++    g_arenaStackTop = stackTop;
++}
++
+ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+                                      R5900Context *ctx,
+                                      uint32_t targetPc,
+@@ -1352,12 +1452,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+ {
+     ctx->pc = targetPc;
+     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
++    g_branchHistory[g_branchHistoryPos++ & 127u] = BranchRecord{sourcePc, targetPc, static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)),
++                                                               static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)), static_cast<uint8_t>(kind)};
+ 
+     // Every inter-function transfer is also a deterministic EE safe point.
+     // Backward edges inside generated functions use eeCheckpointDue(), while
+     // this charge bounds straight-line call chains that have no local loop.
+     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+     {
++        g_ps2GuestUnwinding = true;
+         return false;
+     }
+ 
+@@ -1369,6 +1472,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         }
+ 
+         ctx->pc = targetPc;
++        g_ps2GuestUnwinding = true;
+         return false;
+     }
+ 
+@@ -1398,7 +1502,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     const uint32_t entryPc = ctx->pc;
+     targetFn(rdram, ctx, this);
+ 
+-    if (isStopRequested() || ctx->pc == 0u)
++    if (isStopRequested() || ctx->pc == 0u || g_ps2GuestUnwinding)
+     {
+         return false;
+     }
+@@ -1408,7 +1512,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         ctx->pc = fallthroughPc;
+     }
+ 
+-    return ctx->pc == fallthroughPc;
++    if (ctx->pc != fallthroughPc)
++    {
++        g_ps2GuestUnwinding = true; // non-local return (longjmp, tail jump): the scheduler continues at ctx->pc
++        return false;
++    }
++    return true;
+ }
+ 
+ void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)
+@@ -1638,6 +1747,17 @@ uint32_t PS2Runtime::clampGuestHeapLimit(uint32_t guestLimit) const
+ 
+ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
+ {
++    if (g_arenaHeapLimit > g_arenaHeapBase)
++    {
++        // Host-assigned arena: the game's SetupHeap region belongs to the game's own allocator.
++        m_guestHeapBlocks.clear();
++        m_guestHeapBlocks.push_back({g_arenaHeapBase, g_arenaHeapLimit - g_arenaHeapBase, true});
++        m_guestHeapBase = g_arenaHeapBase;
++        m_guestHeapEnd = g_arenaHeapBase;
++        m_guestHeapLimit = g_arenaHeapLimit;
++        m_guestHeapConfigured = true;
++        return;
++    }
+     uint32_t base = alignGuestHeapValue(clampGuestHeapBase(guestBase), kGuestHeapDefaultAlignment);
+     uint32_t limit = clampGuestHeapLimit(guestLimit);
+     if (base == 0u)
+@@ -1990,6 +2110,11 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
+     }
+ 
+     std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
++    if (g_arenaStackTop > g_arenaStackFloor && (m_asyncCallbackStackTop > g_arenaStackTop || m_asyncCallbackStackFloor < g_arenaStackFloor))
++    {
++        m_asyncCallbackStackTop = g_arenaStackTop;
++        m_asyncCallbackStackFloor = g_arenaStackFloor;
++    }
+     uint32_t top = m_asyncCallbackStackTop;
+     if (top > PS2_RAM_SIZE)
+     {
+@@ -2211,7 +2338,10 @@ void PS2Runtime::postEeEvent(EeEvent event)
+ 
+ bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
+ {
+-    return m_eeScheduler->checkpointDue(cycles);
++    const bool due = m_eeScheduler->checkpointDue(cycles);
++    if (due)
++        g_ps2GuestUnwinding = true;
++    return due;
+ }
+ 
+ [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
+diff --git a/ps2xIOP/src/emulator/imports/iop_imports.cpp b/ps2xIOP/src/emulator/imports/iop_imports.cpp
+index f13267f..2590c4f 100644
+--- a/ps2xIOP/src/emulator/imports/iop_imports.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_imports.cpp
+@@ -42,6 +42,7 @@ namespace ps2x::iop::detail
+ 
+     void IopImportRegistry::reset()
+     {
++        m_decodeCache.clear();
+         m_libraries.clear();
+     }
+ 
+@@ -54,6 +55,12 @@ namespace ps2x::iop::detail
+             return std::nullopt;
+ 
+         const uint32_t physicalPc = IopMemory::physicalAddress(pc);
++        if (const auto hit = m_decodeCache.find(physicalPc); hit != m_decodeCache.end())
++        {
++            if (hit->second.delayWord == delay)
++                return hit->second.call;
++            m_decodeCache.erase(hit);
++        }
+         const uint32_t searchBegin = physicalPc > 0x10000u ? physicalPc - 0x10000u : 0u;
+         for (uint32_t candidate = physicalPc & ~3u; candidate >= searchBegin + 20u; candidate -= 4u)
+         {
+@@ -89,11 +96,13 @@ namespace ps2x::iop::detail
+             }
+             if (valid)
+             {
+-                return IopImportCall{
++                IopImportCall call{
+                     trimLibraryName(name),
+                     static_cast<uint16_t>(delay & 0xFFFFu),
+                     m_memory.read16(table + 8u),
+                 };
++                m_decodeCache[physicalPc] = CachedImport{delay, call};
++                return call;
+             }
+         }
+         return std::nullopt;
+@@ -129,6 +138,7 @@ namespace ps2x::iop::detail
+ 
+     bool IopImportRegistry::releaseExportTable(uint32_t address)
+     {
++        m_decodeCache.clear();
+         return m_libraries.erase(IopMemory::physicalAddress(address)) != 0u;
+     }
+ 
+@@ -184,6 +194,7 @@ namespace ps2x::iop::detail
+ 
+     void IopImportRegistry::eraseRange(uint32_t base, uint32_t size)
+     {
++        m_decodeCache.clear();
+         for (auto library = m_libraries.begin(); library != m_libraries.end();)
+         {
+             if (library->first >= base && library->first < base + size)
+diff --git a/ps2xIOP/src/emulator/imports/iop_imports.h b/ps2xIOP/src/emulator/imports/iop_imports.h
+index cae8d91..e8fd877 100644
+--- a/ps2xIOP/src/emulator/imports/iop_imports.h
++++ b/ps2xIOP/src/emulator/imports/iop_imports.h
+@@ -6,6 +6,7 @@
+ #include <optional>
+ #include <string>
+ #include <string_view>
++#include <unordered_map>
+ #include <vector>
+ 
+ namespace ps2x::iop::detail
+@@ -46,5 +47,13 @@ namespace ps2x::iop::detail
+ 
+         IopMemory &m_memory;
+         std::map<uint32_t, ExportLibrary> m_libraries;
++        // decode() runs on every IOP instruction and walks back up to 64 KB to find a stub's import table; remember
++        // resolved stubs (keyed by physical pc, validated by the stub's two instruction words). Cleared on reset/unload.
++        struct CachedImport
++        {
++            uint32_t delayWord;
++            IopImportCall call;
++        };
++        mutable std::unordered_map<uint32_t, CachedImport> m_decodeCache;
+     };
+ }
+diff --git a/ps2xRuntime/include/runtime/ps2_host_arena.h b/ps2xRuntime/include/runtime/ps2_host_arena.h
+new file mode 100644
+index 0000000..9c0614f
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_host_arena.h
+@@ -0,0 +1,10 @@
++#pragma once
++
++#include <cstdint>
++
++// Where the runtime keeps its own guest-memory allocations (HLE buffers via guestMalloc) and the stacks it runs
++// interrupt handlers / callbacks on. By default they follow the game's SetupHeap region and the top of RAM, which is
++// fine for games that use the kernel heap, but collides with games whose own allocator owns all memory from the end of
++// the ELF to the top of RAM. A host can move both into a region the game never touches (e.g. the unused EE kernel area).
++// Pass 0 for a limit to keep the default. Call before PS2Runtime::loadELF.
++void ps2SetRuntimeArena(uint32_t heapBase, uint32_t heapLimit, uint32_t stackFloor, uint32_t stackTop);

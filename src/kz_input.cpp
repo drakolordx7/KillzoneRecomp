@@ -81,6 +81,7 @@ namespace
         uint64_t wheelDownUntil = 0;
         float mouseDx = 0.0f; // raw counts since last take
         float mouseDy = 0.0f;
+        bool usingKbm = true; // last device with activity was keyboard/mouse (vs gamepad)
         float stickMouseDx = 0.0f; // counts since last pad read (right-stick fallback)
         float stickMouseDy = 0.0f;
         bool captured = false;
@@ -101,12 +102,14 @@ namespace
 
     // KZ_INPUT_SCRIPT="t:button[:dur];..." for automated runs: presses `button` (a pad button name, or
     // lx/ly/rx/ry with =value e.g. ly=-1) at t seconds after the first pad read, for dur seconds (default 0.15).
+    // mx/my=counts inject one raw mouse motion (after sensitivity) at t, e.g. "70:mx=400".
     struct ScriptEvent
     {
         double t, dur;
         uint16_t mask;
-        int axis; // 0 none, 1 lx, 2 ly, 3 rx, 4 ry
+        int axis; // 0 none, 1 lx, 2 ly, 3 rx, 4 ry, 5 mouse x, 6 mouse y
         float value;
+        bool fired = false;
     };
 
     std::vector<ScriptEvent> &script()
@@ -135,8 +138,8 @@ namespace
                 }
                 if (const size_t eq = what.find('='); eq != std::string::npos)
                 {
-                    static const char *axes[] = {"", "lx", "ly", "rx", "ry"};
-                    for (int a = 1; a <= 4; ++a)
+                    static const char *axes[] = {"", "lx", "ly", "rx", "ry", "mx", "my"};
+                    for (int a = 1; a <= 6; ++a)
                         if (_stricmp(what.substr(0, eq).c_str(), axes[a]) == 0)
                             ev.axis = a;
                     ev.value = static_cast<float>(std::atof(what.c_str() + eq + 1));
@@ -161,7 +164,7 @@ namespace
         const double t = g_scriptClock ? g_scriptClock() : SDL_GetTicks() / 1000.0;
         for (const ScriptEvent &e : events)
         {
-            if (t < e.t || t >= e.t + e.dur)
+            if (t < e.t || t >= e.t + e.dur || e.axis > 4)
                 continue;
             pressed |= e.mask;
             float *axis[] = {nullptr, &lx, &ly, &rx, &ry};
@@ -383,11 +386,13 @@ void kzInputOnEvent(const SDL_Event &e)
     case SDL_EVENT_KEY_UP:
         if (e.key.scancode < SDL_SCANCODE_COUNT)
             s.keys[e.key.scancode] = e.type == SDL_EVENT_KEY_DOWN;
+        s.usingKbm = true;
         break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
     case SDL_EVENT_MOUSE_BUTTON_UP:
         if (e.button.button < s.mouseButtons.size())
             s.mouseButtons[e.button.button] = e.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+        s.usingKbm = true;
         break;
     case SDL_EVENT_MOUSE_WHEEL:
         if (e.wheel.y > 0)
@@ -405,6 +410,7 @@ void kzInputOnEvent(const SDL_Event &e)
             s.mouseDy += dy;
             s.stickMouseDx += dx;
             s.stickMouseDy += dy;
+            s.usingKbm = true;
         }
         break;
     case SDL_EVENT_GAMEPAD_ADDED:
@@ -456,6 +462,15 @@ void kzInputPoll()
     s.ry = axis(SDL_GAMEPAD_AXIS_RIGHTY);
     s.l2 = axis(SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
     s.r2 = axis(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
+    if (s.padButtons || std::fabs(s.rx) > 0.3f || std::fabs(s.ry) > 0.3f || std::fabs(s.lx) > 0.3f || std::fabs(s.ly) > 0.3f)
+        s.usingKbm = false;
+}
+
+bool kzInputUsingKeyboardMouse()
+{
+    State &s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    return s.usingKbm;
 }
 
 bool kzPadProvider(int port, int slot, uint8_t *data, size_t size)
@@ -483,6 +498,17 @@ KzMouseDelta kzInputTakeMouseDelta()
     std::lock_guard<std::mutex> lock(s.mutex);
     KzMouseDelta d{s.mouseDx, s.mouseDy};
     s.mouseDx = s.mouseDy = 0.0f;
+    if (!script().empty())
+    {
+        const KzConfig &cfg = kzConfig();
+        const double t = g_scriptClock ? g_scriptClock() : SDL_GetTicks() / 1000.0;
+        for (ScriptEvent &e : script())
+            if (e.axis > 4 && !e.fired && t >= e.t)
+            {
+                e.fired = true;
+                (e.axis == 5 ? d.dx : d.dy) += e.value * cfg.mouseSensitivity * (e.axis == 6 && cfg.invertY ? -1.0f : 1.0f);
+            }
+    }
     return d;
 }
 
