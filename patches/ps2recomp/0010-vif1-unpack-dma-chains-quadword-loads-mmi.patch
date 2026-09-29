@@ -1,0 +1,940 @@
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1,6 +1,8 @@
+ #include "runtime/ps2_host_vu.h"
+ #include "runtime/ps2_host_vu0.h"
+ #include "runtime/ps2_host_ipu.h"
++#include "runtime/ps2_dma_stats.h"
++#include <cstdlib>
+ #include <functional>
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_address.h"
+@@ -29,6 +31,61 @@
+     }
+ }
+ 
++PS2DmaStats &ps2DmaStats()
++{
++    static PS2DmaStats stats;
++    return stats;
++}
++
++bool ps2DmaStatsEnabled()
++{
++    static const bool enabled = []
++    {
++        const char *v = std::getenv("PS2X_DMA_STATS");
++        return v && *v && *v != '0';
++    }();
++    return enabled;
++}
++
++namespace
++{
++    // A DMA address (MADR, TADR, DMAtag ADDR) with bit 31 set addresses the scratchpad at (addr & 0x3FF0) (EE User's
++    // Manual 5.2; PCSX2 dmaGetAddr). The runtime's scratchpad addresses are 0x70000000-based, so map it there. Without
++    // this, a REF/NEXT/CALL into the scratchpad read main RAM at the low offset instead. PS2X_DMA_SPR_BIT=0 disables it.
++    uint32_t dmaSprBitAddress(uint32_t addr)
++    {
++        static const bool enabled = []
++        {
++            const char *v = std::getenv("PS2X_DMA_SPR_BIT");
++            return !(v && *v == '0');
++        }();
++        if ((addr & 0x80000000u) == 0u)
++            return addr;
++        if (!enabled || ps2IsScratchpadAddress(addr))
++            return addr & 0x7FFFFFFFu;
++        return PS2_SCRATCHPAD_BASE | (addr & 0x3FF0u);
++    }
++
++    // DMAC channel index (D_STAT bit) from a channel register base.
++    int dmaChannelIndex(uint32_t channelBase)
++    {
++        switch (channelBase)
++        {
++        case 0x10008000u: return 0;
++        case 0x10009000u: return 1;
++        case 0x1000A000u: return 2;
++        case 0x1000B000u: return 3;
++        case 0x1000B400u: return 4;
++        case 0x1000C000u: return 5;
++        case 0x1000C400u: return 6;
++        case 0x1000C800u: return 7;
++        case 0x1000D000u: return 8;
++        case 0x1000D400u: return 9;
++        default: return -1;
++        }
++    }
++}
++
+ void ps2SetHostIpu(const PS2HostIpu &hooks)
+ {
+     g_hostIpu = hooks;
+@@ -1431,14 +1488,20 @@
+             }
+ 
+             const uint32_t channelBase = address & 0xFFFFFF00;
+-            const uint32_t madr = m_ioRegisters[channelBase + 0x10];
++            const uint32_t madr = dmaSprBitAddress(m_ioRegisters[channelBase + 0x10]);
+             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
+             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
++            const int statsChannel = dmaChannelIndex(channelBase);
++            const bool stats = ps2DmaStatsEnabled() && statsChannel >= 0;
++            if (stats)
++                ps2DmaStats().dmaStart[statsChannel][(value >> 2) & 3u].fetch_add(1, std::memory_order_relaxed);
+ 
+             if (tryProcessScratchpadDma(channelBase, value))
+             {
+                 return true;
+             }
++            if (stats && (statsChannel == 8 || statsChannel == 9))
++                ps2DmaStats().dmaUnhandled[statsChannel][(value >> 2) & 3u].fetch_add(1, std::memory_order_relaxed);
+ 
+             if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
+             {
+@@ -1468,12 +1531,13 @@
+                 }
+                 else if (mode == 1)
+                 {
+-                    uint32_t tagAddr = m_ioRegisters[channelBase + 0x30];
++                    uint32_t tagAddr = dmaSprBitAddress(m_ioRegisters[channelBase + 0x30]);
+                     uint32_t asr0 = m_ioRegisters[channelBase + 0x40];
+                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
+                     uint32_t asp = (chcr >> 4) & 0x3u;
+                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+-                    const int kMaxChainTags = 4096;
++                    // Only a runaway guard: Killzone gameplay frames are ~4400 tags in one VIF1 chain (PCSX2 savestate).
++                    const int kMaxChainTags = 1 << 20;
+                     std::vector<uint8_t> chainBuf;
+ 
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+@@ -1567,9 +1631,12 @@
+                         uint16_t tagQwc = static_cast<uint16_t>(tag & 0xFFFF);
+                         uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7);
+                         const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
+-                        uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
++                        uint32_t addr = dmaSprBitAddress(static_cast<uint32_t>(tag >> 32));
+                         lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
+                         ++tagsProcessed;
++                        if (stats && channelBase == 0x10009000u && (tag >> 63) != 0ull &&
++                            (id == 0u || id == 2u || id == 3u || id == 4u || id == 5u))
++                            ps2DmaStats().vif1SprTagAddr.fetch_add(1, std::memory_order_relaxed);
+ 
+                         uint32_t dataAddr = 0;
+                         bool hasPayload = (tagQwc > 0);
+@@ -1650,6 +1717,14 @@
+                             break;
+                     }
+ 
++                    if (stats && channelBase == 0x10009000u)
++                    {
++                        PS2DmaStats &st = ps2DmaStats();
++                        st.vif1Chains.fetch_add(1, std::memory_order_relaxed);
++                        st.vif1Tags.fetch_add(static_cast<uint64_t>(tagsProcessed), std::memory_order_relaxed);
++                        if (tagsProcessed >= kMaxChainTags)
++                            st.vif1ChainTagLimit.fetch_add(1, std::memory_order_relaxed);
++                    }
+                     m_ioRegisters[channelBase + 0x30] = tagAddr;
+                     m_ioRegisters[channelBase + 0x40] = asr0;
+                     m_ioRegisters[channelBase + 0x50] = asr1;
+@@ -1713,6 +1788,20 @@
+     return false;
+ }
+ 
++namespace
++{
++    // PS2X_SPR_CHAIN=0 turns scratchpad chain-mode DMA back off (debugging / A-B comparison).
++    bool sprChainEnabled()
++    {
++        static const bool enabled = []
++        {
++            const char *v = std::getenv("PS2X_SPR_CHAIN");
++            return !(v && *v == '0');
++        }();
++        return enabled;
++    }
++}
++
+ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
+ {
+     static constexpr uint32_t kSprFromChannel = 0x1000D000u;
+@@ -1724,6 +1813,173 @@
+     // qwords skipped after each block, while the scratchpad side stays contiguous (EE User's Manual, 5.6 / D_SQWC).
+     // libmpeg audio (Killzone's PSS player) deinterleaves stereo PCM with a toSPR interleave transfer.
+     const uint32_t mode = (chcr >> 2u) & 0x3u;
++    if (mode == 1u && sprChainEnabled())
++    {
++        // Chain mode (EE User's Manual 5.4/5.6, PCSX2 SPR.cpp).
++        //  toSPR (ch9) is a source chain: DMAtags are read from main memory at TADR (REFE/CNT/NEXT/REF/REFS/CALL/
++        //  RET/END, as for VIF1/GIF); with CHCR.TTE the whole 128-bit tag is written to the scratchpad before its data.
++        //  fromSPR (ch8) is a destination chain: each DMAtag is read from the scratchpad at SADR (CNTS/CNT/END); its
++        //  data follows it in the scratchpad and goes to main memory at the tag's ADDR.
++        // Both stop after END, REFE or RET with an empty call stack, or after a tag with IRQ set when CHCR.TIE is set.
++        const bool fromScratchpad = channelBase == kSprFromChannel;
++        uint32_t sadr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
++        uint32_t tadr = m_ioRegisters[channelBase + 0x30u];
++        uint32_t madr = m_ioRegisters[channelBase + 0x10u];
++        uint32_t asr[2] = {m_ioRegisters[channelBase + 0x40u], m_ioRegisters[channelBase + 0x50u]};
++        uint32_t asp = (chcr >> 4u) & 3u;
++        const bool tte = (chcr & 0x40u) != 0u;
++        const bool tie = (chcr & 0x80u) != 0u;
++        uint32_t lastTagUpper = chcr >> 16u;
++        const bool stats = ps2DmaStatsEnabled();
++
++        // Main-memory side of a transfer (PCSX2 masks the SPR bit off for the SPR channels' memory side too).
++        auto mainPtr = [&](uint32_t addr, uint32_t bytes) -> uint8_t *
++        {
++            const uint32_t phys = addr & 0x01FFFFF0u;
++            if (phys >= PS2_RAM_SIZE || bytes > PS2_RAM_SIZE - phys)
++                return nullptr;
++            return m_rdram + phys;
++        };
++        auto toSpr = [&](const uint8_t *src, uint32_t bytes)
++        {
++            while (bytes != 0u)
++            {
++                const uint32_t chunk = std::min<uint32_t>(bytes, PS2_SCRATCHPAD_SIZE - sadr);
++                std::memcpy(m_scratchpad + sadr, src, chunk);
++                src += chunk;
++                bytes -= chunk;
++                sadr = (sadr + chunk) & (PS2_SCRATCHPAD_SIZE - 1u);
++            }
++        };
++        auto fromSpr = [&](uint32_t dstAddr, uint32_t bytes)
++        {
++            uint8_t *dst = mainPtr(dstAddr, bytes);
++            if (!dst)
++            {
++                sadr = (sadr + bytes) & (PS2_SCRATCHPAD_SIZE - 1u);
++                return;
++            }
++            markModified(dstAddr & 0x01FFFFF0u, bytes);
++            while (bytes != 0u)
++            {
++                const uint32_t chunk = std::min<uint32_t>(bytes, PS2_SCRATCHPAD_SIZE - sadr);
++                std::memcpy(dst, m_scratchpad + sadr, chunk);
++                dst += chunk;
++                bytes -= chunk;
++                sadr = (sadr + chunk) & (PS2_SCRATCHPAD_SIZE - 1u);
++            }
++        };
++
++        // A chain start with QWC != 0 first transfers MADR/QWC.
++        const uint32_t startQwc = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
++        if (startQwc != 0u)
++        {
++            if (fromScratchpad)
++                fromSpr(madr, startQwc * 16u);
++            else if (const uint8_t *mem = mainPtr(madr, startQwc * 16u))
++                toSpr(mem, startQwc * 16u);
++            madr += startQwc * 16u;
++        }
++
++        for (int tags = 0; tags < 16384; ++tags)
++        {
++            uint64_t tag[2] = {0u, 0u};
++            if (fromScratchpad)
++            {
++                std::memcpy(tag, m_scratchpad + sadr, 16u);
++                sadr = (sadr + 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
++            }
++            else
++            {
++                const uint8_t *tp = ((tadr & 0x80000000u) != 0u || ps2IsScratchpadAddress(tadr))
++                                        ? m_scratchpad + (tadr & 0x3FF0u)
++                                        : mainPtr(tadr, 16u);
++                if (!tp)
++                    break;
++                std::memcpy(tag, tp, 16u);
++            }
++            if (stats)
++                ps2DmaStats().sprChainTags.fetch_add(1, std::memory_order_relaxed);
++
++            const uint32_t tagQwc = static_cast<uint32_t>(tag[0] & 0xFFFFu);
++            const uint32_t id = static_cast<uint32_t>((tag[0] >> 28) & 7u);
++            const bool irq = ((tag[0] >> 31) & 1u) != 0u;
++            const uint32_t addr = static_cast<uint32_t>(tag[0] >> 32);
++            lastTagUpper = static_cast<uint32_t>((tag[0] >> 16) & 0xFFFFu);
++            bool end = false;
++
++            if (fromScratchpad)
++            {
++                madr = addr;
++                if (id == 7u)
++                    end = true;
++                if (tagQwc != 0u)
++                    fromSpr(madr, tagQwc * 16u);
++                madr += tagQwc * 16u;
++            }
++            else
++            {
++                uint32_t dataAddr = tadr + 16u;
++                switch (id)
++                {
++                case 0u: // REFE
++                    dataAddr = addr;
++                    tadr += 16u;
++                    end = true;
++                    break;
++                case 1u: // CNT
++                    tadr = dataAddr + tagQwc * 16u;
++                    break;
++                case 2u: // NEXT
++                    tadr = addr;
++                    break;
++                case 3u: // REF
++                case 4u: // REFS
++                    dataAddr = addr;
++                    tadr += 16u;
++                    break;
++                case 5u: // CALL
++                    if (asp < 2u)
++                        asr[asp++] = dataAddr + tagQwc * 16u;
++                    tadr = addr;
++                    break;
++                case 6u: // RET
++                    if (asp > 0u)
++                        tadr = asr[--asp];
++                    else
++                        end = true;
++                    break;
++                default: // END
++                    end = true;
++                    break;
++                }
++                if (tte)
++                    toSpr(reinterpret_cast<const uint8_t *>(tag), 16u);
++                if (tagQwc != 0u)
++                {
++                    if (const uint8_t *mem = mainPtr(dataAddr, tagQwc * 16u))
++                        toSpr(mem, tagQwc * 16u);
++                    else
++                        sadr = (sadr + tagQwc * 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
++                }
++                madr = dataAddr + tagQwc * 16u;
++            }
++            if (irq && tie)
++                end = true;
++            if (end)
++                break;
++        }
++
++        m_ioRegisters[channelBase + 0x10u] = madr;
++        m_ioRegisters[channelBase + 0x20u] = 0u;
++        m_ioRegisters[channelBase + 0x30u] = tadr;
++        m_ioRegisters[channelBase + 0x40u] = asr[0];
++        m_ioRegisters[channelBase + 0x50u] = asr[1];
++        m_ioRegisters[channelBase + 0x80u] = sadr;
++        m_ioRegisters[channelBase] = (chcr & 0x0000FFCFu) | ((asp & 3u) << 4u) | (lastTagUpper << 16u);
++        completeDmacChannel(channelBase, fromScratchpad ? 8u : 9u);
++        return true;
++    }
+     if (mode != 0u && mode != 2u)
+         return false;
+     uint32_t blockBytes = 0u; // 0 = contiguous
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,6 +1,11 @@
+ // Based on Blackline Interactive implementation
+ #include "runtime/ps2_memory.h"
++#include "runtime/ps2_dma_stats.h"
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <string>
+ 
+ enum VIFCmd : uint8_t
+ {
+@@ -30,6 +35,191 @@
+ {
+     constexpr uint8_t kGifFmtImage = 2u;
+ 
++    // PS2X_VIF1_DUMP=<dir>: writes every VIF1 buffer (the bytes processVIF1Data gets: a whole DMA chain with its TTE
++    // VIFcodes, or a normal-mode block) as vif1_NNNNN.bin, starting PS2X_VIF1_DUMP_AFTER seconds after the first
++    // VIF1 transfer, at most PS2X_VIF1_DUMP_MAX (default 400) buffers. With the first one it also writes the VU1
++    // micro memory (vu1code.bin) and the scratchpad (spr.bin); vu1code.bin is rewritten whenever MPG changes it.
++    struct Vif1Dump
++    {
++        std::string dir;
++        double after = 0.0;
++        uint32_t max = 400u;
++        uint32_t written = 0u;
++        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++    };
++
++    Vif1Dump *vif1Dump()
++    {
++        static Vif1Dump *dump = []() -> Vif1Dump *
++        {
++            const char *dir = std::getenv("PS2X_VIF1_DUMP");
++            if (!dir || !*dir)
++                return nullptr;
++            auto *d = new Vif1Dump();
++            d->dir = dir;
++            if (const char *v = std::getenv("PS2X_VIF1_DUMP_AFTER"))
++                d->after = std::atof(v);
++            if (const char *v = std::getenv("PS2X_VIF1_DUMP_MAX"))
++                d->max = static_cast<uint32_t>(std::atoi(v));
++            return d;
++        }();
++        return dump;
++    }
++
++    // PS2X_VIF_UNPACK=legacy keeps PS2Recomp's original VIF1 UNPACK code (A/B comparison).
++    bool legacyVif1Unpack()
++    {
++        static const bool legacy = []
++        {
++            const char *v = std::getenv("PS2X_VIF_UNPACK");
++            return v && std::strcmp(v, "legacy") == 0;
++        }();
++        return legacy;
++    }
++
++    // Bytes of source data per vector, by VN<<2|VL (PCSX2 nVifT).
++    constexpr uint8_t kVifGsize[16] = {4, 2, 1, 0, 8, 4, 2, 0, 12, 6, 3, 0, 16, 8, 4, 2};
++
++    // VIF1 UNPACK with PCSX2's semantics (Vif_Unpack.cpp: vifUnpackSetup, _nVifUnpackLoop, UNPACK_S/V2/V4/V4_5,
++    // writeXYZW):
++    //  - WL = 0 means 256; fill mode is CL < WL. In fill mode the source pointer only advances for the first CL
++    //    writes of a block; the other writes see the next (not yet consumed) vector, normally masked to row/col.
++    //  - S-xx broadcasts; V2 writes x,y,x,y; V3 reads four elements (W = the next vector's first element);
++    //    V4-5 expands 5:5:5:1 to 8-bit channels (<<3) and ignores STMOD.
++    //  - STMOD 1 adds the row, 2 adds and stores the row, 3 stores the data into the row.
++    //  - The mask row is chosen by the write-cycle counter (min(cl, 3)), the column register the same way.
++    //  - The destination address wraps in VU1 memory (0x3FF0).
++    // data/dataBytes is the source stream for this UNPACK; reads past it return zero.
++    void vif1UnpackPcsx2(uint8_t *vuMem, uint32_t vuMemSize, VIFRegisters &regs, uint32_t cmd, const uint8_t *data,
++                         uint32_t dataBytes)
++    {
++        const uint32_t upk = (cmd >> 24) & 0x1Fu; // mask bit | VN | VL
++        const uint32_t vnvl = upk & 0xFu;
++        const bool doMask = (upk & 0x10u) != 0u;
++        const bool usn = (cmd & 0x4000u) != 0u;
++        const uint32_t vsize = kVifGsize[vnvl];
++        if (vsize == 0u)
++            return; // invalid unpack (PCSX2 only warns)
++        uint32_t num = (cmd >> 16) & 0xFFu;
++        if (num == 0u)
++            num = 256u;
++        const uint32_t cl = regs.cycle & 0xFFu;
++        const uint32_t wl = ((regs.cycle >> 8) & 0xFFu) ? ((regs.cycle >> 8) & 0xFFu) : 256u;
++        const bool isFill = cl < wl;
++        const uint32_t mode = (vnvl == 15u) ? 0u : (regs.mode & 3u);
++        uint32_t addr = cmd & 0x3FFu;
++        if ((cmd & 0x8000u) != 0u)
++            addr += regs.tops;
++        addr = (addr << 4) & 0x3FF0u;
++        const uint32_t skipBytes = isFill ? 0u : (cl - wl) * 16u;
++        const uint32_t vl = vnvl & 3u;
++        const uint32_t vn = vnvl >> 2;
++
++        auto element = [&](uint32_t offset, uint32_t index) -> uint32_t
++        {
++            const uint32_t bytes = 4u >> vl; // 4, 2, 1
++            const uint32_t at = offset + index * bytes;
++            if (at + bytes > dataBytes)
++                return 0u;
++            if (vl == 0u)
++            {
++                uint32_t v;
++                std::memcpy(&v, data + at, 4);
++                return v;
++            }
++            if (vl == 1u)
++            {
++                uint16_t v;
++                std::memcpy(&v, data + at, 2);
++                return usn ? static_cast<uint32_t>(v) : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(v)));
++            }
++            const uint8_t v = data[at];
++            return usn ? static_cast<uint32_t>(v) : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(v)));
++        };
++
++        uint32_t src = 0u;  // byte offset of the current source vector
++        uint32_t vcl = 0u;  // write-cycle counter (PCSX2 vif.cl)
++        for (uint32_t n = 0; n < num; ++n)
++        {
++            uint32_t in[4];
++            if (vnvl == 15u)
++            {
++                uint16_t v = 0;
++                if (src + 2u <= dataBytes)
++                    std::memcpy(&v, data + src, 2);
++                in[0] = (v & 0x001Fu) << 3;
++                in[1] = (v & 0x03E0u) >> 2;
++                in[2] = (v & 0x7C00u) >> 7;
++                in[3] = (v & 0x8000u) >> 8;
++            }
++            else if (vn == 0u)
++            {
++                in[0] = in[1] = in[2] = in[3] = element(src, 0);
++            }
++            else if (vn == 1u)
++            {
++                in[0] = in[2] = element(src, 0);
++                in[1] = in[3] = element(src, 1);
++            }
++            else // V3 and V4 read four elements
++            {
++                for (uint32_t c = 0; c < 4u; ++c)
++                    in[c] = element(src, c);
++            }
++
++            uint32_t *dest = reinterpret_cast<uint32_t *>(vuMem + (addr & (vuMemSize - 16u)));
++            const uint32_t maskCycle = vcl < 3u ? vcl : 3u;
++            for (uint32_t f = 0; f < 4u; ++f)
++            {
++                const uint32_t m = doMask ? (regs.mask >> (maskCycle * 8u + f * 2u)) & 3u : 0u;
++                switch (m)
++                {
++                case 0:
++                    switch (mode)
++                    {
++                    case 1: dest[f] = in[f] + regs.row[f]; break;
++                    case 2: regs.row[f] += in[f]; dest[f] = regs.row[f]; break;
++                    case 3: regs.row[f] = in[f]; dest[f] = in[f]; break;
++                    default: dest[f] = in[f]; break;
++                    }
++                    break;
++                case 1: dest[f] = regs.row[f]; break;
++                case 2: dest[f] = regs.col[maskCycle]; break;
++                default: break; // write protect
++                }
++            }
++
++            addr += 16u;
++            ++vcl;
++            if (isFill)
++            {
++                if (vcl <= cl)
++                    src += vsize;
++                else if (vcl == wl)
++                    vcl = 0u;
++            }
++            else
++            {
++                src += vsize;
++                if (vcl >= wl)
++                {
++                    addr += skipBytes;
++                    vcl = 0u;
++                }
++            }
++        }
++        regs.num = 0u;
++    }
++
++    void writeFile(const std::string &path, const void *data, size_t size)
++    {
++        if (FILE *f = std::fopen(path.c_str(), "wb"))
++        {
++            std::fwrite(data, 1, size, f);
++            std::fclose(f);
++        }
++    }
++
+     uint32_t pendingGifImageQwc(const uint8_t *data, uint32_t sizeBytes)
+     {
+         if (!data || sizeBytes < 16u)
+@@ -341,6 +531,33 @@
+     if (sizeBytes == 0u)
+         return;
+ 
++    if (Vif1Dump *dump = vif1Dump())
++    {
++        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - dump->start).count();
++        if (t >= dump->after && dump->written < dump->max)
++        {
++            char name[64];
++            std::snprintf(name, sizeof(name), "/vif1_%05u.bin", dump->written);
++            writeFile(dump->dir + name, data, sizeBytes);
++            if (dump->written == 0u)
++            {
++                writeFile(dump->dir + "/spr.bin", m_scratchpad, PS2_SCRATCHPAD_SIZE);
++                writeFile(dump->dir + "/vu1code.bin", m_vu1Code, PS2_VU1_CODE_SIZE);
++            }
++            ++dump->written;
++        }
++    }
++
++    const bool stats = ps2DmaStatsEnabled();
++    PS2DmaStats &st = ps2DmaStats();
++    if (stats)
++        st.vif1Bytes.fetch_add(sizeBytes, std::memory_order_relaxed);
++    auto count = [&](std::atomic<uint64_t> &c, uint64_t n = 1u)
++    {
++        if (stats)
++            c.fetch_add(n, std::memory_order_relaxed);
++    };
++
+     uint32_t pos = 0;
+ 
+     while (pos + 4 <= sizeBytes)
+@@ -409,6 +626,7 @@
+         else if (opcode == VIF_STMOD)
+         {
+             vif1_regs.mode = imm & 3u;
++            count(st.vif1Stmod[imm & 3u]);
+             continue;
+         }
+         else if (opcode == VIF_MSKPATH3)
+@@ -446,6 +664,7 @@
+                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
+             vif1_regs.stat ^= (1u << 7); // toggle DBF
+ 
++            count(st.vif1Mscal);
+             if (m_vu1MscalCallback)
+                 m_vu1MscalCallback(startPC, runTop, runItop);
+             continue;
+@@ -464,6 +683,7 @@
+                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
+             vif1_regs.stat ^= (1u << 7); // toggle DBF
+ 
++            count(st.vif1Mscnt);
+             if (m_vu1MscntCallback)
+                 m_vu1MscntCallback(runTop, runItop);
+             continue;
+@@ -496,6 +716,7 @@
+         }
+         else if (opcode == VIF_MPG)
+         {
++            count(st.vif1Mpg);
+             uint32_t destAddr = (uint32_t)imm * 8u;
+             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
+             const uint32_t mpgBytes = instructionCount * 8u;
+@@ -527,6 +748,8 @@
+                 qwCount = availableQw;
+ 
+             const bool directHl = (opcode == VIF_DIRECTHL);
++            count(st.vif1Direct);
++            count(st.vif1DirectQw, requestedQw);
+             if (truncated)
+             {
+                 // The rest of this DIRECT's data starts the next buffer (see m_vif1PendingDirectQwc).
+@@ -601,6 +824,29 @@
+                 vuAddr = (vuAddr + (vif1_regs.tops & 0x3FFu)) & 0x3FFu;
+ 
+             const bool zeroExtend = (imm & 0x4000u) != 0u;
++            count(st.vif1Unpack[(vn << 2) | vl]);
++            if (maskEnable)
++                count(st.vif1UnpackMasked);
++            if (pos + totalBytes > sizeBytes)
++                count(st.vif1UnpackDropped);
++            else
++                count(st.vif1UnpackQw, writeVectorCount);
++
++            if (!legacyVif1Unpack())
++            {
++                // PCSX2 source size: fill mode reads CL vectors per WL block (WL = 0 means 256).
++                const uint32_t pcl = vif1_regs.cycle & 0xFFu;
++                const uint32_t pwl = ((vif1_regs.cycle >> 8) & 0xFFu) ? ((vif1_regs.cycle >> 8) & 0xFFu) : 256u;
++                const uint32_t srcVectors = (pcl < pwl) ? pcl * (writeVectorCount / pwl) + std::min(writeVectorCount % pwl, pcl)
++                                                        : writeVectorCount;
++                const uint32_t srcBytes = (srcVectors * kVifGsize[opcode & 0xFu] + 3u) & ~3u;
++                if (m_vu1Data && pos + srcBytes <= sizeBytes)
++                    vif1UnpackPcsx2(m_vu1Data, PS2_VU1_DATA_SIZE, vif1_regs, cmd, data + pos, srcBytes);
++                pos += srcBytes;
++                if (pos > sizeBytes)
++                    break;
++                continue;
++            }
+ 
+             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+             {
+@@ -807,6 +1053,7 @@
+         }
+         else
+         {
++            count(st.vif1Unknown);
+             continue;
+         }
+     }
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -15,6 +15,81 @@
+ #include "runtime/ps2_host_gs.h"
+ #include "runtime/ps2_host_vu.h"
+ #include "runtime/ps2_host_vu0.h"
++#include "runtime/ps2_dma_stats.h"
++#include <array>
++#include <cstdio>
++
++namespace
++{
++    // PS2X_DMA_STATS=1: one line per headless heartbeat with the DMAC/VIF1/VU1 counters since the previous one.
++    void printDmaStatsDelta()
++    {
++        static std::array<uint64_t, 256> prev{};
++        PS2DmaStats &st = ps2DmaStats();
++        size_t slot = 0;
++        auto d = [&](const std::atomic<uint64_t> &c) -> unsigned long long
++        {
++            const uint64_t v = c.load(std::memory_order_relaxed);
++            const uint64_t r = v - prev[slot];
++            prev[slot++] = v;
++            return static_cast<unsigned long long>(r);
++        };
++        std::string starts;
++        for (int ch = 0; ch < 10; ++ch)
++            for (int m = 0; m < 4; ++m)
++            {
++                const unsigned long long n = d(st.dmaStart[ch][m]);
++                const unsigned long long u = d(st.dmaUnhandled[ch][m]);
++                if (n == 0 && u == 0)
++                    continue;
++                char buf[64];
++                std::snprintf(buf, sizeof(buf), " ch%d.m%d=%llu", ch, m, n);
++                starts += buf;
++                if (u)
++                {
++                    std::snprintf(buf, sizeof(buf), "(dropped %llu)", u);
++                    starts += buf;
++                }
++            }
++        std::string unpack;
++        static const char *kNames[16] = {"S32", "S16", "S8", "S?", "V2_32", "V2_16", "V2_8", "V2?", "V3_32", "V3_16",
++                                         "V3_8", "V3?", "V4_32", "V4_16", "V4_8", "V4_5"};
++        for (int i = 0; i < 16; ++i)
++        {
++            const unsigned long long n = d(st.vif1Unpack[i]);
++            if (!n)
++                continue;
++            char buf[48];
++            std::snprintf(buf, sizeof(buf), " %s:%llu", kNames[i], n);
++            unpack += buf;
++        }
++        std::string prims;
++        for (int i = 0; i < 8; ++i)
++        {
++            const unsigned long long n = d(st.vu1XgkickPrim[i]);
++            if (!n)
++                continue;
++            char buf[32];
++            std::snprintf(buf, sizeof(buf), " p%d:%llu", i, n);
++            prims += buf;
++        }
++        const unsigned long long sprTags = d(st.sprChainTags), chains = d(st.vif1Chains), tags = d(st.vif1Tags),
++                                 bytes = d(st.vif1Bytes), limit = d(st.vif1ChainTagLimit), sprAddr = d(st.vif1SprTagAddr),
++                                 masked = d(st.vif1UnpackMasked), dropped = d(st.vif1UnpackDropped),
++                                 unpackQw = d(st.vif1UnpackQw), mpg = d(st.vif1Mpg), mscal = d(st.vif1Mscal),
++                                 mscnt = d(st.vif1Mscnt), direct = d(st.vif1Direct), directQw = d(st.vif1DirectQw),
++                                 unknown = d(st.vif1Unknown), m0 = d(st.vif1Stmod[0]), m1 = d(st.vif1Stmod[1]),
++                                 m2 = d(st.vif1Stmod[2]), m3 = d(st.vif1Stmod[3]), kicks = d(st.vu1Xgkick),
++                                 kickBytes = d(st.vu1XgkickBytes), cycles = d(st.vu1Cycles);
++        std::fprintf(stderr,
++                     "[dma] starts:%s | sprtags=%llu | vif1 chains=%llu tags=%llu bytes=%llu taglimit=%llu sprtagaddr=%llu | "
++                     "unpack%s masked=%llu dropped=%llu qw=%llu stmod=%llu/%llu/%llu/%llu mpg=%llu mscal=%llu mscnt=%llu "
++                     "direct=%llu/%lluqw unknown=%llu | vu1 xgkick=%llu bytes=%llu cycles=%llu prims%s\n",
++                     starts.c_str(), sprTags, chains, tags, bytes, limit, sprAddr, unpack.c_str(), masked, dropped,
++                     unpackQw, m0, m1, m2, m3, mpg, mscal, mscnt, direct, directQw, unknown, kicks, kickBytes, cycles,
++                     prims.c_str());
++    }
++}
+ #include "ps2x/iop/iop_subsystem.h"
+ 
+ #include <iostream>
+@@ -2571,6 +2646,8 @@
+                       << " threads=" << ee.threads.size() << " vsync=" << m_eeScheduler->currentVSyncTick()
+                       << " dma=" << m_memory.dmaStartCount() << " gif=" << m_memory.gifCopyCount()
+                       << " gsw=" << m_memory.gsWriteCount() << " vif=" << m_memory.vifWriteCount() << std::endl;
++            if (ps2DmaStatsEnabled())
++                printDmaStatsDelta();
+             if (headless.shotDir.empty())
+                 continue;
+             gs().latchHostPresentationFrame();
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_dma_stats.h
+@@ -0,0 +1,39 @@
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++
++// Debug counters for the DMAC / VIF1 / VU1 path (PS2X_DMA_STATS=1). Written on the EE game thread, read by the
++// headless heartbeat, which prints the per-interval difference. Not included by generated code.
++struct PS2DmaStats
++{
++    using C = std::atomic<uint64_t>;
++    // DMA starts per channel (0 VIF0, 1 VIF1, 2 GIF, 3 fromIPU, 4 toIPU, 5 SIF0, 6 SIF1, 7 SIF2, 8 fromSPR, 9 toSPR)
++    // and CHCR.MOD (0 normal, 1 chain, 2 interleave, 3 invalid).
++    C dmaStart[10][4]{};
++    C dmaUnhandled[10][4]{}; // starts no emulation path consumed (CHCR.STR still reads back as done)
++    C sprChainTags{};        // DMAtags walked by toSPR/fromSPR chain transfers
++    C vif1Chains{};
++    C vif1Tags{};
++    C vif1Bytes{};
++    C vif1ChainTagLimit{}; // chains cut at the tag limit
++    C vif1SprTagAddr{};    // REF/REFS/NEXT/CALL tags whose ADDR has the SPR bit
++    C vif1Unpack[16]{};    // by VN<<2 | VL
++    C vif1UnpackMasked{};
++    C vif1UnpackDropped{}; // UNPACK whose data ran past the buffer
++    C vif1UnpackQw{};      // qwords written to VU1 memory
++    C vif1Mpg{};
++    C vif1Mscal{};
++    C vif1Mscnt{};
++    C vif1Direct{};
++    C vif1DirectQw{};
++    C vif1Unknown{}; // undefined VIFcodes
++    C vif1Stmod[4]{};
++    C vu1Xgkick{};
++    C vu1XgkickBytes{};
++    C vu1Cycles{};
++    C vu1XgkickPrim[8]{}; // PRIM type of the first PRE tag in an XGKICK packet
++};
++
++PS2DmaStats &ps2DmaStats();
++bool ps2DmaStatsEnabled();
+--- a/ps2xRecomp/src/lib/instruction_translator.cpp
++++ b/ps2xRecomp/src/lib/instruction_translator.cpp
+@@ -73,14 +73,23 @@
+         return memoryHint;
+     }
+ 
++    // LQ/SQ/LQC2/SQC2 ignore the low four address bits on the EE (the address is forced to a quadword boundary).
++    // Code relies on it: the unaligned-load idiom "lq t0,0(a); lq t1,16(a); mtsab a,0; qfsrv t0,t1,t0" needs both
++    // loads to return the aligned quadwords around a.
++    static std::string alignQuadwordAddress(int width, const std::string &addr)
++    {
++        return width == 128 ? fmt::format("(({}) & ~0xFu)", addr) : addr;
++    }
++
+     std::string InstructionTranslator::translateMemoryRead(const Instruction &inst,
+                                                            const MemoryAccessHint &memoryHint,
+                                                            int width,
+-                                                           const std::string &addr) const
++                                                           const std::string &rawAddr) const
+     {
++        const std::string addr = alignQuadwordAddress(width, rawAddr);
+         if (memoryHint.hasAddress)
+         {
+-            const uint32_t resolvedAddress = memoryHint.address;
++            const uint32_t resolvedAddress = width == 128 ? (memoryHint.address & ~0xFu) : memoryHint.address;
+             const std::string resolvedAddressExpr = addressLiteral(resolvedAddress);
+             if (inst.isMmio || Ps2IsSpecialAddress(resolvedAddress))
+             {
+@@ -99,12 +108,13 @@
+     std::string InstructionTranslator::translateMemoryWrite(const Instruction &inst,
+                                                             const MemoryAccessHint &memoryHint,
+                                                             int width,
+-                                                            const std::string &addr,
++                                                            const std::string &rawAddr,
+                                                             const std::string &value) const
+     {
++        const std::string addr = alignQuadwordAddress(width, rawAddr);
+         if (memoryHint.hasAddress)
+         {
+-            const uint32_t resolvedAddress = memoryHint.address;
++            const uint32_t resolvedAddress = width == 128 ? (memoryHint.address & ~0xFu) : memoryHint.address;
+             const std::string resolvedAddressExpr = addressLiteral(resolvedAddress);
+             if (inst.isMmio || Ps2IsSpecialAddress(resolvedAddress))
+             {
+--- a/ps2xRecomp/src/lib/fpu_translator.cpp
++++ b/ps2xRecomp/src/lib/fpu_translator.cpp
+@@ -58,7 +58,8 @@
+                                    "ctx->f[{}] = FPU_DIV_S(ctx->f[{}], ctx->f[{}]);",
+                                    ft, fd, fs, ft);
+             case COP1_S_SQRT:
+-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
++                // EE SQRT.S fd, ft takes its operand from the ft field (fs is 0 in the encoding).
++                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, ft);
+             case COP1_S_ABS:
+                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
+             case COP1_S_MOV:
+--- a/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
+@@ -236,7 +236,12 @@
+         case PMFHL_LH:
+             return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_LH(ctx->hi, ctx->lo));", inst.rd);
+         case PMFHL_SH:
+-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_SH(ctx->hi, ctx->lo));", inst.rd);
++            // LO/HI are 128-bit on the EE (upper halves in lo1/hi1): halfwords = sat16(LO.w0, LO.w1, HI.w0, HI.w1,
++            // LO.w2, LO.w3, HI.w2, HI.w3).
++            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_packs_epi32("
++                               "_mm_set_epi64x((int64_t)ctx->hi, (int64_t)ctx->lo), "
++                               "_mm_set_epi64x((int64_t)ctx->hi1, (int64_t)ctx->lo1)));",
++                               inst.rd);
+         default:
+             return emitUnhandledInstruction(inst, fmt::format("Unhandled PMFHL instruction: function 0x{:X}", subfunc));
+         }
+@@ -454,16 +459,16 @@
+ 
+     std::string CodeGenerator::translatePEXEH(const Instruction &inst)
+     {
+-        // Swaps halfwords 1<->3 and 5<->7 within the 128-bit register
+-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shufflelo_epi16(_mm_shufflehi_epi16(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,3,0,1)), _MM_SHUFFLE(2,3,0,1)));",
++        // Exchanges halfwords 0<->2 and 4<->6 (EE PEXEH: rd.h0 = rt.h2, rd.h2 = rt.h0, odd halfwords unchanged)
++        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shufflelo_epi16(_mm_shufflehi_epi16(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,0,1,2)), _MM_SHUFFLE(3,0,1,2)));",
+                            inst.rd, inst.rt);
+     }
+ 
+ 
+     std::string CodeGenerator::translatePREVH(const Instruction &inst)
+     {
+-        // Reverses the order of the 8 halfwords
+-        return fmt::format("{{ __m128i mask = _mm_setr_epi8(14,15, 12,13, 10,11, 8,9, 6,7, 4,5, 2,3, 0,1); "
++        // Reverses the four halfwords within each doubleword (EE PREVH: rd.h0 = rt.h3 ... rd.h4 = rt.h7 ...)
++        return fmt::format("{{ __m128i mask = _mm_setr_epi8(6,7, 4,5, 2,3, 0,1, 14,15, 12,13, 10,11, 8,9); "
+                            "SET_GPR_VEC(ctx, {}, PS2_SHUFFLE_EPI8(GPR_VEC(ctx, {}), mask)); }}",
+                            inst.rd, inst.rt);
+     }
+@@ -471,15 +476,16 @@
+ 
+     std::string CodeGenerator::translatePMULTH(const Instruction &inst)
+     {
+-        // Parallel multiply halfword, results sum to HI/LO and rd
+-        return fmt::format("{{ __m128i prod = _mm_madd_epi16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})); \n"
+-                           "   int32_t p0 = _mm_cvtsi128_si32(prod); \n"
+-                           "   int32_t p1 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 4)); \n"
+-                           "   int32_t p2 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 8)); \n"
+-                           "   int32_t p3 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 12)); \n"
+-                           "   int64_t result = (int64_t)p0 + (int64_t)p1 + (int64_t)p2 + (int64_t)p3; \n"
+-                           "   ctx->lo = (uint32_t)result; ctx->hi = (uint32_t)(result >> 32); \n"
+-                           "   SET_GPR_U64(ctx, {}, result); }}",
++        // EE PMULTH: eight signed halfword products p0..p7 (32-bit each). LO = {p0, p1, p4, p5}, HI = {p2, p3, p6, p7}
++        // (128-bit; upper halves in lo1/hi1), rd = {p0, p2, p4, p6}.
++        return fmt::format("{{ alignas(16) int16_t a[8]; alignas(16) int16_t b[8]; int32_t p[8]; \n"
++                           "   _mm_store_si128((__m128i *)a, GPR_VEC(ctx, {})); _mm_store_si128((__m128i *)b, GPR_VEC(ctx, {})); \n"
++                           "   for (int i = 0; i < 8; ++i) p[i] = (int32_t)a[i] * (int32_t)b[i]; \n"
++                           "   ctx->lo = (uint64_t)(uint32_t)p[0] | ((uint64_t)(uint32_t)p[1] << 32); \n"
++                           "   ctx->hi = (uint64_t)(uint32_t)p[2] | ((uint64_t)(uint32_t)p[3] << 32); \n"
++                           "   ctx->lo1 = (uint64_t)(uint32_t)p[4] | ((uint64_t)(uint32_t)p[5] << 32); \n"
++                           "   ctx->hi1 = (uint64_t)(uint32_t)p[6] | ((uint64_t)(uint32_t)p[7] << 32); \n"
++                           "   SET_GPR_VEC(ctx, {}, _mm_set_epi32(p[6], p[4], p[2], p[0])); }}",
+                            inst.rs, inst.rt, inst.rd);
+     }
+ 
+@@ -513,7 +519,8 @@
+ 
+     std::string CodeGenerator::translatePEXEW(const Instruction &inst)
+     {
+-        return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PEXEW(GPR_VEC(ctx, {})));",
++        // EE PEXEW: rd.w0 = rt.w2, rd.w2 = rt.w0, w1/w3 unchanged.
++        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,0,1,2)));",
+                            inst.rd, inst.rt);
+     }
+ 
+@@ -560,8 +567,8 @@
+ 
+     std::string CodeGenerator::translatePEXCH(const Instruction &inst)
+     {
+-        // Parallel Exchange Center Halfword (same as MMI2 PEXEH)
+-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shufflelo_epi16(_mm_shufflehi_epi16(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,3,0,1)), _MM_SHUFFLE(2,3,0,1)));",
++        // Parallel Exchange Center Halfword: halfwords 1<->2 and 5<->6
++        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shufflelo_epi16(_mm_shufflehi_epi16(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,1,2,0)), _MM_SHUFFLE(3,1,2,0)));",
+                            inst.rd, inst.rt);
+     }
+ 
+@@ -577,8 +584,8 @@
+ 
+     std::string CodeGenerator::translatePEXCW(const Instruction &inst)
+     {
+-        // Parallel Exchange Center Word (Swaps words 0<>2, 1<>3)
+-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(1,0,3,2)));",
++        // Parallel Exchange Center Word: words 1<->2
++        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,1,2,0)));",
+                            inst.rd, inst.rt);
+     }
+ 

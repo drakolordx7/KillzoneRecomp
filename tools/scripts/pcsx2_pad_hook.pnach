@@ -1,0 +1,26 @@
+gametitle=Killzone (SCUS-97402) - KillzoneRecomp reference-run input hook (temporary)
+// scePadRead call at 0x416d98 goes through a cave at 0xFF000 that clears the buttons in the word at 0xFFF00
+// (active-high mask, written over PINE) from the pad reply, and sets the cross pressure byte when cross is in it.
+patch=1,EE,00416d98,word,0C03FC00
+patch=1,EE,000FF000,word,27BDFFE0
+patch=1,EE,000FF004,word,FFBF0000
+patch=1,EE,000FF008,word,FFA60008
+patch=1,EE,000FF00C,word,0C0AB422
+patch=1,EE,000FF010,word,00000000
+patch=1,EE,000FF014,word,DFA60008
+patch=1,EE,000FF018,word,DFBF0000
+patch=1,EE,000FF01C,word,3C080010
+patch=1,EE,000FF020,word,8D08FF00
+patch=1,EE,000FF024,word,1100000A
+patch=1,EE,000FF028,word,00000000
+patch=1,EE,000FF02C,word,94C90002
+patch=1,EE,000FF030,word,01005027
+patch=1,EE,000FF034,word,012A4824
+patch=1,EE,000FF038,word,A4C90002
+patch=1,EE,000FF03C,word,310B4000
+patch=1,EE,000FF040,word,11600003
+patch=1,EE,000FF044,word,240C00FF
+patch=1,EE,000FF048,word,A0CC000E
+patch=1,EE,000FF04C,word,00000000
+patch=1,EE,000FF050,word,03E00008
+patch=1,EE,000FF054,word,27BD0020

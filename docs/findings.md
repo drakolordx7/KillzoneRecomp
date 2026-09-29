@@ -113,3 +113,35 @@ The ELF is stripped, so Sony library functions are identified by `ps2_analyzer`'
   the runtime now uses vu0_cmsar0 (patch 0007). No capture came from these two sites, so the fix is untested in-game.
 - PS2Recomp's interpreter vs microVU0/PCSX2 interpreter on clean captured inputs: identical except program 0xD18,
   where `FMAND vi1, vi3` sees a different MAC flag and the program branches the other way (ext/kzvu/README.md).
+
+## Gameplay 3D (2026-09-29)
+- Symptom: in the first mission only the HUD, tutorial prompts and post-effect passes rendered, over a red scene buffer.
+  The EE was not submitting the world. Measured per frame: ours had 108 MSCAL, 468 UNPACK and ~250 DMA tags. PCSX2 had
+  915 MSCAL, 6803 UNPACK and 4381 tags. The PCSX2 figures come from the frame chain in a gameplay savestate.
+- **PCSX2 gameplay reference:** `tools/pcsx2/sstates/SCUS-97402 (CAAEC49C).09.p2s` and `.10.p2s`, taken at the first
+  tutorial prompt ("Press R1"). `tools/scripts/pcsx2_drive.py` produced them, driving PCSX2 through PINE and the pnach
+  pad hook.
+  - Useful addresses (same in both runtimes, static data):
+    - `0x559040` holds the start of the frame's VIF1 chain. `chain2buf.py` walks it and `vifparse.py` parses it.
+    - RenderZoneManager vtable `0x531448`: +0x30 zone count, +0x34 zone array.
+    - RenderZone world AABB: min at +0xA0, max at +0xAC.
+    - Player entity vtable `0x525710`: position at +0x210.
+- **Chain of causes, each fix measured in a run:**
+  1. **Unaligned LQ.** FUN_003107a8 builds each RenderZone's world AABB with FUN_002c84d8, which loads the local box
+     max with the unaligned `lq/lq/qfsrv` idiom. The generated LQ did not align the address, so every zone box came out
+     flat and the camera was in no zone.
+     - After the fix, the zone boxes match PCSX2 to 1 ulp, and the weapon plus the world batches (27k strip vertices per
+       12 vsyncs) are submitted.
+     - The camera was then 1.7e5 units below the level: the player fell.
+  2. **SQRT.S read fs.** After the fix, the player x/y equal PCSX2's exactly (95.354, -480.852); before, they were off
+     by ~0.02. The player still fell.
+  3. **MMI lane bugs (PEXEW and others).** After the fix, the player stands at z 2.654 (PCSX2: 2.659), and the level,
+     weapon and HUD render.
+  4. **VIF1 DMA chains cut at 4096 tags.** A gameplay frame is ~4400 tags. After the fix, textures are clean and there
+     are no white screens or host crashes (5 of 5 runs clean, against 3 crashes in ~6 runs before).
+  5. **VIF1 UNPACK semantics.** The legacy code bends geometry.
+- Before/after in-game rate (vif counter per second, t=150-230 s, `KZ_FPS=66`, `PS2X_IOP_BATCH=1`):
+  - main build without these fixes, no 3D: 12.1
+  - with the fixes, full scene: 10.7 and 10.3 (two runs)
+- **Boot hang:** with `PS2X_IOP_BATCH` at its default (4096), 2 of 4 boots hung at dma=18. The game thread spins in
+  FUN_00149f30 at 0x14a028, waiting for an IOP file read. With `PS2X_IOP_BATCH=1`, 0 of 4 boots hung.
