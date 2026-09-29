@@ -16,6 +16,17 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
   from the image but resolved `sceCdSearchFile` against a virtual layout built from the host folder (different LSNs),
   so IOP-side file reads (Killzone's PFILE_R.IRX streamer) could land on the wrong sectors. Search now walks the image's
   own ISO9660 directory. Adds `sceCdTrayReq` (cdvdman #14; tray never moves), called ~2.7k times per boot.
+- `0004-mpeg-hle-killzone-movies.patch` — Killzone's FMV player (all movies, incl. the looping menu backgrounds) on the
+  runtime's libmpeg HLE (its sceMpeg*/sceIpu* calls are HLE-bound; FFmpeg decodes). `sceMpegAddStrCallback` now
+  matches packets by libmpeg's stream key (stream id + 4 sub-stream bytes, channel OR'ed in; table read from the game's
+  library), so the audio callback gets its PSS channel (5 language channels per movie). `sceMpegGetPicture` with no picture
+  calls the game's sceMpegCbNodata callback (Killzone only demuxes from inside it) and treats the IPU_TO data the
+  callback sends as consumed; it stops asking once the video hit its sequence_end_code. Without a sceCdSt stream
+  (the game reads files itself) the program end code ends a movie, `sceMpegCreate`/`sceMpegReset` replay the video
+  demuxed since the latest sequence header (the game demuxes the first chunk before them), data after the end starts
+  a new pass (looping), and the libmpeg end flag (`*mp->sys`, read by the game's unbound `sceMpegIsEnd`) is published.
+  Also: toSPR/fromSPR interleave-mode DMA (D_SQWC; the PSS audio path deinterleaves with it), and pending invocations
+  (SIF commands) may run while a thread executes an HleCall invocation (the nodata callback blocks on file reads).
 - `0005-vif1-direct-image-continuation.patch`: fixes garbled text and dithered sprite edges, in both the kzgs GS and
   the CPU GS. A VIF1 DIRECT can end with a PATH2 IMAGE GIFtag whose pixel data arrives in a later DIRECT, usually
   `MARK; DIRECT n` in the next DMAtag's TTE words. The runtime used to treat the bytes right after the first DIRECT as

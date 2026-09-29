@@ -1,0 +1,650 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -476,7 +476,43 @@
+             uint32_t data = 0u;
+             uint32_t handle = 0u;
+             bool stream = false;
++            uint64_t key = 0u;  // stream callbacks: libmpeg stream key (stream id, then 4 payload bytes) ...
++            uint64_t mask = 0u; // ... compared against the packet key under this mask
+         };
++
++        // libmpeg's sceMpegAddStrCallback table (sceMpegStrM2V=0, IPU=1, PCM=2, ADPCM=3, DATA=4, ...): a stream type
++        // selects a 40-bit key over the PES stream id and the first 4 payload bytes (the private stream 1 sub-stream
++        // header), and the channel argument is OR'ed in at a type-specific bit position. Read from the library as
++        // linked into Killzone (SCUS-97402, table at 0x51E8A0). sceMpegDemuxPss/Ring hand a packet to the first
++        // callback with (packetKey & mask) == key.
++        struct MpegStrKey
++        {
++            uint64_t key;
++            uint64_t mask;
++        };
++        constexpr MpegStrKey kMpegStrKeys[] = {
++            {0xE000000000ull, 0xFF00000000ull}, // 0 M2V: video stream 0xE0 + ch
++            {0xBDFFC00000ull, 0xFFFFFFFFFFull}, // 1 IPU
++            {0xBDFFA00000ull, 0xFFFFFFFFFFull}, // 2 PCM
++            {0xBDFFA10000ull, 0xFFFFFFFFFFull}, // 3 ADPCM
++            {0xBDFF900000ull, 0xFFFFFFFFFFull}, // 4 DATA
++            {0xC000000000ull, 0xFF00000000ull}, // 5 MPEG audio 0xC0 + ch
++            {0xBD80000000ull, 0xFFFF000000ull}, // 6
++            {0xBDA0000000ull, 0xFFFF000000ull}, // 7
++            {0xBD88000000ull, 0xFFFF000000ull}, // 8
++            {0xBD90000000ull, 0xFFFF000000ull}, // 9
++        };
++
++        bool mpegStrKeyFor(uint32_t type, uint32_t channel, uint64_t &key, uint64_t &mask)
++        {
++            if (type >= std::size(kMpegStrKeys))
++                return false;
++            const MpegStrKey &k = kMpegStrKeys[type];
++            const unsigned shift = k.mask == 0xFFFF000000ull ? 24u : k.mask == 0xFF00000000ull ? 32u : 0u;
++            key = k.key | (static_cast<uint64_t>(channel) << shift);
++            mask = k.mask;
++            return true;
++        }
+ 
+         constexpr uint64_t kPictureClockOne = 1ull << 32u;
+         // NTSC-style fields at ~59.94 Hz to keep MPEG timing yet (29.97 fps).
+@@ -492,7 +528,18 @@
+             uint32_t decodeMode = 0u;
+             uint32_t imageBufferAddr = 0u;
+             bool sawInput = false;
+-            bool sawSequenceEnd = false;
++            // Video elementary stream from the latest sequence header on (only while no CD stream producer is
++            // active; see replayVideoSinceSequenceHeader).
++            struct EsChunk
++            {
++                std::vector<uint8_t> bytes;
++                int64_t pts90k = -1;
++                int64_t dts90k = -1;
++            };
++            std::vector<EsChunk> esSinceSequenceHeader;
++            size_t esSinceSequenceHeaderBytes = 0u;
++            bool sawSequenceEnd = false;       // the latest video data ended with a sequence_end_code
++            bool videoAfterSequenceEnd = false; // more video followed an earlier sequence_end_code
+             bool streamEnded = false;
+             bool decoderFailed = false;
+             uint64_t cdStreamGeneration = 0u;
+@@ -532,6 +579,7 @@
+             uint64_t cdStreamGeneration = 0u;
+             uint64_t cdStreamBytesProduced = 0u;
+             uint64_t cdStreamBytesDemuxed = 0u;
++            uint64_t pssBytesAppended = 0u; // all PSS bytes demuxed so far (progress check for sceMpegCbNodata)
+             bool cdStreamEofPending = false;
+             bool currentCdStreamEofSeen = false;
+             uint32_t feedEsTraceCount = 0u;
+@@ -552,8 +600,7 @@
+         constexpr uint32_t kStubMovieWidth = 320u;
+         constexpr uint32_t kStubMovieHeight = 240u;
+         constexpr uint32_t kMpegStrM2V = 0u;
+-        constexpr uint32_t kMpegStrPCM = 1u;
+-        constexpr uint32_t kMpegStrADPCM = 2u;
++        constexpr uint32_t kMpegStrAudio = 2u; // callback event type written for audio packets
+         constexpr uint8_t kMpegPackHeader = 0xBAu;
+         constexpr uint8_t kMpegSystemHeader = 0xBBu;
+         constexpr uint8_t kMpegProgramEnd = 0xB9u;
+@@ -1091,6 +1138,11 @@
+                 playback.sawSequenceEnd = true;
+                 playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
+             }
++            else
++            {
++                playback.videoAfterSequenceEnd = playback.sawSequenceEnd;
++                playback.sawSequenceEnd = false;
++            }
+ 
+             if (!playback.decoder)
+             {
+@@ -1110,6 +1162,56 @@
+             flushDecoderIfEnded(playback);
+         }
+ 
++        // A game that feeds the demuxer from its own file reads (no sceCdSt stream; Killzone) demuxes the start of a
++        // movie into its bitstream ring and then calls sceMpegCreate (a second time) or sceMpegReset, e.g. to loop a
++        // movie: rewind the file, demux the first chunk, reset the decoder. libmpeg keeps decoding from that ring. This
++        // HLE decodes at demux time, so it keeps the video since the latest sequence header and replays it into the
++        // fresh decoder instead of dropping it.
++        void recordVideoSinceSequenceHeader(MpegPlaybackState &playback, const uint8_t *data, size_t size,
++                                            int64_t pts90k, int64_t dts90k)
++        {
++            if (g_mpeg_stub_state.cdStreamGeneration != 0u || !data || size == 0u)
++                return;
++            constexpr size_t kMaxBytes = 8u * 1024u * 1024u;
++            const size_t header = findMpegSequenceHeader(data, size);
++            if (header != kStartCodeNotFound)
++            {
++                playback.esSinceSequenceHeader.clear();
++                playback.esSinceSequenceHeaderBytes = 0u;
++                data += header;
++                size -= header;
++            }
++            else if (playback.esSinceSequenceHeader.empty() || playback.esSinceSequenceHeaderBytes + size > kMaxBytes)
++            {
++                playback.esSinceSequenceHeader.clear(); // no sequence header to start from
++                playback.esSinceSequenceHeaderBytes = 0u;
++                return;
++            }
++            MpegPlaybackState::EsChunk chunk;
++            chunk.bytes.assign(data, data + size);
++            chunk.pts90k = pts90k;
++            chunk.dts90k = dts90k;
++            playback.esSinceSequenceHeader.push_back(std::move(chunk));
++            playback.esSinceSequenceHeaderBytes += size;
++        }
++
++        // Resets `playback` to a fresh decoder, then replays the video since the latest sequence header.
++        void resetAndReplayVideo(MpegPlaybackState &playback)
++        {
++            std::vector<MpegPlaybackState::EsChunk> replay = std::move(playback.esSinceSequenceHeader);
++            playback = makeFreshPlaybackStatePreservingConfig(playback);
++            for (const MpegPlaybackState::EsChunk &chunk : replay)
++            {
++                recordVideoSinceSequenceHeader(playback, chunk.bytes.data(), chunk.bytes.size(), chunk.pts90k, chunk.dts90k);
++                feedElementaryStream(playback, chunk.bytes.data(), chunk.bytes.size(), chunk.pts90k, chunk.dts90k);
++            }
++            if (!replay.empty())
++            {
++                playback.sawInput = true;
++                playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
++            }
++        }
++
+         void erasePssPrefix(MpegPlaybackState &playback, size_t count)
+         {
+             std::vector<uint8_t> &buffer = playback.pssBuffer;
+@@ -1131,7 +1233,7 @@
+             }
+         }
+ 
+-        std::vector<MpegRegisteredCallback> matchingStreamCallbacks(uint32_t mpegAddr, uint32_t streamType)
++        std::vector<MpegRegisteredCallback> matchingStreamCallbacks(uint32_t mpegAddr, uint64_t packetKey)
+         {
+             std::vector<MpegRegisteredCallback> out;
+             auto it = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
+@@ -1140,18 +1242,32 @@
+                 return out;
+             }
+ 
++            // Like libmpeg, the first registered callback whose key matches gets the packet.
+             for (const MpegRegisteredCallback &callback : it->second)
+             {
+-                if (callback.stream && callback.type == streamType)
++                if (callback.stream && callback.mask != 0u && (packetKey & callback.mask) == callback.key)
+                 {
+                     out.push_back(callback);
++                    break;
+                 }
+             }
+             return out;
++        }
++
++        uint64_t mpegPacketKey(uint8_t streamId, const uint8_t *payload, size_t payloadSize)
++        {
++            uint64_t key = static_cast<uint64_t>(streamId) << 32u;
++            if (payload && payloadSize >= 4u)
++            {
++                key |= (static_cast<uint64_t>(payload[0]) << 24u) | (static_cast<uint64_t>(payload[1]) << 16u) |
++                       (static_cast<uint64_t>(payload[2]) << 8u) | static_cast<uint64_t>(payload[3]);
++            }
++            return key;
+         }
+ 
+         void queueStreamCallbackEvent(uint32_t mpegAddr,
+                                       uint32_t streamType,
++                                      uint64_t packetKey,
+                                       uint32_t dataAddr,
+                                       uint32_t len,
+                                       std::vector<MpegStreamCallbackEvent> &callbackEvents,
+@@ -1165,7 +1281,7 @@
+             event.len = len;
+             event.pts = pts90k >= 0 ? static_cast<uint64_t>(pts90k) : 0xFFFFFFFFFFFFFFFFull;
+             event.dts = dts90k >= 0 ? static_cast<uint64_t>(dts90k) : 0xFFFFFFFFFFFFFFFFull;
+-            event.callbacks = matchingStreamCallbacks(mpegAddr, streamType);
++            event.callbacks = matchingStreamCallbacks(mpegAddr, packetKey);
+             if (!event.callbacks.empty())
+             {
+                 callbackEvents.push_back(std::move(event));
+@@ -1325,12 +1441,19 @@
+                             queueStreamCallbackEvent(
+                                 mpegAddr,
+                                 kMpegStrM2V,
++                                mpegPacketKey(streamId, buffer.data() + payloadStart, packetEnd - payloadStart),
+                                 playback.pssGuestAddrs[payloadStart],
+                                 static_cast<uint32_t>(packetEnd - payloadStart),
+                                 callbackEvents,
+                                 pes.pts90k,
+                                 pes.dts90k);
+                         }
++                        recordVideoSinceSequenceHeader(
++                            playback,
++                            buffer.data() + payloadStart,
++                            packetEnd - payloadStart,
++                            pes.pts90k,
++                            pes.dts90k);
+                         feedElementaryStream(
+                             playback,
+                             buffer.data() + payloadStart,
+@@ -1345,17 +1468,11 @@
+                     const size_t payloadStart = pes.payloadOffset;
+                     if (payloadStart < packetEnd && payloadStart < playback.pssGuestAddrs.size())
+                     {
++                        // The callback gets the payload including the 4-byte sub-stream header, as from libmpeg.
+                         queueStreamCallbackEvent(
+                             mpegAddr,
+-                            kMpegStrPCM,
+-                            playback.pssGuestAddrs[payloadStart],
+-                            static_cast<uint32_t>(packetEnd - payloadStart),
+-                            callbackEvents,
+-                            pes.pts90k,
+-                            pes.dts90k);
+-                        queueStreamCallbackEvent(
+-                            mpegAddr,
+-                            kMpegStrADPCM,
++                            kMpegStrAudio,
++                            mpegPacketKey(streamId, buffer.data() + payloadStart, packetEnd - payloadStart),
+                             playback.pssGuestAddrs[payloadStart],
+                             static_cast<uint32_t>(packetEnd - payloadStart),
+                             callbackEvents,
+@@ -1445,13 +1562,17 @@
+ 
+             if (playback.streamEnded)
+             {
+-                if (playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration)
++                // Without a CD stream producer, data after the program end is the game feeding the movie again
++                // (looping it: rewind, demux the first chunk, then sceMpegReset).
++                if (g_mpeg_stub_state.cdStreamGeneration != 0u &&
++                    playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration)
+                 {
+                     playback.sawInput = true;
+                     return;
+                 }
+ 
+-                playback = makeFreshPlaybackState();
++                playback = g_mpeg_stub_state.cdStreamGeneration == 0u ? makeFreshPlaybackStatePreservingConfig(playback)
++                                                                      : makeFreshPlaybackState();
+             }
+ 
+             if (!playback.sawInput)
+@@ -1460,6 +1581,7 @@
+             }
+             playback.sawInput = true;
+ 
++            g_mpeg_stub_state.pssBytesAppended += size;
+             playback.pssBuffer.insert(playback.pssBuffer.end(), data, data + size);
+             playback.pssGuestAddrs.reserve(playback.pssGuestAddrs.size() + size);
+             for (size_t i = 0; i < size; ++i)
+@@ -1942,9 +2064,26 @@
+         g_mpeg_stub_state.initialized = true;
+         (void)getPlaybackState(mpegAddr);
+         const uint32_t handle = g_mpeg_stub_state.nextCallbackHandle++;
+-        g_mpeg_stub_state.callbacksByMpeg[mpegAddr].push_back(
+-            MpegRegisteredCallback{streamType, streamId, callbackFunc, callbackData, handle, true});
+-        setReturnU32(ctx, 0u);
++        MpegRegisteredCallback callback{streamType, streamId, callbackFunc, callbackData, handle, true};
++        if (!mpegStrKeyFor(streamType, streamId, callback.key, callback.mask))
++        {
++            callback.key = 0u;
++            callback.mask = 0u;
++        }
++        // Registering a key again replaces its callback and returns the previous one (libmpeg reuses the table slot).
++        auto &callbacks = g_mpeg_stub_state.callbacksByMpeg[mpegAddr];
++        uint32_t previous = 0u;
++        for (auto it = callbacks.begin(); it != callbacks.end(); ++it)
++        {
++            if (it->stream && it->mask == callback.mask && it->key == callback.key)
++            {
++                previous = it->func;
++                callbacks.erase(it);
++                break;
++            }
++        }
++        callbacks.push_back(callback);
++        setReturnU32(ctx, previous);
+     }
+ 
+     void sceMpegClearRefBuff(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -2000,7 +2139,14 @@
+ 
+         {
+             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+-            getPlaybackState(param_1) = makeFreshPlaybackState();
++            MpegPlaybackState &playback = getPlaybackState(param_1);
++            // Killzone creates its decoder twice per movie: a small work area to demux the first chunk (it reads the
++            // picture size from the sequence header), then the real one. Without a CD stream producer the video
++            // demuxed so far is replayed into the new decoder (see recordVideoSinceSequenceHeader).
++            if (g_mpeg_stub_state.cdStreamGeneration == 0u)
++                resetAndReplayVideo(playback);
++            else
++                playback = makeFreshPlaybackState();
+         }
+ 
+         const uint32_t puVar4 = uVar3 + 0x108u;
+@@ -2280,6 +2426,103 @@
+         setReturnU32(ctx, getPlaybackState(mpegAddr).decodeMode);
+     }
+ 
++    void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
++
++    namespace
++    {
++        // sceMpegIsEnd's condition. Only the producer/demux EOF is authoritative. A sequence_end_code can be observed
++        // while more PSS data is still buffered, and a decoder failure before producer EOF may still recover on a
++        // later sequence. Games that feed the demuxer from their own file reads instead of sceCdSt* streaming
++        // (Killzone reads through its IOP file driver) never start a CD stream; for them the program end is the end.
++        bool mpegPlaybackAtEnd(const MpegPlaybackState &playback, PS2Runtime *runtime, bool *endedOut = nullptr,
++                               bool *presentationCompleteOut = nullptr)
++        {
++            const bool noCdStreamProducer = g_mpeg_stub_state.cdStreamGeneration == 0u;
++            const bool producerEnded =
++                noCdStreamProducer ||
++                (g_mpeg_stub_state.currentCdStreamEofSeen &&
++                 playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration);
++            const bool ended = producerEnded &&
++                               (playback.streamEnded || (playback.decoderFailed && playback.sawInput));
++            const uint64_t presentationEnd = playback.presentationEndTickQ32;
++            const uint64_t currentTickQ32 = runtime != nullptr
++                                                ? (runtime->eeScheduler().currentVSyncTick() << 32u)
++                                                : std::numeric_limits<uint64_t>::max();
++            const bool presentationComplete =
++                presentationEnd == std::numeric_limits<uint64_t>::max() ||
++                currentTickQ32 >= presentationEnd;
++            if (endedOut)
++                *endedOut = ended;
++            if (presentationCompleteOut)
++                *presentationCompleteOut = presentationComplete;
++            return ended && playback.decodedFrames.empty() && presentationComplete;
++        }
++
++        // libmpeg's sceMpegIsEnd is a one-line accessor (return *mp->sys, first word of the work area at mpeg +0x40);
++        // games whose copy is not bound to the HLE (Killzone, 0x3CD860) read that word directly, so publish it.
++        void publishMpegEndFlag(uint8_t *rdram, uint32_t mpegAddr, const MpegPlaybackState &playback, PS2Runtime *runtime)
++        {
++            if (!mpegPlaybackAtEnd(playback, runtime))
++                return;
++            if (uint8_t *base = getMemPtr(rdram, mpegAddr))
++            {
++                const uint32_t inner = *reinterpret_cast<uint32_t *>(base + 0x40);
++                if (inner != 0u)
++                    mpegGuestWrite32(rdram, inner, 1u);
++            }
++        }
++
++        constexpr uint32_t kMpegCbNodata = 1u; // sceMpegCbNodata
++        bool s_nodataMadeNoProgress = false;    // set for the retry after a callback that demuxed nothing
++
++        // Runs the game's sceMpegCbNodata callback on the current thread, then retries sceMpegGetPicture.
++        // The callback typically demuxes more of the stream and sends the next part of the video bitstream to the
++        // IPU (DMA ch4). This HLE decodes the demuxed stream itself, so whatever was sent to the IPU counts as consumed:
++        // the IPU_TO transfer is stopped and the IPU input FIFO cleared, otherwise the callback would wait on it forever.
++        [[noreturn]] void invokeNodataCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
++                                               uint32_t mpegAddr, uint32_t func, uint32_t data)
++        {
++            const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
++            if (uint8_t *cbData = cbDataAddr ? getMemPtr(rdram, cbDataAddr) : nullptr)
++            {
++                std::memset(cbData, 0, kMpegCallbackDataSize);
++                *reinterpret_cast<uint32_t *>(cbData) = kMpegCbNodata;
++            }
++            GuestInvocation invocation{};
++            invocation.kind = GuestInvocationKind::HleCall;
++            invocation.context = *ctx;
++            invocation.context.pc = func;
++            SET_GPR_U32(&invocation.context, 4, mpegAddr);
++            SET_GPR_U32(&invocation.context, 5, cbDataAddr);
++            SET_GPR_U32(&invocation.context, 6, data);
++            SET_GPR_U32(&invocation.context, 29, 0u);
++            SET_GPR_U32(&invocation.context, 31, 0u);
++            uint64_t bytesBefore = 0u;
++            {
++                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                bytesBefore = g_mpeg_stub_state.pssBytesAppended;
++            }
++            invocation.onComplete = [rdram, runtime, cbDataAddr, bytesBefore](const R5900Context &, R5900Context &parent)
++            {
++                {
++                    std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                    s_nodataMadeNoProgress = g_mpeg_stub_state.pssBytesAppended == bytesBefore;
++                }
++                if (cbDataAddr)
++                    runtime->guestFree(cbDataAddr);
++                PS2Memory &mem = runtime->memory();
++                constexpr uint32_t kD4Chcr = 0x1000B400u;
++                if (mem.read32(kD4Chcr) & 0x100u)
++                {
++                    mem.write32(kD4Chcr, 0u);  // force-stop IPU_TO
++                    mem.write32(0x10002000u, 0u); // IPU BCLR: drop the queued input
++                }
++                sceMpegGetPicture(rdram, &parent, runtime);
++            };
++            runtime->eeScheduler().invokeCurrent(std::move(invocation));
++        }
++    }
++
+     void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         const uint32_t mpegAddr = getRegU32(ctx, 4);
+@@ -2292,6 +2535,19 @@
+         {
+             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
+             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
++            if (playback.decodedFrames.empty() && playback.sawSequenceEnd && !playback.streamEnded)
++            {
++                // The video bitstream ended (sequence_end_code): libmpeg stops requesting data here, and the game's
++                // callback would block reading past the end of its file. Drain the decoder; with nothing left the
++                // movie is over (sceMpegIsEnd reports it once presentation completes).
++                if (playback.decoder)
++                    playback.decoder->flush(playback.decodedFrames);
++                if (playback.decodedFrames.empty())
++                {
++                    playback.streamEnded = true;
++                    playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
++                }
++            }
+             if (playback.decodedFrames.empty() &&
+                 !g_mpeg_stub_state.currentCdStreamEofSeen &&
+                 !playback.streamEnded &&
+@@ -2307,7 +2563,37 @@
+                     });
+                     ++g_mpeg_stub_state.getPictureWaitTraceCount;
+                 }
++                // libmpeg asks the game for more bitstream through its sceMpegCbNodata callback whenever the decoder
++                // runs dry, and games without a separate demux thread (Killzone) only demux from inside it. Do the
++                // same before parking the thread.
++                uint32_t nodataFunc = 0u;
++                uint32_t nodataData = 0u;
++                if (const auto cbs = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr); cbs != g_mpeg_stub_state.callbacksByMpeg.end())
++                {
++                    for (const MpegRegisteredCallback &cb : cbs->second)
++                    {
++                        if (!cb.stream && cb.type == kMpegCbNodata)
++                        {
++                            nodataFunc = cb.func;
++                            nodataData = cb.data;
++                        }
++                    }
++                }
++                const bool noProgress = s_nodataMadeNoProgress;
++                s_nodataMadeNoProgress = false;
++                if (nodataFunc != 0u && runtime->hasFunction(nodataFunc) && noProgress)
++                {
++                    // The callback had nothing to demux yet (the stream read is asynchronous). Return without a new
++                    // picture instead of parking the only thread that can demux; the game calls again next frame.
++                    lock.unlock();
++                    setReturnS32(ctx, 0);
++                    return;
++                }
+                 lock.unlock();
++                if (nodataFunc != 0u && runtime->hasFunction(nodataFunc))
++                {
++                    invokeNodataCallback(rdram, ctx, runtime, mpegAddr, nodataFunc, nodataData);
++                }
+                 runtime->eeScheduler().waitExternal(
+                     EeWaitReason::Mpeg,
+                     kMpegPictureWaitType,
+@@ -2386,6 +2672,7 @@
+                 width = playback.width;
+                 height = playback.height;
+                 frameCount = playback.picturesServed;
++                publishMpegEndFlag(rdram, mpegAddr, playback, runtime);
+             }
+         }
+ 
+@@ -2455,21 +2742,9 @@
+         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+         g_mpeg_stub_state.initialized = true;
+         MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+-        // Only the producer/demux EOF is authoritative. A sequence_end_code can
+-        // be observed while more PSS data is still buffered, and a decoder
+-        // failure before producer EOF may still recover on a later sequence.
+-        const bool producerEnded =
+-            g_mpeg_stub_state.currentCdStreamEofSeen &&
+-            playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration;
+-        const bool ended = producerEnded &&
+-                           (playback.streamEnded || (playback.decoderFailed && playback.sawInput));
+-        const uint64_t presentationEnd = playback.presentationEndTickQ32;
+-        const uint64_t currentTickQ32 = runtime != nullptr
+-                                            ? (runtime->eeScheduler().currentVSyncTick() << 32u)
+-                                            : std::numeric_limits<uint64_t>::max();
+-        const bool presentationComplete =
+-            presentationEnd == std::numeric_limits<uint64_t>::max() ||
+-            currentTickQ32 >= presentationEnd;
++        bool ended = false;
++        bool presentationComplete = false;
++        const bool isEnd = mpegPlaybackAtEnd(playback, runtime, &ended, &presentationComplete);
+ 
+         if (g_mpeg_stub_state.isEndTraceCount < 16u)
+         {
+@@ -2486,7 +2761,7 @@
+             ++g_mpeg_stub_state.isEndTraceCount;
+         }
+ 
+-        setReturnS32(ctx, (ended && playback.decodedFrames.empty() && presentationComplete) ? 1 : 0);
++        setReturnS32(ctx, isEnd ? 1 : 0);
+     }
+ 
+     void sceMpegIsRefBuffEmpty(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -2507,7 +2782,15 @@
+             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+             MpegPlaybackState &playback = getPlaybackState(param_1);
+             MpegPlaybackState resetState = makeFreshPlaybackStatePreservingConfig(playback);
+-            if (playback.streamEnded || playback.decoderFailed)
++            // An ended CD stream stays ended until the next sceCdSt stream. Without a CD stream producer (the game
++            // feeds the demuxer itself, e.g. to loop a movie) a reset starts over from the video demuxed since the
++            // latest sequence header.
++            if (g_mpeg_stub_state.cdStreamGeneration == 0u)
++            {
++                resetAndReplayVideo(playback);
++                resetState = std::move(playback);
++            }
++            else if (playback.streamEnded || playback.decoderFailed)
+             {
+                 resetState.sawInput = true;
+                 resetState.streamEnded = true;
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1720,9 +1720,21 @@
+     if (channelBase != kSprFromChannel && channelBase != kSprToChannel)
+         return false;
+ 
++    // Normal mode, or interleave mode (MOD=2): main memory is walked in blocks of D_SQWC.TQWC qwords with D_SQWC.SQWC
++    // qwords skipped after each block, while the scratchpad side stays contiguous (EE User's Manual, 5.6 / D_SQWC).
++    // libmpeg audio (Killzone's PSS player) deinterleaves stereo PCM with a toSPR interleave transfer.
+     const uint32_t mode = (chcr >> 2u) & 0x3u;
+-    if (mode != 0u)
+-        return false;
++    if (mode != 0u && mode != 2u)
++        return false;
++    uint32_t blockBytes = 0u; // 0 = contiguous
++    uint32_t skipBytes = 0u;
++    if (mode == 2u)
++    {
++        const auto sqwcIt = m_ioRegisters.find(0x1000E030u);
++        const uint32_t sqwc = sqwcIt != m_ioRegisters.end() ? sqwcIt->second : 0u;
++        blockBytes = ((sqwc >> 16u) & 0xFFu) * 16u;
++        skipBytes = (sqwc & 0xFFu) * 16u;
++    }
+ 
+     const uint32_t qwc = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
+     const uint32_t byteCount = qwc * 16u;
+@@ -1739,33 +1751,52 @@
+         return false;
+     }
+ 
+-    if (mainOffset > PS2_RAM_SIZE || byteCount > PS2_RAM_SIZE - mainOffset)
++    uint32_t mainSpan = byteCount; // bytes of main memory covered, skips included
++    if (blockBytes != 0u && byteCount != 0u)
++    {
++        const uint32_t blocks = (byteCount + blockBytes - 1u) / blockBytes;
++        mainSpan = byteCount + (blocks - 1u) * skipBytes;
++    }
++    if (mainOffset > PS2_RAM_SIZE || mainSpan > PS2_RAM_SIZE - mainOffset)
+         return false;
+ 
+     const bool fromScratchpad = channelBase == kSprFromChannel;
+     uint32_t scratchOffset = originalSadr;
+     uint32_t bytesLeft = byteCount;
+-    uint32_t copied = 0u;
++    uint32_t mainPos = 0u;
++    uint32_t blockLeft = blockBytes;
+     while (bytesLeft != 0u)
+     {
+         const uint32_t scratchChunk = PS2_SCRATCHPAD_SIZE - scratchOffset;
+-        const uint32_t chunk = std::min(bytesLeft, scratchChunk);
++        uint32_t chunk = std::min(bytesLeft, scratchChunk);
++        if (blockBytes != 0u)
++            chunk = std::min(chunk, blockLeft);
+         if (fromScratchpad)
+         {
+-            std::memcpy(m_rdram + mainOffset + copied, m_scratchpad + scratchOffset, chunk);
+-            markModified(mainOffset + copied, chunk);
++            std::memcpy(m_rdram + mainOffset + mainPos, m_scratchpad + scratchOffset, chunk);
++            markModified(mainOffset + mainPos, chunk);
+         }
+         else
+         {
+-            std::memcpy(m_scratchpad + scratchOffset, m_rdram + mainOffset + copied, chunk);
+-        }
+-
+-        copied += chunk;
++            std::memcpy(m_scratchpad + scratchOffset, m_rdram + mainOffset + mainPos, chunk);
++        }
++
++        mainPos += chunk;
+         bytesLeft -= chunk;
+         scratchOffset = (scratchOffset + chunk) & (PS2_SCRATCHPAD_SIZE - 1u);
+-    }
+-
+-    m_ioRegisters[channelBase + 0x10u] = (originalMadr + byteCount) & 0x7FFFFFF0u;
++        if (blockBytes != 0u)
++        {
++            blockLeft -= chunk;
++            if (blockLeft == 0u)
++            {
++                if (bytesLeft != 0u)
++                    mainPos += skipBytes;
++                blockLeft = blockBytes;
++            }
++        }
++    }
++
++    m_ioRegisters[channelBase + 0x10u] = (originalMadr + mainPos) & 0x7FFFFFF0u;
+     m_ioRegisters[channelBase + 0x20u] = 0u;
+     m_ioRegisters[channelBase + 0x80u] = (originalSadr + byteCount) & 0x3FF0u;
+     completeDmacChannel(channelBase, fromScratchpad ? 8u : 9u);
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -299,7 +299,11 @@
+             continue;
+         }
+ 
+-        if (!m_pendingInvocations.empty() && running->invocations.empty())
++        // Pending invocations (interrupts, SIF commands, stream callbacks) run on a thread that is executing its own
++        // code, including guest code an HLE function called on its behalf (HleCall): a libmpeg nodata callback that
++        // blocks on a file read needs the SIF command that completes the read.
++        if (!m_pendingInvocations.empty() &&
++            (running->invocations.empty() || running->invocations.back().kind == GuestInvocationKind::HleCall))
+         {
+             GuestInvocation invocation = std::move(m_pendingInvocations.front());
+             m_pendingInvocations.pop_front();
