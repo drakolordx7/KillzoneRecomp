@@ -9,6 +9,7 @@ set(PS2X_BUILD_STUDIO OFF CACHE BOOL "" FORCE)
 set(PS2X_ENABLE_AGRESSIVE_LOGS OFF CACHE BOOL "" FORCE)  # per-call enter/exit trace: ~500MB per 30s
 add_subdirectory(ext/PS2Recomp)
 add_subdirectory(ext/kzgs)   # PCSX2 hardware GS as a library (ext/kzgs/README.md)
+add_subdirectory(ext/kzvu)   # PCSX2 microVU (VU1 recompiler) as a library (ext/kzvu/README.md)
 
 # Generated code lives outside the repo (derived from the game ELF). Point KZ_GENERATED_DIR at it.
 set(KZ_GENERATED_DIR "${CMAKE_SOURCE_DIR}/generated" CACHE PATH "PS2Recomp output for SCUS_974.02")
@@ -28,7 +29,7 @@ add_library(kz_port STATIC
     "${KZ_IMGUI_DIR}/backends/imgui_impl_sdl3.cpp"
     "${KZ_IMGUI_DIR}/backends/imgui_impl_sdlrenderer3.cpp")
 target_include_directories(kz_port PRIVATE "${CMAKE_SOURCE_DIR}/src" "${KZ_IMGUI_DIR}" "${KZ_IMGUI_DIR}/backends")
-target_link_libraries(kz_port PRIVATE ps2_runtime SDL3::SDL3 imgui kzgs)
+target_link_libraries(kz_port PRIVATE ps2_runtime SDL3::SDL3 imgui kzgs kzvu)
 target_compile_definitions(kz_port PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 
 add_executable(killzone
@@ -58,3 +59,11 @@ ps2x_stage_ffmpeg_runtime_dlls(killzone)
 kzgs_stage_resources(killzone)
 add_custom_command(TARGET killzone POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:SDL3::SDL3> $<TARGET_FILE_DIR:killzone>)
+
+# Offline GS trace replay (tools/gs_replay): renders a KZ_GS_TRACE recording through kzgs.
+add_executable(kz_gs_replay tools/gs_replay/gs_replay.cpp)
+target_link_libraries(kz_gs_replay PRIVATE kzgs SDL3::SDL3)
+target_compile_features(kz_gs_replay PRIVATE cxx_std_20)
+add_executable(kz_gs_replay_cpu tools/gs_replay/gs_replay_cpu.cpp)
+target_link_libraries(kz_gs_replay_cpu PRIVATE ps2_runtime)
+target_compile_features(kz_gs_replay_cpu PRIVATE cxx_std_20)

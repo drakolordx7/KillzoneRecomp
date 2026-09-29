@@ -12,11 +12,13 @@
 #include "kz_launcher.h"
 #include "kz_gs.h"
 #include "kz_timing.h"
+#include "kz_vu.h"
 
 #include <SDL3/SDL.h>
 
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <thread>
 #include "runtime/ps2_pad_provider.h"
 
@@ -32,6 +34,7 @@ namespace
     struct Options
     {
         std::filesystem::path elf = "game/SCUS_974.02";
+        bool elfGiven = false;
         std::filesystem::path iso;
         int sampleSeconds = 0; // --sample N: dump all thread stacks to work/stacks.txt every N seconds
         bool selfTest = false;  // --selftest: run unit checks (config, input, disc, launcher render) and exit
@@ -45,7 +48,10 @@ namespace
         {
             const std::string_view arg = argv[i];
             if (arg == "--elf" && i + 1 < argc)
+            {
                 opts.elf = argv[++i];
+                opts.elfGiven = true;
+            }
             else if (arg == "--iso" && i + 1 < argc)
                 opts.iso = argv[++i];
             else if (arg == "--sample" && i + 1 < argc)
@@ -161,7 +167,23 @@ int main(int argc, char *argv[])
             if (!kzRunLauncher(cfg))
                 return 0;
         }
-        const std::filesystem::path elf = std::filesystem::absolute(opts.elf).lexically_normal();
+        // Boot files: an explicit --elf (development), otherwise the small files extracted from the user's disc image
+        // into <exe dir>/disc. Game data is read from the image itself.
+        std::filesystem::path elf;
+        if (opts.elfGiven)
+            elf = std::filesystem::absolute(opts.elf).lexically_normal();
+        else
+        {
+            std::string prepError;
+            elf = kzPrepareDiscFiles(cfg.isoPath, kzConfigPath().parent_path() / "disc", &prepError);
+            if (elf.empty())
+            {
+                const std::string msg = "Can't use the game disc image: " + prepError;
+                std::cerr << "[kz] " << msg << std::endl;
+                SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Killzone", msg.c_str(), nullptr);
+                return 1;
+            }
+        }
         if (!std::filesystem::exists(elf))
         {
             std::cerr << "[kz] ELF not found: " << elf.string() << std::endl;
@@ -191,7 +213,17 @@ int main(int argc, char *argv[])
         SDL_Window *window = nullptr;
         void *hwnd = nullptr;
         int winW = 1280, winH = 896;
-        if (!automation)
+        if (automation)
+        {
+            // Automation still renders into a real (hidden) window: kzgs is exercised the same way as in the game.
+            if (SDL_InitSubSystem(SDL_INIT_VIDEO))
+            {
+                window = SDL_CreateWindow("Killzone (automation)", winW, winH, SDL_WINDOW_HIDDEN);
+                if (window)
+                    hwnd = SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+            }
+        }
+        else
         {
             if (!SDL_InitSubSystem(SDL_INIT_VIDEO))
             {
@@ -210,14 +242,24 @@ int main(int argc, char *argv[])
             kzInputSetCaptured(true);
         }
 
+        std::string vuError;
+        if (!kzVuInstall(&vuError))
+        {
+            std::cerr << "[kz] VU1 recompiler init failed: " << vuError << std::endl;
+            return 1;
+        }
         PS2Runtime runtime;
+        kzVuBindRuntime(runtime);
         if (!runtime.initialize("Killzone"))
         {
             std::cerr << "[kz] failed to initialize PS2 runtime" << std::endl;
             return 1;
         }
         std::string gsError;
-        if (!kzGsAttach(runtime, hwnd, winH, cfg, &gsError))
+        const bool cpuGs = std::getenv("KZ_GS") && std::strcmp(std::getenv("KZ_GS"), "cpu") == 0; // debug: software GS
+        if (cpuGs)
+            std::cout << "[kz] KZ_GS=cpu: using the runtime's software GS (PS2X_HEADLESS_SHOTS for frames)" << std::endl;
+        else if (!kzGsAttach(runtime, hwnd, winH, cfg, &gsError))
         {
             const std::string msg = "Could not start the renderer: " + gsError;
             std::cerr << "[kz] " << msg << std::endl;

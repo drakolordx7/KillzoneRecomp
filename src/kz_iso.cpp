@@ -154,3 +154,49 @@ KzDiscCheck kzCheckDisc(const std::filesystem::path &isoPath)
     r.message = "Killzone (USA) v1.00 - SCUS-97402 - OK";
     return r;
 }
+
+std::filesystem::path kzPrepareDiscFiles(const std::filesystem::path &isoPath, const std::filesystem::path &dir, std::string *error)
+{
+    const KzDiscCheck check = kzCheckDisc(isoPath);
+    if (!check.ok)
+    {
+        if (error) *error = check.message;
+        return {};
+    }
+    KzIso iso;
+    if (!iso.open(isoPath, error))
+        return {};
+    static const char *kFiles[] = {
+        "SYSTEM.CNF", "SCUS_974.02",
+        "IOP/DEV9.IRX", "IOP/EZNETCNF.IRX", "IOP/EZNETCTL.IRX", "IOP/INET.IRX", "IOP/INETCTL.IRX", "IOP/LGAUD.IRX",
+        "IOP/LGKBM.IRX", "IOP/LIBNETB.IRX", "IOP/LIBSD.IRX", "IOP/MCMAN.IRX", "IOP/MCSERV.IRX", "IOP/MSIFRPC.IRX",
+        "IOP/NETCNF.IRX", "IOP/NTPWROFF.IRX", "IOP/PADMAN.IRX", "IOP/PFILE_R.IRX", "IOP/PINPUT_R.IRX", "IOP/POWEROFF.IRX",
+        "IOP/PPP.IRX", "IOP/PPPOE.IRX", "IOP/PSOUND_R.IRX", "IOP/PWROFFN9.IRX", "IOP/SDRDRV.IRX", "IOP/SIO2MAN.IRX",
+        "IOP/SMAP.IRX", "IOP/USBD.IRX",
+    };
+    std::error_code ec;
+    std::filesystem::create_directories(dir / "IOP", ec);
+    std::vector<uint8_t> data;
+    for (const char *name : kFiles)
+    {
+        const auto entry = iso.find(name);
+        if (!entry)
+            continue; // optional module not on this pressing
+        const std::filesystem::path out = dir / name;
+        if (std::filesystem::exists(out, ec) && std::filesystem::file_size(out, ec) == entry->size)
+            continue;
+        if (!iso.read(*entry, data))
+        {
+            if (error) *error = std::string("could not read ") + name + " from the disc image";
+            return {};
+        }
+        std::ofstream f(out, std::ios::binary | std::ios::trunc);
+        f.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()));
+        if (!f)
+        {
+            if (error) *error = "could not write " + out.string();
+            return {};
+        }
+    }
+    return dir / "SCUS_974.02";
+}
