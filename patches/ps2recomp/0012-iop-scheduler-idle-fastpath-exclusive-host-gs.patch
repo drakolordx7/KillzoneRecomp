@@ -1,0 +1,476 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 4832d8f..e44feef 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -23,9 +23,17 @@ namespace ps2x::iop::detail
+     {
+     }
+ 
++    void IopKernel::rebuildThreadList()
++    {
++        m_threadList.clear();
++        for (auto &[id, thread] : m_threads)
++            m_threadList.push_back(&thread);
++    }
++
+     void IopKernel::reset()
+     {
+         m_threads.clear();
++        m_threadList.clear();
+         m_semaphores.clear();
+         m_eventFlags.clear();
+         m_nextThreadId = 1;
+@@ -62,6 +70,7 @@ namespace ps2x::iop::detail
+             }
+             const int id = thread.id;
+             m_threads.emplace(id, std::move(thread));
++            rebuildThreadList();
+             setV0(id);
+             return true;
+         }
+@@ -77,6 +86,7 @@ namespace ps2x::iop::detail
+             if (it->second.stackBase != 0u)
+                 (void)m_memory.freeAllocation(it->second.stackBase);
+             m_threads.erase(it);
++            rebuildThreadList();
+             setV0(0);
+             return true;
+         }
+@@ -671,20 +687,13 @@ namespace ps2x::iop::detail
+ 
+     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
+     {
+-        for (auto &[id, thread] : m_threads)
+-        {
+-            if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)
+-                thread.state = IopThreadState::Ready;
+-        }
+-
+         IopThread *next = nullptr;
+-        for (auto &[id, thread] : m_threads)
++        for (IopThread *thread : m_threadList) // id order, so ties keep the lowest id
+         {
+-            if (thread.state != IopThreadState::Ready)
+-                continue;
+-            if (next == nullptr || thread.priority < next->priority ||
+-                (thread.priority == next->priority && thread.id < next->id))
+-                next = &thread;
++            if (thread->state == IopThreadState::Delay && thread->wakeCycle <= currentCycle)
++                thread->state = IopThreadState::Ready;
++            if (thread->state == IopThreadState::Ready && (next == nullptr || thread->priority < next->priority))
++                next = thread;
+         }
+         if (next == nullptr)
+             return nullptr;
+@@ -699,10 +708,10 @@ namespace ps2x::iop::detail
+     uint64_t IopKernel::nextWakeCycle(uint64_t fallback) const
+     {
+         uint64_t nextWake = fallback;
+-        for (const auto &[id, thread] : m_threads)
++        for (const IopThread *thread : m_threadList)
+         {
+-            if (thread.state == IopThreadState::Delay)
+-                nextWake = std::min(nextWake, thread.wakeCycle);
++            if (thread->state == IopThreadState::Delay)
++                nextWake = std::min(nextWake, thread->wakeCycle);
+         }
+         return nextWake;
+     }
+@@ -719,6 +728,11 @@ namespace ps2x::iop::detail
+ 
+     void IopKernel::cleanupDeadThreads()
+     {
++        bool anyDead = false;
++        for (const IopThread *thread : m_threadList)
++            anyDead |= thread->state == IopThreadState::Dead;
++        if (!anyDead)
++            return;
+         for (auto thread = m_threads.begin(); thread != m_threads.end();)
+         {
+             if (thread->second.state != IopThreadState::Dead)
+@@ -730,6 +744,7 @@ namespace ps2x::iop::detail
+                 (void)m_memory.freeAllocation(thread->second.stackBase);
+             thread = m_threads.erase(thread);
+         }
++        rebuildThreadList();
+     }
+ 
+     void IopKernel::terminateThreadsInRange(uint32_t base, uint32_t size)
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 4977102..e1a59bd 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -5,6 +5,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <map>
++#include <vector>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -93,6 +97,10 @@ namespace ps2x::iop::detail
+ 
+         IopMemory &m_memory;
+         std::map<int, IopThread> m_threads;
++        // Flat view of m_threads in id order (map nodes are stable); rebuilt when threads are added/removed. The
++        // scheduler scans threads on every IOP time slice, and walking the map there dominated IOP time.
++        std::vector<IopThread *> m_threadList;
++        void rebuildThreadList();
+         std::map<int, Semaphore> m_semaphores;
+         std::map<int, EventFlag> m_eventFlags;
+         uint32_t m_nextThreadId = 1;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index e5f63a9..c4bc946 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "iop_emulator.h"
+ #include "imports/iop_cdvd.h"
+ #include "core/iop_cpu.h"
+@@ -553,34 +641,55 @@ namespace ps2x::iop::detail
+             servicingGuestCallbacks = false;
+         }
+ 
++        // Earliest IOP cycle at which anything can happen while every thread is idle (thread wake, DMA/callback
++        // completion, timer, SPU2 event or idle-step bound), valid until something external touches the IOP.
++        // runCycles is called on nearly every EE checkpoint with a few cycles; while the IOP sleeps this lets those
++        // calls just advance the clock instead of re-scanning every event source. 0 = unknown.
++        uint64_t idleUntil = 0;
++
+         void runCycles(uint64_t cycles) noexcept
+         {
++            static const bool fastPath = []() {
++                const char *v = std::getenv("PS2X_IOP_IDLE_FASTPATH");
++                return !(v && v[0] == '0');
++            }();
++            if (fastPath && idleUntil != 0 && totalCycles + cycles < idleUntil)
++            {
++                totalCycles += cycles; // exactly what the idle branch below would do
++                return;
++            }
++            idleUntil = 0;
+             try
+             {
+                 const uint64_t target = totalCycles + cycles;
+                 while (totalCycles < target)
+                 {
++                    advanceSpu2();
+                     servicePendingDmaInterrupts();
+                     servicePendingGuestCallbacks();
+                     timrman.serviceDue(totalCycles, *this);
+                     IopThread *next = kernel.beginNextReady(totalCycles);
+                     if (!next)
+                     {
+-                        uint64_t nextWake = kernel.nextWakeCycle(target);
++                        uint64_t nextWake = kernel.nextWakeCycle(UINT64_MAX);
+                         for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
+                             nextWake = std::min(nextWake, completionCycle);
+                         if (!pendingGuestCallbacks.empty())
+                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+                         nextWake = timrman.nextEventCycle(nextWake);
++                        nextWake = limitIdleSkip(nextWake);
++                        idleUntil = nextWake > totalCycles ? nextWake : 0;
+                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
+                         continue;
+                     }
++                    idleUntil = 0;
+                     const uint64_t before = totalCycles;
+                     runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
+                     kernel.endTimeslice(*next, kThreadReturnSentinel);
+                     if (totalCycles == before)
+                         ++totalCycles;
+                 }
++                advanceSpu2();
+             }
+             catch (...)
+             {
+@@ -721,21 +831,25 @@ namespace ps2x::iop::detail
+ 
+     void IopEmulator::reset()
+     {
++        m_impl->idleUntil = 0;
+         m_impl->reset();
+     }
+ 
+     ModuleLoadResult IopEmulator::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
+     {
++        m_impl->idleUntil = 0;
+         return m_impl->loadModule(path, arguments, argumentSize);
+     }
+ 
+     ModuleLoadResult IopEmulator::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
+     {
++        m_impl->idleUntil = 0;
+         return m_impl->loadModuleBuffer(guestAddress, arguments, argumentSize);
+     }
+ 
+     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)
+     {
++        m_impl->idleUntil = 0;
+         return m_impl->stopModule(moduleId, result);
+     }
+ 
+@@ -750,6 +864,7 @@ namespace ps2x::iop::detail
+ 
+     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
+     {
++        m_impl->idleUntil = 0;
+         return m_impl->rpc.handleRpc(request, *m_impl);
+     }
+ 
+@@ -760,16 +875,19 @@ namespace ps2x::iop::detail
+ 
+     void IopEmulator::onSifTransfer(const SifTransfer &transfer)
+     {
++        m_impl->idleUntil = 0;
+         m_impl->rpc.onSifTransfer(transfer);
+     }
+ 
+     uint32_t IopEmulator::allocateMemory(uint32_t size, uint32_t alignment)
+     {
++        m_impl->idleUntil = 0;
+         return m_impl->memory.allocate(size, alignment);
+     }
+ 
+     bool IopEmulator::freeMemory(uint32_t address)
+     {
++        m_impl->idleUntil = 0;
+         return m_impl->memory.freeAllocation(address);
+     }
+ 
+@@ -781,12 +899,14 @@ namespace ps2x::iop::detail
+ 
+     bool IopEmulator::writeMemory(uint32_t address, const void *source, size_t size)
+     {
++        m_impl->idleUntil = 0;
+         return isMemoryRange(address, size) &&
+                m_impl->memory.writeRam(address, source, size);
+     }
+ 
+     bool IopEmulator::zeroMemory(uint32_t address, size_t size)
+     {
++        m_impl->idleUntil = 0;
+         return isMemoryRange(address, size) &&
+                m_impl->memory.zeroRam(address, size);
+     }
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..941cb8f 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,3 +1,6 @@
++#include "runtime/ps2_host_gs.h"
++#include <atomic>
++#include <cstdlib>
+ #include "runtime/ee_scheduler.h"
+ 
+ #include "ps2_log.h"
+@@ -388,10 +455,43 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+     return false;
+ }
+ 
++namespace
++{
++    // COP0 Count runs at the EE clock (294.912 MHz). Recompiled `mfc0 Count` reads ctx->cop0_count, which nothing
++    // else advances, so games that time themselves with Count (fades, frame timers) would see time stand still.
++    // Wall-clock time since the first call, in EE cycles (294.912 MHz).
++    uint64_t hostCop0Count64()
++    {
++        static const auto start = std::chrono::steady_clock::now();
++        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
++        return static_cast<uint64_t>(static_cast<double>(ns) * 0.294912);
++    }
++}
++
+ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+ {
+-    const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+-    m_eeCycle += elapsed;
++    // The EE cycle clock never falls behind wall time: checkpoints only charge an estimate per block, so recompiled
++    // code (and especially guest spin-waits) would otherwise let emulated time lag real time, and every cycle-gated
++    // event (vblank, EE timers, IOP time) would run slow. Faster-than-real-time execution still accrues cycles.
++    static const bool wallClock = []() {
++        const char *v = std::getenv("PS2X_WALLCLOCK");
++        return !(v && v[0] == '0');
++    }();
++    // Reading the host clock costs ~20-30 ns and this runs on nearly every guest call: sample it every 64th call.
++    static uint64_t wallCycles = 0;
++    static uint32_t wallSampleCountdown = 0;
++    if (wallSampleCountdown-- == 0u)
++    {
++        wallCycles = static_cast<uint64_t>(hostCop0Count64());
++        wallSampleCountdown = 63u;
++    }
++    uint64_t next = m_eeCycle + std::max<uint64_t>(1u, cycles);
++    if (wallClock && next < wallCycles)
++        next = wallCycles;
++    const uint64_t elapsed = next - m_eeCycle;
++    m_eeCycle = next;
++    if (R5900Context *ctx = currentContext())
++        ctx->cop0_count = static_cast<uint32_t>(wallCycles);
+     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
+     m_runtime.advanceIopEeCycles(elapsed);
+     if (m_pendingEeTimerInterrupts != 0u)
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..5fffbca 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -27,6 +105,21 @@
+ #include <unordered_map>
+ #include <sstream>
+ 
++namespace
++{
++    // Recent guest branches (EE game thread), dumped with the first missing-target report.
++    struct BranchRecord
++    {
++        uint32_t source, target, ra, sp;
++        uint8_t kind;
++    };
++    BranchRecord g_branchHistory[128];
++    uint32_t g_branchHistoryPos = 0;
++}
++
++#include <cstdlib>
++#include <cstdio>
++
+ namespace ps2_stubs
+ {
+     void resetSifState();
+@@ -607,7 +700,20 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
+ 
+ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+ {
+-    m_iopSubsystem->runEeCycles(eeCycles);
++    // Called on every EE checkpoint (nearly every guest call) with a few cycles; each IOP run pays a fixed cost
++    // (SPU2 advance, interrupt/callback service, thread selection). Batch into quanta of PS2X_IOP_BATCH EE cycles
++    // (default 4096, ~14 us of emulated time), well below any IOP timing the games can observe.
++    static const uint64_t batch = []() -> uint64_t {
++        const char *v = std::getenv("PS2X_IOP_BATCH");
++        return v ? std::max<uint64_t>(1u, std::strtoull(v, nullptr, 10)) : 1u; // 4096 hung 2 of 4 boots (IOP file read); opt-in until fixed
++    }();
++    static uint64_t pending = 0;
++    pending += eeCycles;
++    if (pending < batch)
++        return;
++    const uint64_t run = pending;
++    pending = 0; // before running: IOP -> EE callbacks can re-enter here
++    m_iopSubsystem->runEeCycles(run);
+ }
+ 
+ void PS2Runtime::resetIop()
+diff --git a/ps2xRuntime/include/runtime/ps2_host_gs.h b/ps2xRuntime/include/runtime/ps2_host_gs.h
+new file mode 100644
+index 0000000..9cb7c4c
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_host_gs.h
+@@ -0,0 +1,25 @@
++#pragma once
++
++#include <cstdint>
++
++// Optional host GS (e.g. a hardware renderer) fed alongside the built-in GS frontend.
++// gifPacket: every GIF packet in arbiter order, with its PATH (1..3); sizeBytes is a multiple of 16.
++// vsync: guest VBlankStart, after CSR.FIELD was updated; field = interlace field being displayed (0/1).
++// Both are called on the EE game thread.
++struct PS2HostGs
++{
++    void (*gifPacket)(int path, const uint8_t *data, uint32_t sizeBytes) = nullptr;
++    void (*vsync)(uint64_t tick, int field) = nullptr;
++    // true: the host GS is the only consumer of GIF packets; the built-in frontend no longer processes them (saves
++    // its VRAM uploads, register state and vertex work on the EE thread). Only valid for games that never read GS
++    // memory back through the built-in GS (local->host transfers).
++    bool exclusive = false;
++};
++
++void ps2SetHostGs(const PS2HostGs &hooks);
++const PS2HostGs &ps2HostGs();
++
++// Guest vblank period (default 16667 us, NTSC). The host may raise the vblank rate (e.g. for high refresh output);
++// takes effect from the next scheduled vblank.
++void ps2SetVblankPeriodMicros(uint32_t micros);
++uint32_t ps2VblankPeriodMicros();
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index c289ba0..00885df 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -1,7 +1,66 @@
+ #include "runtime/gs/ps2_gif_arbiter.h"
++#include "runtime/ps2_host_gs.h"
+ #include <algorithm>
+ #include <cstring>
+ 
++namespace
++{
++    PS2HostGs g_hostGs{};
++}
++
++void ps2SetHostGs(const PS2HostGs &hooks)
++{
++    g_hostGs = hooks;
++}
++
++namespace
++{
++    // Exclusive host GS: the built-in frontend still has to see A+D writes to SIGNAL / FINISH / LABEL (0x60-0x62),
++    // because they set CSR bits the game polls (e.g. Killzone waits for CSR.FINISH at boot).
++    bool packetWritesGsEvent(const uint8_t *data, uint32_t size)
++    {
++        const uint32_t qwords = size / 16u;
++        uint32_t q = 0;
++        while (q < qwords)
++        {
++            uint64_t lo, hi;
++            std::memcpy(&lo, data + q * 16u, 8);
++            std::memcpy(&hi, data + q * 16u + 8u, 8);
++            ++q;
++            const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu);
++            const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 3u);
++            uint32_t nreg = static_cast<uint32_t>((lo >> 60) & 0xFu);
++            if (nreg == 0u)
++                nreg = 16u;
++            if (flg == 0u)
++            {
++                for (uint32_t l = 0; l < nloop; ++l)
++                    for (uint32_t r = 0; r < nreg; ++r, ++q)
++                    {
++                        if (q >= qwords)
++                            return false;
++                        if (((hi >> (4u * r)) & 0xFu) == 0xEu)
++                        {
++                            const uint8_t addr = data[q * 16u + 8u];
++                            if (addr >= 0x60u && addr <= 0x62u)
++                                return true;
++                        }
++                    }
++            }
++            else if (flg == 1u)
++                q += (nloop * nreg + 1u) / 2u;
++            else
++                q += nloop;
++        }
++        return false;
++    }
++}
++
++const PS2HostGs &ps2HostGs()
++{
++    return g_hostGs;
++}
++
+ GifArbiter::GifArbiter(ProcessPacketFn processFn)
+     : m_processFn(std::move(processFn))
+ {
+@@ -56,7 +115,11 @@ void GifArbiter::drain()
+         auto &pkt = m_queue[i];
+         if (!pkt.data.empty())
+         {
+-            m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
++            if (g_hostGs.gifPacket)
++                g_hostGs.gifPacket(static_cast<int>(pkt.pathId), pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
++            if (!(g_hostGs.gifPacket && g_hostGs.exclusive) ||
++                packetWritesGsEvent(pkt.data.data(), static_cast<uint32_t>(pkt.data.size())))
++                m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+         }
+     }
+     m_queue.clear();
