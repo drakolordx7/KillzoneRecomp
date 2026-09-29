@@ -35,3 +35,8 @@ struct KzDiscCheck
     std::string message; // human-readable status for the launcher
 };
 KzDiscCheck kzCheckDisc(const std::filesystem::path &iso);
+
+// Extracts the small boot files (SYSTEM.CNF, SCUS_974.02, IOP/*.IRX) from the disc image into `dir` (skipping files that
+// already exist with the right size). The large data files stay in the image and are read by sector.
+// Returns the path of the boot ELF, or empty on failure (message in *error).
+std::filesystem::path kzPrepareDiscFiles(const std::filesystem::path &iso, const std::filesystem::path &dir, std::string *error);

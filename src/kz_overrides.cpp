@@ -32,7 +32,16 @@ namespace
         PS2Runtime::RecompiledFunction fn;
         const char *name;
     };
+    // Video (.pss) playback needs the IPU (MPEG decoder), which is not emulated yet: the movie object's open method
+    // (vtable 0x52EA78 +0x10, FUN_002ded00) reports failure so every caller skips its video (attract loop, cutscenes).
+    void kzMovieOpenUnavailable(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        ctx->pc = getRegU32(ctx, 31);
+        setReturnS32(ctx, 0);
+    }
+
     const CustomBinding kCustom[] = {
+        {0x002DED00u, &kzMovieOpenUnavailable, "movie open (no IPU yet)"},
         {0x002B5D88u, &kzSceSifSearchModuleByName, "sceSifSearchModuleByName"},
         {0x002B5CF8u, &kzSceSifUnloadModule, "sceSifUnloadModule"},
         {0x003D7490u, &kzLgkbmInit, "lgkbm init"},

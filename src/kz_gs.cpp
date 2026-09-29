@@ -1,5 +1,6 @@
 #include "kz_gs.h"
 #include "kz_timing.h"
+#include "kz_gpu.h"
 
 #include "kzgs.h"
 
@@ -13,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -94,6 +96,8 @@ namespace
         case KzAspect::Stretch: k.aspect = KzgsAspect::Stretch; break;
         }
         k.vsync = c.vsync;
+        static const std::string gpu = kzPreferredGpuName();
+        k.adapter = gpu;
         return k;
     }
 
@@ -102,13 +106,18 @@ namespace
     {
         const GSRegisters &r = s.runtime->memory().gs();
         auto put = [&s](uint32_t off, uint64_t v) { std::memcpy(s.privRegs + off, &v, 8); };
+        // sceGsResetGraph is an HLE stub in the runtime and never programs the CRTC sync registers. PCSX2 derives the
+        // video mode from SMODE1.CMOD/LC (0 = VESA, wrong display rules) and field flipping from SYNCV.VFP, so fall
+        // back to the NTSC values libgraph writes.
+        constexpr uint64_t kNtscSmode1 = 0x0000000740834504ull; // CMOD=2 (NTSC), LC=32
+        constexpr uint64_t kNtscSyncv = 0x00C7800601A01801ull;  // VFP=1
         put(0x000, r.pmode);
-        put(0x010, r.smode1);
+        put(0x010, r.smode1 ? r.smode1 : kNtscSmode1);
         put(0x020, r.smode2);
         put(0x030, r.srfsh);
         put(0x040, r.synch1);
         put(0x050, r.synch2);
-        put(0x060, r.syncv);
+        put(0x060, r.syncv ? r.syncv : kNtscSyncv);
         put(0x070, r.dispfb1);
         put(0x080, r.display1);
         put(0x090, r.dispfb2);
@@ -140,9 +149,139 @@ namespace
         SDL_DestroySurface(surf);
     }
 
+    std::atomic<uint64_t> g_pathPackets[4]{};
+    // Debug: last A+D writes of interest and primitive count (PACKED/REGLIST parsing, first 64 KB of each packet).
+    std::atomic<uint64_t> g_lastFrame1{0}, g_lastFrame2{0}, g_lastPrim{0}, g_primWrites{0}, g_imageTransfers{0}, g_lastBitblt{0};
+
+    void inspectGif(const uint8_t *data, uint32_t size)
+    {
+        uint32_t off = 0;
+        while (off + 16 <= size)
+        {
+            uint64_t lo, hi;
+            std::memcpy(&lo, data + off, 8);
+            std::memcpy(&hi, data + off + 8, 8);
+            off += 16;
+            const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFF);
+            const bool eop = (lo >> 15) & 1;
+            const bool pre = (lo >> 46) & 1;
+            const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 3);
+            uint32_t nreg = static_cast<uint32_t>((lo >> 60) & 0xF);
+            if (nreg == 0)
+                nreg = 16;
+            if (pre)
+                g_primWrites.fetch_add(1, std::memory_order_relaxed), g_lastPrim.store((lo >> 47) & 0x7FF);
+            if (flg == 0) // PACKED
+            {
+                for (uint32_t l = 0; l < nloop && off + 16 <= size; ++l)
+                    for (uint32_t r = 0; r < nreg && off + 16 <= size; ++r, off += 16)
+                    {
+                        const uint32_t reg = static_cast<uint32_t>((hi >> (4 * r)) & 0xF);
+                        if (reg != 0xE)
+                            continue;
+                        uint64_t val, addr;
+                        std::memcpy(&val, data + off, 8);
+                        std::memcpy(&addr, data + off + 8, 8);
+                        switch (addr & 0xFF)
+                        {
+                        case 0x4C: g_lastFrame1.store(val); break;
+                        case 0x4D: g_lastFrame2.store(val); break;
+                        case 0x00: g_primWrites.fetch_add(1, std::memory_order_relaxed); g_lastPrim.store(val); break;
+                        case 0x50: g_lastBitblt.store(val); break;
+                        case 0x53: g_imageTransfers.fetch_add(1, std::memory_order_relaxed); break;
+                        default: break;
+                        }
+                    }
+            }
+            else if (flg == 1) // REGLIST
+                off += ((nloop * nreg + 1) / 2) * 16;
+            else // IMAGE
+                off += nloop * 16;
+            if (eop)
+                break;
+        }
+    }
+    std::atomic<uint64_t> g_pathQwords[4]{};
+
+    // KZ_GS_TRACE=<file>: records GIF packets and the privileged register block at each vsync, from vsync
+    // KZ_GS_TRACE_START for KZ_GS_TRACE_FRAMES frames (default 3000 / 120). Replayed by tools/gs_replay.
+    struct Trace
+    {
+        FILE *f = nullptr;
+        uint64_t start = 3000, frames = 120;
+        bool active(uint64_t frame) const { return f && frame >= start && frame < start + frames; }
+    };
+    Trace &trace()
+    {
+        static Trace t = []() {
+            Trace t;
+            if (const char *path = std::getenv("KZ_GS_TRACE"))
+            {
+                t.f = std::fopen(path, "wb");
+                if (const char *v = std::getenv("KZ_GS_TRACE_START")) t.start = std::strtoull(v, nullptr, 10);
+                if (const char *v = std::getenv("KZ_GS_TRACE_FRAMES")) t.frames = std::strtoull(v, nullptr, 10);
+            }
+            return t;
+        }();
+        return t;
+    }
+    void traceRecord(uint32_t type, uint32_t arg, const void *data, uint32_t size)
+    {
+        Trace &t = trace();
+        const uint32_t hdr[3] = {type, arg, size};
+        std::fwrite(hdr, sizeof(hdr), 1, t.f);
+        if (size)
+            std::fwrite(data, size, 1, t.f);
+    }
+
     void onGifPacket(int path, const uint8_t *data, uint32_t sizeBytes)
     {
+        if (trace().active(gs().frames.load(std::memory_order_relaxed)))
+            traceRecord(1, static_cast<uint32_t>(path), data, sizeBytes);
+        if (path >= 1 && path <= 3)
+        {
+            g_pathPackets[path].fetch_add(1, std::memory_order_relaxed);
+            g_pathQwords[path].fetch_add(sizeBytes / 16u, std::memory_order_relaxed);
+            static const bool dbg = std::getenv("KZ_GS_DEBUG") && std::getenv("KZ_GS_DEBUG")[0] == '1';
+            if (dbg)
+                inspectGif(data, sizeBytes);
+        }
         kzgsGifTransfer(path, data, sizeBytes / 16u);
+    }
+
+    // KZ_GS_DEBUG=1: one line per ~second with display registers, fade level and GIF traffic.
+    void debugLine(GsState &s)
+    {
+        static const bool enabled = std::getenv("KZ_GS_DEBUG") && std::getenv("KZ_GS_DEBUG")[0] == '1';
+        if (!enabled || (s.frames.load() % 60u) != 0u)
+            return;
+        const GSRegisters &r = s.runtime->memory().gs();
+        const uint8_t *ram = s.runtime->memory().getRDRAM();
+        uint32_t fade = 0, vs = 0, countAcc = 0, countLast = 0;
+        std::memcpy(&fade, ram + 0x0055A7C8u, 4);
+        std::memcpy(&vs, ram + 0x0055A6E0u, 4);
+        std::memcpy(&countAcc, ram + 0x0055F0E8u, 4);
+        std::memcpy(&countLast, ram + 0x0055F0F0u, 4);
+        std::fprintf(stderr, "[gsdbg] smode1=%llx synch1=%llx synch2=%llx syncv=%llx srfsh=%llx\n",
+                     static_cast<unsigned long long>(r.smode1), static_cast<unsigned long long>(r.synch1),
+                     static_cast<unsigned long long>(r.synch2), static_cast<unsigned long long>(r.syncv),
+                     static_cast<unsigned long long>(r.srfsh));
+        std::fprintf(stderr, "[gsdbg] count acc=%u last=%u\n", countAcc, countLast);
+        std::fprintf(stderr,
+                     "[gsdbg] f=%llu vs=%u fade=%u pmode=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx bg=%llx "
+                     "p1=%llu/%llu p2=%llu/%llu p3=%llu/%llu\n",
+                     static_cast<unsigned long long>(s.frames.load()), vs, fade,
+                     static_cast<unsigned long long>(r.pmode), static_cast<unsigned long long>(r.smode2),
+                     static_cast<unsigned long long>(r.dispfb1), static_cast<unsigned long long>(r.display1),
+                     static_cast<unsigned long long>(r.dispfb2), static_cast<unsigned long long>(r.display2),
+                     static_cast<unsigned long long>(r.bgcolor),
+                     static_cast<unsigned long long>(g_pathPackets[1].load()), static_cast<unsigned long long>(g_pathQwords[1].load()),
+                     static_cast<unsigned long long>(g_pathPackets[2].load()), static_cast<unsigned long long>(g_pathQwords[2].load()),
+                     static_cast<unsigned long long>(g_pathPackets[3].load()), static_cast<unsigned long long>(g_pathQwords[3].load()));
+        std::fprintf(stderr, "[gsdbg]   frame1=%llx frame2=%llx prims=%llu lastprim=%llx trxdir=%llu bitblt=%llx\n",
+                     static_cast<unsigned long long>(g_lastFrame1.load()), static_cast<unsigned long long>(g_lastFrame2.load()),
+                     static_cast<unsigned long long>(g_primWrites.load()), static_cast<unsigned long long>(g_lastPrim.load()),
+                     static_cast<unsigned long long>(g_imageTransfers.load()), static_cast<unsigned long long>(g_lastBitblt.load()));
     }
 
     void onVsync(uint64_t, int field)
@@ -163,8 +302,16 @@ namespace
             }
         }
         snapshotPrivRegs(s);
+        if (trace().active(s.frames.load(std::memory_order_relaxed)))
+        {
+            traceRecord(2, static_cast<uint32_t>(field), s.privRegs, sizeof(s.privRegs));
+            std::fflush(trace().f);
+        }
+        else if (trace().f && s.frames.load(std::memory_order_relaxed) == trace().start + trace().frames)
+            std::fflush(trace().f), std::fprintf(stderr, "[kz] GS trace complete\n");
         kzgsVsync(field, true);
         s.frames.fetch_add(1, std::memory_order_relaxed);
+        debugLine(s);
         if (!s.shotDir.empty())
         {
             const auto now = std::chrono::steady_clock::now();
@@ -178,7 +325,8 @@ namespace
 
     void onLog(int level, const char *msg)
     {
-        if (level <= 1)
+        static const bool verbose = std::getenv("KZ_GS_DEBUG") && std::getenv("KZ_GS_DEBUG")[0] == '1';
+        if (level <= 1 || verbose)
             std::cerr << "[kzgs] " << msg << std::endl;
     }
 }

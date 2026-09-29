@@ -194,18 +194,18 @@ namespace
                     }
                     ImGui::EndCombo();
                 }
-                static const int kFps[] = {0, 60, 120, 144, 165, 240, 360};
-                std::string fpsLabel = cfg.fpsLimit == 0 ? "Unlimited" : std::to_string(cfg.fpsLimit);
-                if (ImGui::BeginCombo("Frame rate limit", fpsLabel.c_str()))
+                static const int kFps[] = {0, 60, 120, 144, 165, 240, 360};  // 0 = monitor refresh
+                std::string fpsLabel = cfg.fpsLimit == 0 ? "Match monitor refresh" : std::to_string(cfg.fpsLimit) + " fps";
+                if (ImGui::BeginCombo("Frame rate", fpsLabel.c_str()))
                 {
                     for (int f : kFps)
-                        if (ImGui::Selectable(f == 0 ? "Unlimited" : std::to_string(f).c_str(), cfg.fpsLimit == f))
+                        if (ImGui::Selectable(f == 0 ? "Match monitor refresh" : (std::to_string(f) + " fps").c_str(), cfg.fpsLimit == f))
                             cfg.fpsLimit = f;
                     ImGui::EndCombo();
                 }
                 ImGui::Checkbox("V-Sync", &cfg.vsync);
-                ImGui::TextDisabled("High refresh rate: the game runs its simulation on real frame time, so any\n"
-                                    "limit above 60 renders and plays at that rate.");
+                ImGui::TextDisabled("The game simulates on real frame time, so it renders and plays at the chosen\n"
+                                    "rate (60 = original feel, 120 and up = high refresh).");
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Graphics"))
