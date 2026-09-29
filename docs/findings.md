@@ -24,3 +24,8 @@ Addresses are EE virtual addresses in `SCUS_974.02`. Function names are Ghidra a
 ## Widescreen / noise filter
 - `0x005DA364` = 1 → native widescreen (pnach). `0x0055DF6C` byte → noise filter (only when `0x0057BA88 == 4`).
   No direct xrefs in Ghidra (accessed via base+offset) — locate owning struct later.
+
+## Mouse (first pass)
+- `Use Mouse` @0x5570FB ← `FUN_003c8a20`; `Mouse-Look X/Y` @0x557249/56, 0x55730A/17 ← `FUN_003ca130`, `FUN_003cb580` (options/menu construction).
+- `MsgMouse` @0x5516A7 ← `FUN_00309a88` (registers 4 message handlers at 0x582B80..0x582C60 via `FUN_00172238`).
+- Next: follow `MsgMouse` handler → where mouse deltas feed player aim.
