@@ -44,6 +44,7 @@ CMake options:
 | `KZGS_DEPS_DIR` | `ext/kzgs/deps/deps` | Location of the extracted dependency bundle |
 | `KZGS_ISA` | `AVX2` | Instruction set the GS code is compiled for: `SSE4`, `AVX` or `AVX2` (see Known gaps) |
 | `KZGS_BUILD_TEST` | on when top-level | Builds `kzgs_test` |
+| `KZGS_BUILD_TOOLS` | on when top-level | Builds `kzgs_replay`, the trace debugger (see Debugging) |
 
 All of kzgs' compile flags are private: `/permissive-`, `/Zc:preprocessor`, `/arch:AVX2`, C++20, PCSX2's defines and
 the ImGui rename header. The only thing a consumer inherits is the include directory, plus these link libraries:
@@ -79,7 +80,7 @@ void kzgsSetLogCallback(KzgsLogFn fn);
 ```
 
 `KzgsConfig` has these settings:
-- `renderer`: D3D11, D3D12 or Vulkan
+- `renderer`: D3D11, D3D12, Vulkan, or Software (PCSX2's software rasterizer, useful as a reference when debugging)
 - `upscale`: 1 to 8
 - `textureFiltering`: PCSX2 `BiFiltering`
 - `anisotropy`
@@ -95,6 +96,7 @@ void kzgsSetLogCallback(KzgsLogFn fn);
 - `cacheDir`: defaults to `<exe>/cache`. Set it to a writable per-user folder if the game is installed read-only.
 - `disableShaderCache`
 - `maxQueuedFrames`: default 2
+- `selfContainedGifPackets`: default true; see GIF packet semantics below
 - `debugDevice`
 
 Pass `hwnd = nullptr` to open without a window (a surfaceless device). This still renders and supports
@@ -123,6 +125,23 @@ Mode notes that were checked with the test:
 - A 448-line full-frame buffer uses `SMODE2 = INT=1, FFMD=0`.
 - `FFMD=1` makes PCSX2 read a half-height field (224 lines) and line-double it.
 
+### GIF packet semantics
+
+By default (`selfContainedGifPackets = true`), every `kzgsGifTransfer()` call must be a self-contained sequence of GIF
+packets that starts with a GIFtag. This matches what PS2Recomp's GIF arbiter forwards, and what its own CPU GS
+frontend expects.
+
+A GIFtag that is still open at the end of a call is dropped. This matters for one case in particular. When a VIF1
+DIRECT ends with an IMAGE tag whose data arrives in a later DMA chunk, `ps2_vif1_interpreter.cpp` sends that data as
+a new packet with its own synthesized IMAGE tag. PCSX2 keeps GIF path state across calls (MTGS semantics), so without
+this mode it would read the synthesized tag as pixel data. The last data qword would then be parsed as a garbage
+GIFtag, which corrupted every PATH2 texture upload and the GS state after it. That was the cause of the all-black
+Killzone frames. Dropping the open tag is safe because the image transfer's own progress (TRXREG) is tracked
+separately and continues with the re-wrapped data.
+
+Set `selfContainedGifPackets = false` for a raw, hardware-exact per-path byte stream, where a packet may continue
+across calls.
+
 ## Threading model
 
 kzgs owns one GS thread. The D3D11/D3D12/Vulkan device, the ImGui context and every PCSX2 GS call live on that thread.
@@ -150,6 +169,7 @@ The public calls work as producers:
 | `VMManager` | Reports serial `SCUS-97402`, title `Killzone` and CRC 0. These are used only for dump and texture-replacement folder names. | No |
 | `PerformanceMetrics`, `GSDumpReplayer`, `MTGS`, `SPU2`, `USB`, `Pad`, `FileMcd`, `AudioStream`, `CrashHandler` | No-ops. The MTGS entries are reached only from PCSX2 hotkeys, which kzgs never fires. | No |
 | `eeHw`, `_cpuRegistersPack`, `FMVstarted`, `BuildVersion` | Dummy globals that PCSX2 headers bind references to. | No |
+| `SysMemory::GetCodePtr` | Reserves only the 64 MB RWX "SWrec" region, near the exe, for the software renderer's JIT. | Only for the Software renderer |
 | **SIGNAL / FINISH / LABEL, CSR interrupt bits, IMR, INTC_GS** | Not handled. PCSX2's `GSState` ignores these A+D writes too; the EE-side GIF unit handles them. **The caller's GIF arbiter must process them and raise INTC_GS.** | **Yes** |
 | **CSR.FIELD / vsync field** | The caller supplies `field` to `kzgsVsync` and keeps CSR in its own block. | **Yes** |
 
@@ -178,6 +198,23 @@ corresponding source. The shims and the kzgs sources carry `SPDX-License-Identif
 
 The DLLs from the dependency bundle keep their own licenses (zlib, libpng, libwebp, libjpeg-turbo, zstd, DXC,
 shaderc); see `deps/deps/licenses`.
+
+## Debugging (kzgs_replay)
+
+`kzgs_replay` replays a game GS trace recorded with `KZ_GS_TRACE`, in the same format that `tools/gs_replay` reads,
+and can look inside PCSX2's GS:
+
+```sh
+ext/kzgs/build/kzgs_replay.exe work/trace_full2.bin work/kzdbg/out --every 100 [--upscale 2] [--renderer sw]
+    [--pcrtc] [--vram 0:8,70:8,e0:8] [--dump-draws 1000:60] [--last N]
+```
+
+- `--pcrtc` prints PCSX2's display-circuit state: display and framebuffer rects, offsets and magnification.
+- `--vram` reads the texture cache back into local memory. It then prints nonzero bytes per 256 KB of VRAM and
+  writes each requested CT32 buffer (FBP:FBW) as a PNG.
+- `--dump-draws F:N` turns on PCSX2's own per-draw dumps (context registers, vertices, transfers) for N draws
+  starting at frame F.
+- It uses the internal hook `kzgs::RunOnGSThread()`, declared in `shim/include/kzgs_internal.h`.
 
 ## Known gaps
 

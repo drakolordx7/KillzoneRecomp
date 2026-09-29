@@ -5,3 +5,6 @@ build-*/
 # Test outputs
 test/*.png
 test/last_run.txt
+
+# The repo root ignores every "tools/" dir; kzgs debug tools are source.
+!tools/

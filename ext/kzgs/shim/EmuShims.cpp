@@ -20,15 +20,37 @@
 #include "VMManager.h"
 
 #include "common/CrashHandler.h"
+#include "common/RedtapeWindows.h"
 #include "BuildVersion.h"
 
 // ---- EE globals that PCSX2 headers bind static references to (Dmac.h, R5900.h) ---------------------------------------
 alignas(__pagealignsize) u8 eeHw[Ps2MemSize::Hardware];
 alignas(16) cpuRegistersPack _cpuRegistersPack;
 
+// The SW renderer JITs its rasterizers into SysMemory's "SWrec" code region. kzgs has no SysMemory, so reserve just
+// that region (64 MB, RWX) on first use, as close to the executable as possible like PCSX2 does, so rel32
+// calls/jumps from generated code into the binary stay in range.
 u8* SysMemory::GetCodePtr(size_t offset)
 {
-	return nullptr;
+	static u8* s_swrec = []() -> u8* {
+		const uintptr_t image = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+		constexpr uintptr_t step = 0x10000000; // 256 MB
+		for (uintptr_t d = step; d < 0x70000000; d += step)
+		{
+			for (const uintptr_t hint : {image > d ? image - d : 0, image + d})
+			{
+				if (!hint)
+					continue;
+				if (void* p = VirtualAlloc(reinterpret_cast<void*>(hint), HostMemoryMap::SWrecSize,
+						MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE))
+					return static_cast<u8*>(p);
+			}
+		}
+		return static_cast<u8*>(VirtualAlloc(nullptr, HostMemoryMap::SWrecSize, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+	}();
+	if (offset < HostMemoryMap::SWrecOffset || offset > HostMemoryMap::SWrecOffset + HostMemoryMap::SWrecSize || !s_swrec)
+		return nullptr;
+	return s_swrec + (offset - HostMemoryMap::SWrecOffset);
 }
 
 void CrashHandler::WriteDumpForCaller() {}

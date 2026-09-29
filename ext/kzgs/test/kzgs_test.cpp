@@ -3,7 +3,7 @@
 // Then switches to 2x upscaling and checks the readback doubles in size with the same picture, stresses the ring
 // buffer with >32 MB of chunked PATH2 IMAGE uploads, and switches renderer on the same window (scene over PATH1).
 //
-// Usage: kzgs_test [--renderer d3d11|d3d12|vulkan] [--warp] [--show] [--vsync] [--frames N] [--stress-uploads N]
+// Usage: kzgs_test [--renderer d3d11|d3d12|vulkan] [--warp] [--show] [--vsync] [--raw-gif] [--frames N] [--stress-uploads N]
 // Exit code 0 = pass. Writes test/out.png (1x), out_2x.png, out_stress.png and out_switch.png.
 // If the hardware D3D device cannot be created (e.g. no GPU access), it retries on WARP and says so.
 // SPDX-License-Identifier: GPL-3.0+
@@ -365,6 +365,8 @@ int main(int argc, char** argv)
 		}
 		else if (a == "--warp")
 			cfg.useWarp = true;
+		else if (a == "--raw-gif") // negative check: self-contained packet phase must then fail
+			cfg.selfContainedGifPackets = false;
 		else if (a == "--vsync")
 			vsync = true;
 		else if (a == "--show")
@@ -421,6 +423,10 @@ int main(int argc, char** argv)
 	// (Uploads keep GPU work small: thousands of full-screen fills per frame trip the 2 s GPU watchdog on an iGPU.)
 	{
 		std::printf("== ring stress (PATH2, %d x 16 KB uploads, 7-qword chunks, 2x)\n", stress_uploads);
+		// Chunked packets need the raw-stream GIF mode (a packet continues in the next kzgsGifTransfer call).
+		KzgsConfig raw = cfg;
+		raw.selfContainedGifPackets = false;
+		kzgsUpdateConfig(raw);
 		const DWORD t0 = GetTickCount();
 		size_t bytes = 0;
 		for (int i = 0; i < stress_uploads; i++)
@@ -442,6 +448,32 @@ int main(int argc, char** argv)
 		CheckPixel(g_last_rgba, g_last_w, g_last_h, 2, 590, 415, 255, 0, 255, "uploaded");
 		CheckPixel(g_last_rgba, g_last_w, g_last_h, 2, 623, 431, 255, 0, 255, "upload edge");
 		CheckPixel(g_last_rgba, g_last_w, g_last_h, 2, 624, 432, kBackground.r, kBackground.g, kBackground.b, "past upload");
+		kzgsUpdateConfig(cfg);
+	}
+
+	// Self-contained packet mode (default), as PS2Recomp's GIF arbiter feeds it: a VIF DIRECT ends with an IMAGE tag
+	// whose data arrives in a later DMA chunk, and the runtime forwards that data re-wrapped in its own IMAGE tag.
+	// Packet A = BITBLTBUF/TRXPOS/TRXREG/TRXDIR + IMAGE tag (NLOOP=n, EOP=0) and no data; packet B = IMAGE tag
+	// (NLOOP=n, EOP=1) + data. kzgs must drop A's open tag; otherwise B's tag is eaten as pixel data and B's last qword
+	// becomes a garbage GIFtag.
+	{
+		std::printf("== self-contained packets (dangling IMAGE tag + re-wrapped continuation over PATH2, 2x)\n");
+		const std::vector<uint8_t> up = BuildUpload(0, 10, 480, 8, 64, 24, 0x80FFFF00u); // cyan
+		std::vector<uint8_t> a(up.begin(), up.begin() + 96);
+		a[80 + 1] &= 0x7F; // clear EOP on the IMAGE tag
+		std::vector<uint8_t> b(up.begin() + 80, up.end());
+		for (int f = 0; f < 2; f++)
+		{
+			kzgsGifTransfer(3, scene.data(), uint32_t(scene.size() / 16));
+			kzgsGifTransfer(2, a.data(), uint32_t(a.size() / 16));
+			kzgsGifTransfer(2, b.data(), uint32_t(b.size() / 16));
+			SetPriv(0x1000, (f & 1) ? (1ull << 13) : 0);
+			kzgsVsync(f & 1);
+		}
+		RenderAndCheck(scene, 0, 2, "out_packets.png");
+		CheckPixel(g_last_rgba, g_last_w, g_last_h, 2, 512, 20, 0, 255, 255, "rewrapped");
+		CheckPixel(g_last_rgba, g_last_w, g_last_h, 2, 543, 31, 0, 255, 255, "rewrap edge");
+		CheckPixel(g_last_rgba, g_last_w, g_last_h, 2, 512, 32, kBackground.r, kBackground.g, kBackground.b, "below rewrap");
 	}
 
 	// Renderer switch on the same window through kzgsUpdateConfig (GSreopen path), scene sent over PATH1.

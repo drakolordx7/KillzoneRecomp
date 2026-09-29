@@ -18,6 +18,7 @@ set(KZGS_DEPS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/deps/deps" CACHE PATH "Extracted 
 set(KZGS_ISA "AVX2" CACHE STRING "Vector ISA the GS is compiled for (SSE4, AVX, AVX2)")
 set_property(CACHE KZGS_ISA PROPERTY STRINGS SSE4 AVX AVX2)
 option(KZGS_BUILD_TEST "Build the kzgs_test executable" ${PROJECT_IS_TOP_LEVEL})
+option(KZGS_BUILD_TOOLS "Build kzgs debug tools (kzgs_replay)" ${PROJECT_IS_TOP_LEVEL})
 
 get_filename_component(KZGS_PCSX2_DIR "${KZGS_PCSX2_DIR}" ABSOLUTE)
 set(P2 "${KZGS_PCSX2_DIR}")
@@ -352,4 +353,12 @@ if(KZGS_BUILD_TEST)
 	target_compile_features(kzgs_test PRIVATE cxx_std_20)
 	target_compile_definitions(kzgs_test PRIVATE KZGS_TEST_OUT_DIR="${KZGS_ROOT}/test")
 	kzgs_stage_resources(kzgs_test)
+endif()
+
+if(KZGS_BUILD_TOOLS)
+	# Debug replay of game GS traces with access to PCSX2 GS internals (compiled with kzgs' private flags).
+	add_executable(kzgs_replay "${KZGS_ROOT}/tools/kzgs_replay.cpp")
+	target_link_libraries(kzgs_replay PRIVATE kzgs kzgs_flags)
+	target_precompile_headers(kzgs_replay PRIVATE "${P2SRC}/PrecompiledHeader.h")
+	kzgs_stage_resources(kzgs_replay)
 endif()
