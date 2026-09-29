@@ -214,6 +214,11 @@ ext/kzgs/build/kzgs_replay.exe work/trace_full2.bin work/kzdbg/out --every 100 [
   writes each requested CT32 buffer (FBP:FBW) as a PNG.
 - `--dump-draws F:N` turns on PCSX2's own per-draw dumps (context registers, vertices, transfers) for N draws
   starting at frame F.
+- `--tex TBP:TBW:PSM:W:H[:CBP]` decodes a texture from GS local memory into color and alpha PNGs. PSM can be
+  PSMT8 (0x13) or PSMT4 (0x14) with a CT32 CSM1 CLUT, or CT32 (0).
+- `--defrost GS.bin` loads the GS part of a PCSX2 savestate (unzip the `.p2s`) instead of replaying a trace. It can be
+  combined with `--tex`, or with `--save-vram FILE`, which writes the raw 4 MB of local memory; `--save-vram` also
+  works at the end of a trace replay. This lets you diff VRAM between real PCSX2 and the port.
 - It uses the internal hook `kzgs::RunOnGSThread()`, declared in `shim/include/kzgs_internal.h`.
 
 ## Known gaps

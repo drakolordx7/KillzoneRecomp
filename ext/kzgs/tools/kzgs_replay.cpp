@@ -105,6 +105,41 @@ static double NonBlack(const std::vector<uint8_t>& px)
 
 struct VramReq { uint32_t fbp, fbw; };
 
+struct TexReq { uint32_t tbp, tbw, psm, w, h, cbp; };
+
+// Decodes a PSMT8/PSMT4 (CSM1, CT32 CLUT) or PSMCT32 texture from GS local memory into color and alpha PNGs.
+static void DumpTexture(const GSLocalMemory& mem, const TexReq& t, const std::filesystem::path& dir, uint64_t frame)
+{
+	std::vector<uint8_t> col(size_t(t.w) * t.h * 4), alp(size_t(t.w) * t.h * 4);
+	auto clut = [&](uint32_t i) -> uint32_t {
+		if (t.psm == 0x13)
+			i = (i & 0xE7) | ((i & 0x08) << 1) | ((i & 0x10) >> 1); // CSM1 T8 CLUT column swizzle
+		return mem.ReadPixel32(int(i & 15), int(i >> 4), t.cbp, 1);
+	};
+	for (uint32_t y = 0; y < t.h; y++)
+		for (uint32_t x = 0; x < t.w; x++)
+		{
+			uint32_t c;
+			if (t.psm == 0x13)
+				c = clut(mem.ReadPixel8(int(x), int(y), t.tbp, t.tbw));
+			else if (t.psm == 0x14)
+				c = clut(mem.ReadPixel4(int(x), int(y), t.tbp, t.tbw));
+			else
+				c = mem.ReadPixel32(int(x), int(y), t.tbp, t.tbw);
+			const size_t o = (size_t(y) * t.w + x) * 4;
+			std::memcpy(&col[o], &c, 4);
+			const uint8_t a = uint8_t(std::min<uint32_t>(255, (c >> 24) * 2));
+			alp[o] = alp[o + 1] = alp[o + 2] = a;
+			alp[o + 3] = 255;
+		}
+	char n[96];
+	std::snprintf(n, sizeof(n), "tex_%04x_%02x_%04llu_rgb.png", t.tbp, t.psm, (unsigned long long)frame);
+	WritePNG((dir / n).string(), col, int(t.w), int(t.h));
+	std::snprintf(n, sizeof(n), "tex_%04x_%02x_%04llu_alpha.png", t.tbp, t.psm, (unsigned long long)frame);
+	WritePNG((dir / n).string(), alp, int(t.w), int(t.h));
+}
+
+
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
 {
 	HANDLE proc = GetCurrentProcess();
@@ -156,6 +191,8 @@ int main(int argc, char** argv)
 	int every = 100, last = 0, dump_frame = -1, dump_count = 0;
 	bool pcrtc = false;
 	std::vector<VramReq> vram;
+	std::vector<TexReq> texs;
+	std::string defrost, save_vram;
 	KzgsConfig cfg;
 	cfg.upscale = 1;
 	cfg.vsync = false;
@@ -172,6 +209,14 @@ int main(int argc, char** argv)
 			const std::string r = argv[++i];
 			cfg.renderer = r == "vulkan" ? KzgsRenderer::Vulkan : r == "d3d12" ? KzgsRenderer::D3D12 :
 						   r == "sw" ? KzgsRenderer::Software : KzgsRenderer::D3D11;
+		}
+		else if (a == "--defrost" && i + 1 < argc) defrost = argv[++i];
+		else if (a == "--save-vram" && i + 1 < argc) save_vram = argv[++i];
+		else if (a == "--tex" && i + 1 < argc)
+		{
+			TexReq t{};
+			if (std::sscanf(argv[++i], "%x:%u:%x:%u:%u:%x", &t.tbp, &t.tbw, &t.psm, &t.w, &t.h, &t.cbp) >= 5)
+				texs.push_back(t);
 		}
 		else if (a == "--vram" && i + 1 < argc)
 		{
@@ -208,6 +253,43 @@ int main(int argc, char** argv)
 	{
 		std::fprintf(stderr, "kzgsOpen failed: %s\n", err.c_str());
 		return 1;
+	}
+
+	auto saveVram = [&](const std::string& path) {
+		kzgs::RunOnGSThread([&]() {
+			g_gs_renderer->ReadbackTextureCache();
+			if (FILE* vf = std::fopen(path.c_str(), "wb"))
+			{
+				std::fwrite(g_gs_renderer->m_mem.vm8(), 1, 4u << 20, vf);
+				std::fclose(vf);
+			}
+		});
+	};
+
+	// --defrost: load a PCSX2 savestate's GS.bin (GS freeze) instead of replaying a trace, then dump.
+	if (!defrost.empty())
+	{
+		FILE* df = std::fopen(defrost.c_str(), "rb");
+		if (!df)
+			return 1;
+		std::vector<u8> blob;
+		u8 tmp[65536];
+		size_t n;
+		while ((n = std::fread(tmp, 1, sizeof(tmp), df)) > 0)
+			blob.insert(blob.end(), tmp, tmp + n);
+		std::fclose(df);
+		int rc = -1;
+		kzgs::RunOnGSThread([&]() {
+			freezeData fd = {static_cast<int>(blob.size()), blob.data()};
+			rc = GSfreeze(FreezeAction::Load, &fd);
+			for (const TexReq& t : texs)
+				DumpTexture(g_gs_renderer->m_mem, t, out, 0);
+		});
+		std::printf("defrost %s: rc=%d (%zu bytes)\n", defrost.c_str(), rc, blob.size());
+		if (!save_vram.empty())
+			saveVram(save_vram);
+		kzgsClose();
+		return rc == 0 ? 0 : 1;
 	}
 
 	uint32_t hdr[3];
@@ -259,7 +341,7 @@ int main(int argc, char** argv)
 			std::printf("frame %llu: readback %s %dx%d nonblack %.1f%%\n", (unsigned long long)frame, ok ? "ok" : "FAILED", w,
 				h, NonBlack(px));
 
-			if (pcrtc || !vram.empty())
+			if (pcrtc || !vram.empty() || !texs.empty())
 			{
 				kzgs::RunOnGSThread([&]() {
 					GSRenderer* r = g_gs_renderer.get();
@@ -281,6 +363,12 @@ int main(int argc, char** argv)
 						GSTexture* cur = g_gs_device->GetCurrent();
 						std::printf("  current output texture: %s %dx%d\n", cur ? "yes" : "none", cur ? cur->GetWidth() : 0,
 							cur ? cur->GetHeight() : 0);
+					}
+					if (!texs.empty())
+					{
+						r->ReadbackTextureCache();
+						for (const TexReq& t : texs)
+							DumpTexture(r->m_mem, t, out, frame);
 					}
 					if (!vram.empty())
 					{
@@ -319,6 +407,8 @@ int main(int argc, char** argv)
 	}
 	std::fclose(f);
 	std::printf("replayed %llu frames\n", (unsigned long long)frame);
+	if (!save_vram.empty())
+		saveVram(save_vram);
 	kzgsClose();
 	return 0;
 }
