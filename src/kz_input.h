@@ -46,6 +46,9 @@ struct KzMouseDelta
 };
 KzMouseDelta kzInputTakeMouseDelta();
 
+// True when the most recent input came from keyboard/mouse rather than a gamepad (pad-only assists are then disabled).
+bool kzInputUsingKeyboardMouse();
+
 // When the engine aim patch is active, mouse motion goes there; otherwise it is mapped onto the right stick.
 void kzInputSetAimPatchActive(bool active);
 

@@ -42,3 +42,20 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
     Returning early left libsd's "transfer done" flag set by the later DMA interrupt. The flag was then stale, so
     the next `sceSdVoiceTransStatus` reported a running upload as finished, and every following `sceSdVoiceTrans`
     was refused as busy.
+
+- `0008-runtime-unwind-arena-iop-import-cache.patch`: stability and speed fixes found while getting into gameplay.
+  - **Yield/return confusion (random crashes).** `dispatchGuestBranch` treated "callee came back with pc == its own
+    entry" as a normal return. A checkpoint yield at a recursive call (Lua) or at a loop head that is the function's
+    first instruction produces exactly that pc. The caller then resumed early and the abandoned callee left
+    garbage return addresses (jumps to heap addresses like 0x7F82A0). A global `g_ps2GuestUnwinding` flag is now
+    set by every yield and every non-return exit; dispatch propagates the unwind, and the scheduler clears the flag
+    before it enters guest code. Reproduced with `PS2X_STRESS_YIELD=50` (a new debug env that forces a yield at
+    every Nth checkpoint): every run crashed within seconds before the fix, and none did in 120 s after it.
+  - **Scheduler trace.** A ring of scheduler entries/exits/interrupt invocations, printed when the scheduler hits
+    a pc with no function (debug aid).
+  - **Runtime arena (`include/runtime/ps2_host_arena.h`, `ps2SetRuntimeArena`).** The runtime's own guest
+    allocations followed the game's `SetupHeap`, and interrupt stacks sat at the top of RAM. Killzone's dlmalloc
+    owns 0x5913F8..0x1FFFFF0, so both overwrote its heap (the level-load heap walk then looped forever on a
+    zeroed chunk). The host now moves them to a region the game never uses (Killzone: 0x80000-0x100000).
+  - **IOP import decode cache.** `IopImportRegistry::decode` runs on every IOP instruction and scanned up to 64 KB
+    back for each stub's import table; resolved stubs are now cached per pc (cleared on reset/unload).
