@@ -1,4 +1,5 @@
 #include "kz_vu.h"
+#include "kz_crash.h"
 
 #include "kzvu.h"
 #include "kzvu0_capture.h"
@@ -6,6 +7,7 @@
 #include "ps2_runtime.h"
 #include "runtime/ps2_host_vu.h"
 #include "runtime/ps2_host_vu0.h"
+#include "runtime/ps2_dma_stats.h"
 
 #include <chrono>
 #include <cstdio>
@@ -26,6 +28,19 @@ namespace
 
     void onXgkick(void *, const uint8_t *packet, uint32_t bytes, uint32_t)
     {
+        if (ps2DmaStatsEnabled())
+        {
+            PS2DmaStats &st = ps2DmaStats();
+            st.vu1Xgkick.fetch_add(1, std::memory_order_relaxed);
+            st.vu1XgkickBytes.fetch_add(bytes, std::memory_order_relaxed);
+            if (bytes >= 16u)
+            {
+                uint64_t tag = 0;
+                std::memcpy(&tag, packet, sizeof(tag));
+                if ((tag >> 46) & 1u)
+                    st.vu1XgkickPrim[(tag >> 47) & 7u].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         if (g_runtime)
             g_runtime->memory().submitGifPacket(GifPathId::Path1, packet, bytes);
     }
@@ -52,8 +67,11 @@ namespace
     void onMscal(uint32_t startPc, uint32_t top, uint32_t itop, uint32_t fbrst, uint64_t gen, uint32_t *vpuStat)
     {
         prepare(top, itop, fbrst, gen);
+        const uint64_t c0 = kzvuCycles();
         kzvuExecute(startPc, kBudget);
         finish(vpuStat);
+        if (ps2DmaStatsEnabled())
+            ps2DmaStats().vu1Cycles.fetch_add(kzvuCycles() - c0, std::memory_order_relaxed);
     }
 
     void onMscnt(uint32_t top, uint32_t itop, uint32_t fbrst, uint64_t gen, uint32_t *vpuStat)
@@ -314,6 +332,7 @@ namespace
 
 bool kzVuInstall(std::string *error)
 {
+    kzCrashTraceInstall(); // debugging aid (KZ_CRASH_TRACE=1), installed with the first host hooks
     const char *mode = std::getenv("KZ_VU");
     const char *mode0 = std::getenv("KZ_VU0");
     const bool vu1Builtin = mode && std::strcmp(mode, "builtin") == 0;

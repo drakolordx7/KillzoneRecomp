@@ -92,6 +92,46 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
     by the host setting FTZ/DAZ on the game thread (src/kz_main.cpp).
   - `CVT.W.S` rounded to nearest; the EE truncates toward zero and saturates.
 
+- `0010-vif1-unpack-dma-chains-quadword-loads-mmi.patch` (recompiler + runtime; the recompiler part needs
+  `build_ps2recomp.bat`, `regen.py` and a full rebuild). Makes Killzone's gameplay 3D render. Before it, the first mission
+  showed only the HUD and post-effect passes over a flat red scene buffer.
+  - **LQ/SQ/LQC2/SQC2 force a quadword address** (`instruction_translator.cpp`). The EE ignores the low four address
+    bits, and the generated code did not. The game loads unaligned vectors with `lq t0,0(a); lq t1,16(a); mtsab a,0;
+    qfsrv t0,t1,t0` (371 QFSRV sites). With unaligned `lq` the second vector came out as neighbouring stack words. One
+    effect: FUN_002c84d8 (AABB x matrix) returned max = translation, every RenderZone box was flat (zone +0xAC max
+    54/-416/-17.3 vs PCSX2's 159/-270/37), the camera was in no zone, and no world object was submitted
+    (108 MSCAL per frame vs 915 in PCSX2).
+  - **SQRT.S reads ft** (`fpu_translator.cpp`). It read fs, which is 0 in the encoding, so ~430 sites took sqrt(f0).
+  - **MMI** (`mmi_translation_helpers.cpp`). PEXEW swapped adjacent words instead of words 0 and 2. PEXEH, PEXCH, PEXCW
+    and PREVH had the same kind of lane errors. PMULTH summed the products instead of storing eight of them in 128-bit
+    LO/HI. PMFHL.SH ignored LO1/HI1. After the alignment and SQRT fixes, the player still fell through the floor (z
+    -1.7e5 after a minute; PCSX2 2.659). With these fixed, the player stands at PCSX2's position.
+  - **VIF1 UNPACK with PCSX2's semantics** (`ps2_vif1_interpreter.cpp`, `vif1UnpackPcsx2`):
+    - WL=0 means 256.
+    - In fill mode the source pointer only advances for CL writes.
+    - V2 writes xyxy. V3 reads four elements.
+    - V4-5 expands to 8 bits per channel.
+    - STMOD 3 is supported.
+    - Mask rows and columns follow the write cycle.
+    - Source size uses PCSX2's formula.
+
+    `PS2X_VIF_UNPACK=legacy` keeps the old code. With it, the world draws with bent and stretched geometry, and the
+    game ran at ~2.5 frames/s in one run.
+  - **DMA chains are no longer cut at 4096 tags** (`ps2_memory.cpp`). A gameplay frame is one VIF1 chain of ~4400
+    tags. The rest of the chain was dropped and CHCR still read back as done. Symptoms: noisy textures, white screens,
+    runaway VU1 programs (2.5e9 VU1 cycles in 10 s), and host crashes (access violation, heap corruption) seconds into
+    gameplay.
+  - **Scratchpad DMA chain mode** (toSPR source chain with TTE, fromSPR destination chain). Before, CHCR only read back
+    as done and nothing was copied. Used in the menus, not in gameplay. `PS2X_SPR_CHAIN=0` disables it.
+  - **SPR bit (bit 31) in MADR/TADR/DMAtag ADDR** selects the scratchpad at `addr & 0x3FF0`, as in PCSX2 `dmaGetAddr`.
+    `PS2X_DMA_SPR_BIT=0` disables it.
+  - **Debug aids:**
+    - `PS2X_DMA_STATS=1` prints a `[dma]` line per headless heartbeat: DMA starts per channel and mode, VIF1
+      chains/tags/bytes, the tag-limit count, UNPACK formats, MSCAL, and XGKICK count/bytes/first PRIM from kz_vu.
+      The counters are in the new header `runtime/ps2_dma_stats.h`, which generated code does not include.
+    - `PS2X_VIF1_DUMP=<dir>` (with `_AFTER=<s>` and `_MAX=<n>`) writes every VIF1 buffer, the VU1 micro memory and
+      the scratchpad. Read the dumps with `tools/scripts/vifparse.py`.
+
 - `0011-iop-batched-advance.patch`: `PS2Runtime::advanceIopEeCycles` ran the IOP on every EE checkpoint (nearly every
   guest call) with a few cycles, paying the fixed per-run cost (SPU2 advance, service checks, thread selection) each
   time; the IOP was ~50% of the game thread in-game. It now runs in quanta of `PS2X_IOP_BATCH` EE cycles (default
