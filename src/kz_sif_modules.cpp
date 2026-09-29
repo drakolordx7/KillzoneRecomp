@@ -79,3 +79,29 @@ void kzSceSifUnloadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime
     g_sif_modules_by_id.erase(it);
     setReturnS32(ctx, 0);
 }
+
+// Logitech lgkbm USB keyboard library init (FUN_003d7490(maxKbd, maxMouse, threadPrio, callback)).
+// The real init binds the LGKBM.IRX RPC server and starts a polling thread that blocks on the IOP; the port feeds
+// keyboard/mouse through its own input layer, so the library is brought up as "initialized, nothing plugged in":
+// device counts set, every keyboard/mouse slot id = 0xFFFF (free), init flag set. The public API
+// (open/read/bitmap, docs/findings.md#usb-keyboardmouse-lgkbm) then reports "no device" as on a PS2 without USB devices.
+void kzLgkbmInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    (void)runtime;
+    ctx->pc = getRegU32(ctx, 31);
+    const int32_t maxKbd = std::min<int32_t>(static_cast<int32_t>(getRegU32(ctx, 4)), 4);
+    const int32_t maxMouse = std::min<int32_t>(static_cast<int32_t>(getRegU32(ctx, 5)), 4);
+    auto w32 = [rdram](uint32_t addr, uint32_t v) { std::memcpy(rdram + (addr & PS2_RAM_MASK), &v, 4); };
+    auto w16 = [rdram](uint32_t addr, uint16_t v) { std::memcpy(rdram + (addr & PS2_RAM_MASK), &v, 2); };
+    w32(0x00590DD0u, static_cast<uint32_t>(maxKbd));
+    w32(0x00590DD4u, static_cast<uint32_t>(maxMouse));
+    for (int i = 0; i < 4; ++i)
+    {
+        w16(0x00590E1Cu + i * 0x110u, 0xFFFFu); // keyboard slot device id
+        w32(0x00590E34u + i * 0x110u, 0u);      // keyboard slot state: not connected
+        w16(0x0059125Cu + i * 0x68u, 0xFFFFu);  // mouse slot device id
+    }
+    w32(0x00590DC4u, 1u); // library initialized
+    RUNTIME_LOG("[kz] lgkbm init HLE: maxKbd=" << maxKbd << " maxMouse=" << maxMouse << " (no USB devices)");
+    setReturnS32(ctx, 0);
+}

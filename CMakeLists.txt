@@ -8,6 +8,7 @@ set(PS2X_BUILD_TEST OFF CACHE BOOL "" FORCE)
 set(PS2X_BUILD_STUDIO OFF CACHE BOOL "" FORCE)
 set(PS2X_ENABLE_AGRESSIVE_LOGS OFF CACHE BOOL "" FORCE)  # per-call enter/exit trace: ~500MB per 30s
 add_subdirectory(ext/PS2Recomp)
+add_subdirectory(ext/kzgs)   # PCSX2 hardware GS as a library (ext/kzgs/README.md)
 
 # Generated code lives outside the repo (derived from the game ELF). Point KZ_GENERATED_DIR at it.
 set(KZ_GENERATED_DIR "${CMAKE_SOURCE_DIR}/generated" CACHE PATH "PS2Recomp output for SCUS_974.02")
@@ -17,14 +18,25 @@ message(STATUS "Killzone: ${KZ_GENERATED_COUNT} generated sources")
 
 file(GLOB KZ_SRC CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.cpp")
 
+# Our code lives in its own library so its dependencies (SDL3, ImGui, ...) never change the compile flags of the
+# ~650 generated-code unity batches (a flag change there means a full 15-minute rebuild).
+include(FetchContent)
+FetchContent_GetProperties(imgui SOURCE_DIR KZ_IMGUI_DIR)
+find_package(SDL3 CONFIG REQUIRED PATHS "${CMAKE_SOURCE_DIR}/ext/sdl3/SDL3-3.4.16/cmake" NO_DEFAULT_PATH)
+add_library(kz_port STATIC
+    ${KZ_SRC}
+    "${KZ_IMGUI_DIR}/backends/imgui_impl_sdl3.cpp"
+    "${KZ_IMGUI_DIR}/backends/imgui_impl_sdlrenderer3.cpp")
+target_include_directories(kz_port PRIVATE "${CMAKE_SOURCE_DIR}/src" "${KZ_IMGUI_DIR}" "${KZ_IMGUI_DIR}/backends")
+target_link_libraries(kz_port PRIVATE ps2_runtime SDL3::SDL3 imgui kzgs)
+target_compile_definitions(kz_port PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+
 add_executable(killzone
     ${KZ_GENERATED_SRC}
-    ${KZ_SRC}
 )
-# Our own code must not be merged into the generated-code unity batches.
-set_source_files_properties(${KZ_SRC} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
 target_include_directories(killzone PRIVATE "${KZ_GENERATED_DIR}" "${CMAKE_SOURCE_DIR}/src")
-target_link_libraries(killzone PRIVATE ps2_runtime)
+# kz_port holds main() and the game override registration; link it whole so static registrars are kept.
+target_link_libraries(killzone PRIVATE ps2_runtime "$<LINK_LIBRARY:WHOLE_ARCHIVE,kz_port>")
 set_target_properties(killzone PROPERTIES
     UNITY_BUILD ON
     UNITY_BUILD_BATCH_SIZE 128
@@ -43,3 +55,6 @@ endif()
 
 # Copy FFmpeg runtime DLLs next to killzone.exe (helper from ps2xRuntime).
 ps2x_stage_ffmpeg_runtime_dlls(killzone)
+kzgs_stage_resources(killzone)
+add_custom_command(TARGET killzone POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:SDL3::SDL3> $<TARGET_FILE_DIR:killzone>)

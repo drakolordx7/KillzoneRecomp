@@ -6,8 +6,9 @@ Addresses are EE virtual addresses in `SCUS_974.02`. Function names are Ghidra a
 - `SCUS_974.02` = entire offline game. `cdrom0:\LOADER.ELF` is exec'd only for Killzone Online; `LOADER.ELF` loads
   `MODULES\BLGFX.REL` (online loading screen), `DNASMC.REL`, `NETWORK.REL`, `ONLINE.REL`. All online-only → out of scope.
 - Game data: `FILES.DAT`, `FILES01-04.DAT`.
-- Strings `Use Mouse`, `Mouse-Look X`, `Mouse-Look Y`, `MsgMouse` present in the offline ELF; `IOP/LGKBM.IRX` (USB kbd/mouse) on disc
-  → the game appears to have native USB mouse support. Candidate path for M+KB (feed PC mouse into the game's own mouse input).
+- ~~Native USB mouse support~~ — **wrong, corrected 2026-09-29**: `Use Mouse` / `Mouse-Look X/Y` are reflection properties of the
+  engine camera classes (`Camera.Input: Use Mouse/Use Joystick/Use Keyboard`, `CamFirstPerson: Speed/Forward/Strafe/Mouse-Look X/Y/Min Pitch/Max Pitch`,
+  `CamOrbit`), i.e. Guerrilla's PC tool/debug cameras. See "USB keyboard/mouse (lgkbm)" below: nothing reads mouse data.
 
 ## Frame timing (key for high refresh)
 - `DAT_0055a6e0` — vsync counter (60 Hz NTSC fields).
@@ -25,7 +26,18 @@ Addresses are EE virtual addresses in `SCUS_974.02`. Function names are Ghidra a
 - `0x005DA364` = 1 → native widescreen (pnach). `0x0055DF6C` byte → noise filter (only when `0x0057BA88 == 4`).
   No direct xrefs in Ghidra (accessed via base+offset) — locate owning struct later.
 
-## Mouse (first pass)
+## USB keyboard/mouse (lgkbm)
+- `FUN_002de720` loads `cdrom0:\IOP\USBD.IRX` ("usbd") and `LGKBM.IRX` ("lgkbm", arg `MaxKbd=1`), then `FUN_003d7490(1,0,1,cb)` = Logitech
+  lgkbm lib init (max kbd, max mice clamped to 4; here 1 keyboard, 0 mice).
+- RPC sid `0x61766973`, client @0x590D90, async with end func `0x3D9360` (iSignalSema 0x590DB8). Thread `FUN_003d8cf0`:
+  cmd 3 (0x20) handshake {u16 maxKbd, u16 maxMouse, u32 ver 0x80001, u16 1} → IOP must echo ver at +0xA, 1 at +0xE, 0 at +0x10;
+  cmd 1 (0x90) device list (count @+2, entries @+4 x 0x10: +2 type 0/1 kbd/2 mouse, +4 id, +0xE flags 0x8000 reportId/0x4000 wheel);
+  cmd 2 (0x1D0) events (count @+2, records @+4 x 0x1C: +4 type, +6 id, +0xC err, +0x14 HID boot report); cmd 4 ack.
+- Keyboard API (lock 0x590DBC, slots 0x590E18 x 0x110): `FUN_003d7708` open, `FUN_003d6f38`, `FUN_003d7058` read, `FUN_003d7918` key
+  bitmap, `FUN_003d7858` close, `FUN_003d7828` changed-flag. **No mouse reader exists** (mouse ring 0x591258 x 0x68 is written, never read).
+- Consequence: mouse aim must be an engine patch (player yaw/pitch); keyboard movement via the pad layer. The keyboard lib is likely online chat.
+
+## Mouse (first pass, superseded)
 - `Use Mouse` @0x5570FB ← `FUN_003c8a20`; `Mouse-Look X/Y` @0x557249/56, 0x55730A/17 ← `FUN_003ca130`, `FUN_003cb580` (options/menu construction).
 - `MsgMouse` @0x5516A7 ← `FUN_00309a88` (registers 4 message handlers at 0x582B80..0x582C60 via `FUN_00172238`).
 - Next: follow `MsgMouse` handler → where mouse deltas feed player aim.

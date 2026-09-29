@@ -35,6 +35,7 @@ namespace
     const CustomBinding kCustom[] = {
         {0x002B5D88u, &kzSceSifSearchModuleByName, "sceSifSearchModuleByName"},
         {0x002B5CF8u, &kzSceSifUnloadModule, "sceSifUnloadModule"},
+        {0x003D7490u, &kzLgkbmInit, "lgkbm init"},
     };
 
     void applyKillzone(PS2Runtime &runtime)

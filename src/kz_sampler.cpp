@@ -4,6 +4,9 @@
 
 #include "kz_sampler.h"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <dbghelp.h>
 #include <tlhelp32.h>
