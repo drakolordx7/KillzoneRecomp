@@ -17,6 +17,7 @@
 #include "common/StringUtil.h"
 
 #include <atomic>
+#include <functional>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -40,6 +41,7 @@ namespace
 		UpdateConfig,
 		Sync,
 		Readback,
+		Call,
 		Quit,
 	};
 
@@ -85,7 +87,14 @@ namespace
 		bool ok = false;
 	};
 
+	struct CallRequest
+	{
+		SyncPoint sync;
+		std::function<void()> fn;
+	};
+
 	static constexpr size_t RING_SIZE = 32u * 1024u * 1024u;
+	static constexpr u32 TRANSFER_END_OF_PACKET = 0x100;
 	static constexpr u32 MAX_TRANSFER_CHUNK = 1024u * 1024u; // bytes per Transfer command
 
 	alignas(64) static u8* s_ring = nullptr;
@@ -101,6 +110,7 @@ namespace
 	static uint8_t* s_caller_regs = nullptr;
 	alignas(16) static u8 s_gs_regs[0x2000]; // the GS thread's copy of the privileged registers
 	static int s_max_queued_frames = 2;
+	static bool s_self_contained_packets = true;
 	static KzgsLogFn s_log_fn = nullptr;
 
 	static constexpr u32 Align16(u32 v) { return (v + 15u) & ~15u; }
@@ -181,6 +191,7 @@ namespace
 		{
 			case KzgsRenderer::D3D12: return GSRendererType::DX12;
 			case KzgsRenderer::Vulkan: return GSRendererType::VK;
+			case KzgsRenderer::Software: return GSRendererType::SW;
 			case KzgsRenderer::D3D11:
 			default: return GSRendererType::DX11;
 		}
@@ -228,6 +239,7 @@ namespace
 		EmuConfig.GS = opts;
 		EmuConfig.CurrentAspectRatio = opts.AspectRatio;
 		s_max_queued_frames = std::max(1, cfg.maxQueuedFrames);
+		s_self_contained_packets = cfg.selfContainedGifPackets;
 	}
 
 	static void SetupFolders(const KzgsConfig& cfg)
@@ -272,13 +284,28 @@ namespace
 		std::memcpy(s_gs_regs + 0x1080, &p.siglblid, sizeof(p.siglblid));
 	}
 
-	static void DoTransfer(u32 path, const u8* data, u32 qwords)
+
+
+	static void DoTransfer(u32 path_and_flags, const u8* data, u32 qwords)
 	{
-		switch (path)
+		const u32 path = path_and_flags & 0xFF;
+		const u32 index = (path == 1) ? 0 : (path == 2) ? 1 : 2;
+		switch (index)
 		{
-			case 1: g_gs_renderer->Transfer<0>(data, qwords); break;
-			case 2: g_gs_renderer->Transfer<1>(data, qwords); break;
+			case 0: g_gs_renderer->Transfer<0>(data, qwords); break;
+			case 1: g_gs_renderer->Transfer<1>(data, qwords); break;
 			default: g_gs_renderer->Transfer<2>(data, qwords); break;
+		}
+
+		// Self-contained packet mode: every kzgsGifTransfer() call starts with a GIFtag. A tag left open at the end of
+		// a packet (e.g. the IMAGE tag that ends a VIF DIRECT whose data comes in a later chunk, which PS2Recomp's
+		// VIF1 re-wraps in a synthesized IMAGE tag) is dropped instead of swallowing the next packet's tag as data.
+		// The TRXDIR image transfer itself (m_tr) keeps its progress, so the re-wrapped data continues it.
+		if (s_self_contained_packets && (path_and_flags & TRANSFER_END_OF_PACKET))
+		{
+			GIFPath& gp = g_gs_renderer->m_path[index];
+			if (gp.nloop != 0)
+				gp.nloop = 0;
 		}
 	}
 
@@ -380,6 +407,16 @@ namespace
 					std::memcpy(&p, payload, sizeof(p));
 					ReadbackRequest* req = reinterpret_cast<ReadbackRequest*>(p);
 					DoReadback(req);
+					req->sync.Signal();
+				}
+				break;
+
+				case Cmd::Call:
+				{
+					u64 p;
+					std::memcpy(&p, payload, sizeof(p));
+					CallRequest* req = reinterpret_cast<CallRequest*>(p);
+					req->fn();
 					req->sync.Signal();
 				}
 				break;
@@ -513,7 +550,7 @@ void kzgsGifTransfer(int path, const uint8_t* data, uint32_t qwords)
 	while (qwords > 0)
 	{
 		const u32 n = std::min(qwords, chunk_qw);
-		Push(Cmd::Transfer, p, n, data, n * 16);
+		Push(Cmd::Transfer, p | ((n == qwords) ? TRANSFER_END_OF_PACKET : 0u), n, data, n * 16);
 		data += static_cast<size_t>(n) * 16;
 		qwords -= n;
 	}
@@ -590,6 +627,16 @@ bool kzgsReadback(std::vector<uint8_t>& rgba, int& width, int& height)
 	PushPtr(Cmd::Readback, &req);
 	req.sync.Wait();
 	return req.ok;
+}
+
+void kzgs::RunOnGSThread(std::function<void()> fn)
+{
+	if (!s_open.load(std::memory_order_relaxed))
+		return;
+	CallRequest req;
+	req.fn = std::move(fn);
+	PushPtr(Cmd::Call, &req);
+	req.sync.Wait();
 }
 
 void kzgsSetLogCallback(KzgsLogFn fn)

@@ -30,6 +30,7 @@ enum class KzgsRenderer : int
 	D3D11 = 0,
 	D3D12 = 1,
 	Vulkan = 2,
+	Software = 3, // PCSX2's software rasterizer (reference/debugging; presents through D3D11)
 };
 
 enum class KzgsAspect : int
@@ -74,6 +75,12 @@ struct KzgsConfig
 	bool disableShaderCache = false;
 
 	int maxQueuedFrames = 2;                           // kzgsVsync blocks when this many frames are still queued
+
+	// true: every kzgsGifTransfer() call is a self-contained GIF packet sequence that starts with a GIFtag, as
+	// PS2Recomp's GIF arbiter produces (it re-wraps IMAGE data continued across VIF DIRECT/DMA chunks in a synthesized
+	// IMAGE tag). A tag still open at the end of a call is dropped. false: a raw, hardware-exact GIF byte stream per
+	// path, where a packet may continue in the next call (PCSX2 MTGS semantics).
+	bool selfContainedGifPackets = true;
 	bool debugDevice = false;                          // D3D/Vulkan validation layer
 };
 
