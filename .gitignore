@@ -2,7 +2,10 @@ game/
 generated/
 work/
 ghidra/
-tools/
+tools/dl/
+tools/ghidra_12.1.3_PUBLIC/
+tools/jdk-21.0.12.1+1/
+tools/pcsx2/
 ext/pcsx2/
 build/
 out/
