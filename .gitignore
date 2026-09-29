@@ -1,0 +1,8 @@
+game/
+generated/
+work/
+ghidra/
+tools/
+ext/pcsx2/
+build/
+out/
