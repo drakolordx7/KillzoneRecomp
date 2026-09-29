@@ -136,3 +136,15 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
   guest call) with a few cycles, paying the fixed per-run cost (SPU2 advance, service checks, thread selection) each
   time; the IOP was ~50% of the game thread in-game. It now runs in quanta of `PS2X_IOP_BATCH` EE cycles (default
   4096, ~14 us). Killzone in-game: ~14 -> ~18 frames/s; menu and in-game audio unchanged (WAV capture).
+
+- `0012-iop-scheduler-idle-fastpath-exclusive-host-gs.patch` (performance; in-game Killzone ~13 -> ~22 frames/s):
+  - IOP kernel keeps a flat thread list (map walks in `beginNextReady`/`nextWakeCycle` dominated IOP time) and
+    merges the wake/select passes; dead-thread cleanup is skipped when nothing died.
+  - IOP idle fast path: when an idle pass finds nothing can happen before cycle X, later `runCycles` calls that stay
+    before X only advance the clock; any external entry (RPC, SIF transfer, memory writes, module ops, reset)
+    invalidates it. `PS2X_IOP_IDLE_FASTPATH=0` disables.
+  - EE `accountCycles` samples the host clock every 64th call instead of on every checkpoint.
+  - `PS2HostGs::exclusive`: with a host GS attached, the built-in software GS no longer processes GIF packets
+    (except packets that write SIGNAL/FINISH/LABEL, whose CSR bits games poll).
+  - `PS2X_IOP_BATCH` (patch 0011) now defaults to 1 (off): larger batches correlated with boot hangs; the
+    re-entrancy of the batch counter was also fixed.
