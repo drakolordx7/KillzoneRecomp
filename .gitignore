@@ -12,3 +12,4 @@ out/
 ext/sdl3/
 ext/kzvu/build/
 ext/kzvu/build-*/
+__pycache__/
