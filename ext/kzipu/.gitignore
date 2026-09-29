@@ -1,0 +1,5 @@
+# Build trees
+build/
+build-*/
+# Test outputs (PNGs written by kzipu_test)
+test/out/
