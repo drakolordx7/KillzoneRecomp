@@ -1,6 +1,17 @@
 cmake_minimum_required(VERSION 3.21)
 project(KillzoneRecomp CXX C)
 
+# Shipping build is RelWithDebInfo (symbols for crash reports). CMake's default for it is /O2 /Ob1 (no automatic
+# inlining) with security cookies and incremental linking, which cost the hot generated code measurably (out-of-line
+# memory helpers, __security_check_cookie in profiles). Keep strict float semantics (no /fp:fast: PS2 float
+# emulation depends on it). KZ_FAST_FLAGS=OFF restores CMake's defaults.
+option(KZ_FAST_FLAGS "Release-grade optimisation flags for RelWithDebInfo" ON)
+if(MSVC AND KZ_FAST_FLAGS)
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "/Zi /O2 /Ob3 /Oi /Gy /Gw /GS- /Qspectre- /arch:AVX2 /DNDEBUG")
+    set(CMAKE_C_FLAGS_RELWITHDEBINFO "/Zi /O2 /Ob3 /Oi /Gy /Gw /GS- /Qspectre- /arch:AVX2 /DNDEBUG")
+    set(CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO "/DEBUG /INCREMENTAL:NO /OPT:REF /OPT:ICF")
+endif()
+
 # PS2Recomp runtime + IOP only (recompiler/analyzer are built separately by tools/scripts/build_ps2recomp.bat)
 set(PS2X_BUILD_RECOMP OFF CACHE BOOL "" FORCE)
 set(PS2X_BUILD_ANALYZER OFF CACHE BOOL "" FORCE)

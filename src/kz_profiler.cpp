@@ -188,7 +188,7 @@ void kzStartProfiler(double startSeconds, double durationSeconds, const char *pa
                     std::fprintf(out, "  %5.1f%%  %s\n", 100.0 * static_cast<double>(v[i].first) / static_cast<double>(st.busy),
                                  v[i].second.c_str());
             };
-            dump("self", st.self, 40);
+            dump("self", st.self, 2000);
             {
                 std::vector<std::pair<uint64_t, std::string>> tops;
                 for (auto &[k, c] : st.self)
