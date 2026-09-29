@@ -1,0 +1,598 @@
+// kzgs - public API and the GS thread.
+// SPDX-License-Identifier: GPL-3.0+
+
+#include "kzgs.h"
+#include "kzgs_internal.h"
+
+#include "GS/GS.h"
+#include "GS/GSRegs.h"
+#include "GS/Renderers/Common/GSDevice.h"
+#include "GS/Renderers/Common/GSRenderer.h"
+#include "Config.h"
+
+#include "common/Console.h"
+#include "common/FileSystem.h"
+#include "common/Path.h"
+#include "common/RedtapeWindows.h"
+#include "common/StringUtil.h"
+
+#include <atomic>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <thread>
+
+namespace
+{
+	// ---------------------------------------------------------------------------------------------------------------
+	// Ring buffer: single consumer (GS thread), producers serialized by s_produce_lock.
+	// Positions are monotonically increasing byte counters; the slot is pos % RING_SIZE.
+	// ---------------------------------------------------------------------------------------------------------------
+	enum class Cmd : u32
+	{
+		Wrap,
+		Transfer,
+		Vsync,
+		WriteCSR,
+		SoftReset,
+		Reset,
+		Resize,
+		UpdateConfig,
+		Sync,
+		Readback,
+		Quit,
+	};
+
+	struct alignas(16) CmdHeader
+	{
+		Cmd cmd;
+		u32 size; // payload bytes following the header, multiple of 16
+		u32 a;
+		u32 b;
+	};
+	static_assert(sizeof(CmdHeader) == 16);
+
+	struct VsyncPayload
+	{
+		u8 regset1[0xF0];
+		u32 csr;
+		u32 imr;
+		u64 siglblid;
+	};
+	static_assert(sizeof(VsyncPayload) == 0x100);
+
+	struct SyncPoint
+	{
+		std::atomic<u32> done{0};
+		void Signal()
+		{
+			done.store(1, std::memory_order_release);
+			done.notify_all();
+		}
+		void Wait()
+		{
+			while (done.load(std::memory_order_acquire) == 0)
+				done.wait(0, std::memory_order_acquire);
+		}
+	};
+
+	struct ReadbackRequest
+	{
+		SyncPoint sync;
+		std::vector<uint8_t>* rgba;
+		int* width;
+		int* height;
+		bool ok = false;
+	};
+
+	static constexpr size_t RING_SIZE = 32u * 1024u * 1024u;
+	static constexpr u32 MAX_TRANSFER_CHUNK = 1024u * 1024u; // bytes per Transfer command
+
+	alignas(64) static u8* s_ring = nullptr;
+	alignas(64) static std::atomic<u64> s_write_pos{0};
+	alignas(64) static std::atomic<u64> s_read_pos{0};
+	alignas(64) static std::atomic<s32> s_queued_frames{0};
+	static std::mutex s_produce_lock;
+	static u64 s_local_write = 0; // producer-side copy, guarded by s_produce_lock
+
+	static std::thread s_gs_thread;
+	static std::atomic<bool> s_open{false};
+	static std::atomic<bool> s_thread_failed{false};
+	static uint8_t* s_caller_regs = nullptr;
+	alignas(16) static u8 s_gs_regs[0x2000]; // the GS thread's copy of the privileged registers
+	static int s_max_queued_frames = 2;
+	static KzgsLogFn s_log_fn = nullptr;
+
+	static constexpr u32 Align16(u32 v) { return (v + 15u) & ~15u; }
+
+	// Reserves header+payload space, waiting for the consumer if needed. Returns a pointer to the header slot.
+	// Must hold s_produce_lock.
+	static u8* Reserve(u32 payload_bytes)
+	{
+		const u64 need = sizeof(CmdHeader) + Align16(payload_bytes);
+		for (;;)
+		{
+			const u64 pos = s_local_write % RING_SIZE;
+			const u64 to_end = RING_SIZE - pos;
+			const u64 required = (need <= to_end) ? need : (to_end + need);
+			u64 r = s_read_pos.load(std::memory_order_acquire);
+			while ((RING_SIZE - (s_local_write - r)) < required)
+			{
+				s_read_pos.wait(r, std::memory_order_acquire);
+				r = s_read_pos.load(std::memory_order_acquire);
+			}
+
+			if (need > to_end)
+			{
+				// Not enough contiguous space: emit a wrap marker and restart at 0.
+				CmdHeader* wrap = reinterpret_cast<CmdHeader*>(s_ring + pos);
+				wrap->cmd = Cmd::Wrap;
+				wrap->size = static_cast<u32>(to_end - sizeof(CmdHeader));
+				wrap->a = wrap->b = 0;
+				s_local_write += to_end;
+				continue;
+			}
+			return s_ring + pos;
+		}
+	}
+
+	static void Publish(u8* slot, Cmd cmd, u32 payload_bytes, u32 a, u32 b)
+	{
+		CmdHeader* hdr = reinterpret_cast<CmdHeader*>(slot);
+		hdr->cmd = cmd;
+		hdr->size = Align16(payload_bytes);
+		hdr->a = a;
+		hdr->b = b;
+		s_local_write += sizeof(CmdHeader) + hdr->size;
+		s_write_pos.store(s_local_write, std::memory_order_release);
+		s_write_pos.notify_one();
+	}
+
+	static void Push(Cmd cmd, u32 a = 0, u32 b = 0, const void* payload = nullptr, u32 payload_bytes = 0)
+	{
+		std::lock_guard lock(s_produce_lock);
+		u8* slot = Reserve(payload_bytes);
+		if (payload_bytes)
+			std::memcpy(slot + sizeof(CmdHeader), payload, payload_bytes);
+		Publish(slot, cmd, payload_bytes, a, b);
+	}
+
+	template <typename T>
+	static void PushPtr(Cmd cmd, T* ptr)
+	{
+		const u64 p = reinterpret_cast<u64>(ptr);
+		Push(cmd, 0, 0, &p, sizeof(p));
+	}
+
+	// ---------------------------------------------------------------------------------------------------------------
+	// Config translation
+	// ---------------------------------------------------------------------------------------------------------------
+	static std::string ExeDir()
+	{
+		wchar_t buf[MAX_PATH * 2];
+		const DWORD len = GetModuleFileNameW(nullptr, buf, static_cast<DWORD>(std::size(buf)));
+		std::string path = StringUtil::WideStringToUTF8String(std::wstring_view(buf, len));
+		return std::string(Path::GetDirectory(path));
+	}
+
+	static GSRendererType ToRendererType(KzgsRenderer r)
+	{
+		switch (r)
+		{
+			case KzgsRenderer::D3D12: return GSRendererType::DX12;
+			case KzgsRenderer::Vulkan: return GSRendererType::VK;
+			case KzgsRenderer::D3D11:
+			default: return GSRendererType::DX11;
+		}
+	}
+
+	static AspectRatioType ToAspect(KzgsAspect a)
+	{
+		switch (a)
+		{
+			case KzgsAspect::Ratio16_9: return AspectRatioType::R16_9;
+			case KzgsAspect::Stretch: return AspectRatioType::Stretch;
+			case KzgsAspect::Ratio4_3:
+			default: return AspectRatioType::R4_3;
+		}
+	}
+
+	static Pcsx2Config::GSOptions MakeOptions(const KzgsConfig& cfg)
+	{
+		Pcsx2Config::GSOptions o;
+		o.Renderer = ToRendererType(cfg.renderer);
+		o.UpscaleMultiplier = static_cast<float>(std::clamp(cfg.upscale, 1, 8));
+		o.TextureFiltering = static_cast<BiFiltering>(std::clamp(static_cast<int>(cfg.textureFiltering), 0, 3));
+		o.MaxAnisotropy = static_cast<u8>(std::clamp(cfg.anisotropy, 0, 16));
+		o.FXAA = cfg.fxaa;
+		o.HWAA1 = cfg.edgeAA;
+		o.AspectRatio = ToAspect(cfg.aspect);
+		o.VsyncEnable = cfg.vsync;
+		o.LinearPresent = cfg.bilinearPresent ? GSPostBilinearMode::BilinearSmooth : GSPostBilinearMode::Off;
+		o.UserHacks_HalfPixelOffset = static_cast<GSHalfPixelOffset>(
+			std::clamp(cfg.halfPixelOffset, 0, static_cast<int>(GSHalfPixelOffset::MaxCount) - 1));
+		o.UserHacks_NativeScaling = static_cast<GSNativeScaling>(
+			std::clamp(cfg.nativeScaling, 0, static_cast<int>(GSNativeScaling::MaxCount) - 1));
+		o.Adapter = cfg.useWarp ? std::string("Microsoft Basic Render Driver") : cfg.adapter;
+		o.DisableShaderCache = cfg.disableShaderCache;
+		o.UseDebugDevice = cfg.debugDevice;
+
+		// No OSD: kzgs does not render PCSX2's overlays.
+		o.OsdMessagesPos = OsdOverlayPos::None;
+		o.OsdPerformancePos = OsdOverlayPos::None;
+		return o;
+	}
+
+	static void ApplyGlobals(const KzgsConfig& cfg, const Pcsx2Config::GSOptions& opts)
+	{
+		EmuConfig.GS = opts;
+		EmuConfig.CurrentAspectRatio = opts.AspectRatio;
+		s_max_queued_frames = std::max(1, cfg.maxQueuedFrames);
+	}
+
+	static void SetupFolders(const KzgsConfig& cfg)
+	{
+		const std::string exe_dir = ExeDir();
+		EmuFolders::AppRoot = exe_dir;
+		EmuFolders::DataRoot = exe_dir;
+		EmuFolders::Resources = cfg.resourcesDir.empty() ? Path::Combine(exe_dir, "resources") : cfg.resourcesDir;
+		EmuFolders::UserResources = EmuFolders::Resources;
+		EmuFolders::Cache = cfg.cacheDir.empty() ? Path::Combine(exe_dir, "cache") : cfg.cacheDir;
+		EmuFolders::Logs = EmuFolders::Cache;
+		EmuFolders::Snapshots = Path::Combine(exe_dir, "snaps");
+		EmuFolders::Videos = Path::Combine(exe_dir, "videos");
+		EmuFolders::Textures = Path::Combine(exe_dir, "textures");
+		if (!cfg.disableShaderCache)
+			FileSystem::CreateDirectoryPath(EmuFolders::Cache.c_str(), false);
+	}
+
+	static void LogCallback(LOGLEVEL level, ConsoleColors color, std::string_view message)
+	{
+		const int lvl = (level <= LOGLEVEL_ERROR) ? 0 : (level == LOGLEVEL_WARNING) ? 1 : 2;
+		std::string msg(message);
+		if (s_log_fn)
+		{
+			s_log_fn(lvl, msg.c_str());
+		}
+		else
+		{
+			msg += '\n';
+			OutputDebugStringA(msg.c_str());
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------------------------
+	// GS thread
+	// ---------------------------------------------------------------------------------------------------------------
+	static void ApplyVsyncRegs(const VsyncPayload& p)
+	{
+		std::memcpy(s_gs_regs, p.regset1, sizeof(p.regset1));
+		std::memcpy(s_gs_regs + 0x1000, &p.csr, sizeof(p.csr));
+		std::memcpy(s_gs_regs + 0x1010, &p.imr, sizeof(p.imr));
+		std::memcpy(s_gs_regs + 0x1080, &p.siglblid, sizeof(p.siglblid));
+	}
+
+	static void DoTransfer(u32 path, const u8* data, u32 qwords)
+	{
+		switch (path)
+		{
+			case 1: g_gs_renderer->Transfer<0>(data, qwords); break;
+			case 2: g_gs_renderer->Transfer<1>(data, qwords); break;
+			default: g_gs_renderer->Transfer<2>(data, qwords); break;
+		}
+	}
+
+	static void DoReadback(ReadbackRequest* req)
+	{
+		u32 w = 0, h = 0;
+		std::vector<u32> pixels;
+		req->ok = GSSaveSnapshotToMemory(0, 0, false, false, &w, &h, &pixels) && w > 0 && h > 0;
+		if (req->ok)
+		{
+			req->rgba->resize(static_cast<size_t>(w) * h * 4);
+			std::memcpy(req->rgba->data(), pixels.data(), req->rgba->size());
+			*req->width = static_cast<int>(w);
+			*req->height = static_cast<int>(h);
+		}
+		else
+		{
+			req->rgba->clear();
+			*req->width = *req->height = 0;
+		}
+	}
+
+	static void GSThreadLoop()
+	{
+		u64 r = s_read_pos.load(std::memory_order_relaxed);
+		for (;;)
+		{
+			u64 w = s_write_pos.load(std::memory_order_acquire);
+			while (w == r)
+			{
+				s_write_pos.wait(w, std::memory_order_acquire);
+				w = s_write_pos.load(std::memory_order_acquire);
+			}
+
+			const CmdHeader hdr = *reinterpret_cast<const CmdHeader*>(s_ring + (r % RING_SIZE));
+			const u8* payload = s_ring + (r % RING_SIZE) + sizeof(CmdHeader);
+			bool quit = false;
+
+			switch (hdr.cmd)
+			{
+				case Cmd::Wrap:
+					break;
+
+				case Cmd::Transfer:
+					DoTransfer(hdr.a, payload, hdr.b);
+					break;
+
+				case Cmd::Vsync:
+				{
+					ApplyVsyncRegs(*reinterpret_cast<const VsyncPayload*>(payload));
+					GSvsync(hdr.a, hdr.b != 0);
+					s_queued_frames.fetch_sub(1, std::memory_order_acq_rel);
+					s_queued_frames.notify_all();
+				}
+				break;
+
+				case Cmd::WriteCSR:
+					GSwriteCSR(hdr.a);
+					break;
+
+				case Cmd::SoftReset:
+					GSgifSoftReset(hdr.a);
+					break;
+
+				case Cmd::Reset:
+					GSreset(true);
+					break;
+
+				case Cmd::Resize:
+					if (GSHasDisplayWindow())
+						GSResizeDisplayWindow(hdr.a, hdr.b, g_gs_device->GetWindowScale());
+					break;
+
+				case Cmd::UpdateConfig:
+				{
+					u64 p;
+					std::memcpy(&p, payload, sizeof(p));
+					std::unique_ptr<KzgsConfig> cfg(reinterpret_cast<KzgsConfig*>(p));
+					const Pcsx2Config::GSOptions opts = MakeOptions(*cfg);
+					const bool vsync_changed = (opts.VsyncEnable != GSConfig.VsyncEnable);
+					ApplyGlobals(*cfg, opts);
+					GSUpdateConfig(opts);
+					if (vsync_changed)
+						GSSetVSyncMode(opts.VsyncEnable ? GSVSyncMode::FIFO : GSVSyncMode::Disabled, false);
+				}
+				break;
+
+				case Cmd::Sync:
+				{
+					u64 p;
+					std::memcpy(&p, payload, sizeof(p));
+					reinterpret_cast<SyncPoint*>(p)->Signal();
+				}
+				break;
+
+				case Cmd::Readback:
+				{
+					u64 p;
+					std::memcpy(&p, payload, sizeof(p));
+					ReadbackRequest* req = reinterpret_cast<ReadbackRequest*>(p);
+					DoReadback(req);
+					req->sync.Signal();
+				}
+				break;
+
+				case Cmd::Quit:
+					quit = true;
+					break;
+			}
+
+			r += sizeof(CmdHeader) + hdr.size;
+			s_read_pos.store(r, std::memory_order_release);
+			s_read_pos.notify_all();
+			if (quit)
+				break;
+		}
+	}
+
+	struct OpenResult
+	{
+		SyncPoint sync;
+		bool ok = false;
+		std::string error;
+	};
+
+	static void GSThreadMain(KzgsConfig cfg, OpenResult* result)
+	{
+		SetThreadDescription(GetCurrentThread(), L"kzgs GS thread");
+
+		SetupFolders(cfg);
+		const Pcsx2Config::GSOptions opts = MakeOptions(cfg);
+		ApplyGlobals(cfg, opts);
+
+		const std::string shader_probe = Path::Combine(EmuFolders::Resources, "shaders/dx11/tfx.fx");
+		if (!FileSystem::FileExists(shader_probe.c_str()))
+		{
+			result->error = "GS shaders not found (expected " + shader_probe +
+							"). Call kzgs_stage_resources() on the exe target or set KzgsConfig::resourcesDir.";
+			result->sync.Signal();
+			return;
+		}
+
+		kzgs::ClearLastError();
+		const bool ok = GSopen(opts, opts.Renderer, s_gs_regs, opts.VsyncEnable ? GSVSyncMode::FIFO : GSVSyncMode::Disabled, false);
+		if (!ok)
+		{
+			result->error = kzgs::GetLastError();
+			if (result->error.empty())
+				result->error = "GSopen failed";
+			result->sync.Signal();
+			return;
+		}
+
+		result->ok = true;
+		result->sync.Signal();
+		result = nullptr; // owned by the opener, which has returned
+
+		GSThreadLoop();
+
+		GSclose();
+	}
+} // namespace
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------------------------------------------------
+
+bool kzgsOpen(void* hwnd, const KzgsConfig& cfg, uint8_t* privRegs, std::string* err)
+{
+	if (s_open.load())
+	{
+		if (err)
+			*err = "kzgs is already open";
+		return false;
+	}
+	if (!privRegs)
+	{
+		if (err)
+			*err = "privRegs must point to a 0x2000-byte register block";
+		return false;
+	}
+
+	Log::SetHostOutputLevel(LOGLEVEL_INFO, LogCallback);
+
+	if (!s_ring)
+		s_ring = static_cast<u8*>(_aligned_malloc(RING_SIZE, 64));
+	s_write_pos.store(0);
+	s_read_pos.store(0);
+	s_local_write = 0;
+	s_queued_frames.store(0);
+
+	s_caller_regs = privRegs;
+	std::memcpy(s_gs_regs, privRegs, sizeof(s_gs_regs));
+	kzgs::SetRenderWindow(hwnd);
+
+	OpenResult result;
+	s_gs_thread = std::thread(GSThreadMain, cfg, &result);
+	result.sync.Wait();
+	if (!result.ok)
+	{
+		s_gs_thread.join();
+		if (err)
+			*err = result.error;
+		return false;
+	}
+
+	s_open.store(true);
+	return true;
+}
+
+void kzgsClose()
+{
+	if (!s_open.load())
+		return;
+	Push(Cmd::Quit);
+	s_gs_thread.join();
+	s_open.store(false);
+	s_caller_regs = nullptr;
+}
+
+bool kzgsIsOpen()
+{
+	return s_open.load();
+}
+
+void kzgsGifTransfer(int path, const uint8_t* data, uint32_t qwords)
+{
+	if (!s_open.load(std::memory_order_relaxed) || !data || qwords == 0)
+		return;
+	const u32 p = static_cast<u32>(std::clamp(path, 1, 3));
+	const u32 chunk_qw = MAX_TRANSFER_CHUNK / 16;
+	while (qwords > 0)
+	{
+		const u32 n = std::min(qwords, chunk_qw);
+		Push(Cmd::Transfer, p, n, data, n * 16);
+		data += static_cast<size_t>(n) * 16;
+		qwords -= n;
+	}
+}
+
+void kzgsVsync(int field, bool regsWritten)
+{
+	if (!s_open.load(std::memory_order_relaxed))
+		return;
+
+	VsyncPayload p;
+	std::memcpy(p.regset1, s_caller_regs, sizeof(p.regset1));
+	std::memcpy(&p.csr, s_caller_regs + 0x1000, sizeof(p.csr));
+	std::memcpy(&p.imr, s_caller_regs + 0x1010, sizeof(p.imr));
+	std::memcpy(&p.siglblid, s_caller_regs + 0x1080, sizeof(p.siglblid));
+
+	// Frame pacing: don't let the game run more than N frames ahead of the GPU.
+	s32 queued = s_queued_frames.fetch_add(1, std::memory_order_acq_rel) + 1;
+	Push(Cmd::Vsync, static_cast<u32>(field & 1), regsWritten ? 1u : 0u, &p, sizeof(p));
+	while (queued > s_max_queued_frames)
+	{
+		s_queued_frames.wait(queued, std::memory_order_acquire);
+		queued = s_queued_frames.load(std::memory_order_acquire);
+	}
+}
+
+void kzgsWriteCSR(uint32_t csr)
+{
+	if (s_open.load(std::memory_order_relaxed))
+		Push(Cmd::WriteCSR, csr);
+}
+
+void kzgsSoftReset(uint32_t mask)
+{
+	if (s_open.load(std::memory_order_relaxed))
+		Push(Cmd::SoftReset, mask);
+}
+
+void kzgsReset()
+{
+	if (s_open.load(std::memory_order_relaxed))
+		Push(Cmd::Reset);
+}
+
+void kzgsResize(int width, int height)
+{
+	if (s_open.load(std::memory_order_relaxed) && width > 0 && height > 0)
+		Push(Cmd::Resize, static_cast<u32>(width), static_cast<u32>(height));
+}
+
+void kzgsUpdateConfig(const KzgsConfig& cfg)
+{
+	if (s_open.load(std::memory_order_relaxed))
+		PushPtr(Cmd::UpdateConfig, new KzgsConfig(cfg));
+}
+
+void kzgsSync()
+{
+	if (!s_open.load(std::memory_order_relaxed))
+		return;
+	SyncPoint sp;
+	PushPtr(Cmd::Sync, &sp);
+	sp.Wait();
+}
+
+bool kzgsReadback(std::vector<uint8_t>& rgba, int& width, int& height)
+{
+	if (!s_open.load(std::memory_order_relaxed))
+		return false;
+	ReadbackRequest req;
+	req.rgba = &rgba;
+	req.width = &width;
+	req.height = &height;
+	PushPtr(Cmd::Readback, &req);
+	req.sync.Wait();
+	return req.ok;
+}
+
+void kzgsSetLogCallback(KzgsLogFn fn)
+{
+	s_log_fn = fn;
+}

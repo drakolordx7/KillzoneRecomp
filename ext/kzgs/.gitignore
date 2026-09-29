@@ -1,0 +1,7 @@
+# Dependency bundle (download per README) and build trees
+deps/
+build/
+build-*/
+# Test outputs
+test/*.png
+test/last_run.txt
