@@ -6,6 +6,7 @@ set(PS2X_BUILD_RECOMP OFF CACHE BOOL "" FORCE)
 set(PS2X_BUILD_ANALYZER OFF CACHE BOOL "" FORCE)
 set(PS2X_BUILD_TEST OFF CACHE BOOL "" FORCE)
 set(PS2X_BUILD_STUDIO OFF CACHE BOOL "" FORCE)
+set(PS2X_ENABLE_AGRESSIVE_LOGS OFF CACHE BOOL "" FORCE)  # per-call enter/exit trace: ~500MB per 30s
 add_subdirectory(ext/PS2Recomp)
 
 # Generated code lives outside the repo (derived from the game ELF). Point KZ_GENERATED_DIR at it.
@@ -39,3 +40,6 @@ target_precompile_headers(killzone PRIVATE
 if(MSVC)
     target_compile_options(killzone PRIVATE /bigobj /FS)
 endif()
+
+# Copy FFmpeg runtime DLLs next to killzone.exe (helper from ps2xRuntime).
+ps2x_stage_ffmpeg_runtime_dlls(killzone)
