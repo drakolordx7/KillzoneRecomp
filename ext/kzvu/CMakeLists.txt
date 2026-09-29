@@ -103,6 +103,7 @@ set(KZVU_VU_SRCS
 	${P2SRC}/VUops.cpp
 	${P2SRC}/VUflags.cpp
 	${P2SRC}/VU1microInterp.cpp
+	${P2SRC}/VU0microInterp.cpp
 )
 file(GLOB KZVU_SHIM_SRCS CONFIGURE_DEPENDS "${KZVU_ROOT}/shim/*.cpp")
 add_library(kzvu_vu OBJECT ${KZVU_VU_SRCS} ${KZVU_SHIM_SRCS})
@@ -144,6 +145,15 @@ if(KZVU_BUILD_TEST)
 	target_compile_definitions(kzvu_test PRIVATE ${KZVU_TEST_DEFS} NOMINMAX _CRT_SECURE_NO_WARNINGS)
 	target_compile_options(kzvu_test PRIVATE /utf-8 /W3 /wd4244 /wd4267 /wd4305)
 	target_include_directories(kzvu_test PRIVATE "${PS2X}/include" "${PS2X}/include/runtime" "${PS2X}/src/lib/vu")
+
+	# VU0 micro mode: synthetic programs + replay of captured game calls (test/vu0_captures, KZ_VU0_DUMP in the game).
+	list(TRANSFORM KZVU_TEST_SRCS REPLACE "kzvu_test\.cpp$" "kzvu0_test.cpp" OUTPUT_VARIABLE KZVU0_TEST_SRCS)
+	add_executable(kzvu0_test ${KZVU0_TEST_SRCS})
+	target_link_libraries(kzvu0_test PRIVATE kzvu)
+	target_compile_features(kzvu0_test PRIVATE cxx_std_20)
+	target_compile_definitions(kzvu0_test PRIVATE ${KZVU_TEST_DEFS} NOMINMAX _CRT_SECURE_NO_WARNINGS)
+	target_compile_options(kzvu0_test PRIVATE /utf-8 /W3 /wd4244 /wd4267 /wd4305)
+	target_include_directories(kzvu0_test PRIVATE "${PS2X}/include" "${PS2X}/include/runtime" "${PS2X}/src/lib/vu")
 
 	# Link check: kzvu + kzgs in one executable, in both library orders. Fails to link on any duplicate symbol.
 	if(EXISTS "${KZVU_KZGS_LIB}")

@@ -57,14 +57,14 @@ static u32 s_pending_irq = 0;
 
 void hwIntcIrq(int n)
 {
-	// VU1 raises INTC_VU1 (7) when it stops on a D or T bit; VPU_STAT bits 0x200/0x400 say which.
+	// VU0/VU1 raise INTC_VU0 (6) / INTC_VU1 (7) when they stop on a D or T bit; VPU_STAT says which bit.
 	s_pending_irq |= 1u << n;
 }
 
-u32 kzvu::TakeInterrupts()
+u32 kzvu::TakeInterrupts(u32 mask)
 {
-	const u32 r = s_pending_irq;
-	s_pending_irq = 0;
+	const u32 r = s_pending_irq & mask;
+	s_pending_irq &= ~mask;
 	return r;
 }
 
@@ -111,11 +111,13 @@ u8* kzvu::CodeCacheBase()
 
 u8* SysMemory::GetCodePtr(size_t offset)
 {
-	// Only microVU1 asks for code memory: [mVU1recOffset, mVU1recOffset + mVU1recSize].
-	pxAssertRel(offset >= HostMemoryMap::mVU1recOffset &&
+	// Only microVU0 and microVU1 ask for code memory: [mVU0recOffset, mVU1recOffset + mVU1recSize], which PCSX2 lays
+	// out back to back and kzvu allocates as one region.
+	static_assert(HostMemoryMap::mVU1recOffset == HostMemoryMap::mVU0recOffset + HostMemoryMap::mVU0recSize);
+	pxAssertRel(offset >= HostMemoryMap::mVU0recOffset &&
 					offset <= HostMemoryMap::mVU1recOffset + HostMemoryMap::mVU1recSize,
-		"kzvu only provides microVU1 code memory");
-	return s_code + (offset - HostMemoryMap::mVU1recOffset);
+		"kzvu only provides microVU0/microVU1 code memory");
+	return s_code + (offset - HostMemoryMap::mVU0recOffset);
 }
 
 // ---- GIF PATH1 (XGKICK) -------------------------------------------------------------------------------------------------

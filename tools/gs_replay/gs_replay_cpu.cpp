@@ -65,6 +65,12 @@ int main(int argc, char **argv)
                     char name[64];
                     std::snprintf(name, sizeof(name), "/cpu_%04llu.png", static_cast<unsigned long long>(frame));
                     ExportImage(img, (std::string(argv[2]) + name).c_str());
+                    std::snprintf(name, sizeof(name), "/vram_%04llu.bin", static_cast<unsigned long long>(frame));
+                    if (FILE *vf = std::fopen((std::string(argv[2]) + name).c_str(), "wb"))
+                    {
+                        std::fwrite(vram.data(), 1, vram.size(), vf);
+                        std::fclose(vf);
+                    }
                 }
             }
         }

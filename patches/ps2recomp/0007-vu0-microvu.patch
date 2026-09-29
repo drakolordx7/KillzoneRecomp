@@ -1,0 +1,161 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_host_vu0.h b/ps2xRuntime/include/runtime/ps2_host_vu0.h
+new file mode 100644
+index 0000000..955febf
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_host_vu0.h
+@@ -0,0 +1,24 @@
++#pragma once
++
++#include <cstdint>
++
++struct R5900Context;
++
++// Optional host VU0 micro mode (e.g. a recompiling VU). When set before PS2Memory::initialize(), VU0 code/data memory
++// is the host's (never freed by the runtime), and VCALLMS/VCALLMSR run the host VU0 instead of the built-in
++// interpreter. The hook is only used while the runtime's VU0 memory is the host's (installed before initialize()).
++//
++// callms runs the microprogram at startPcBytes to completion, synchronously. VU0's registers are the EE's COP2
++// registers in ctx (vu0_vf, vi, vu0_acc, vu0_q, vu0_i, vu0_r, vu0_status, vu0_mac_flags, vu0_clip_flags, vu0_fbrst);
++// the host reads them before the run and writes the results back (plus vu0_tpc/vu0_pc and the VU0 bits of
++// vu0_vpu_stat). codeGeneration increments whenever VU0 code memory was written (VIF0 MPG or EE stores); the host
++// uses it to invalidate recompiled programs. Called on the EE game thread.
++struct PS2HostVu0
++{
++    uint8_t *codeMem = nullptr; // 4 KB
++    uint8_t *dataMem = nullptr; // 4 KB
++    void (*callms)(R5900Context *ctx, uint32_t startPcBytes, uint64_t codeGeneration) = nullptr;
++};
++
++void ps2SetHostVu0(const PS2HostVu0 &hooks);
++const PS2HostVu0 &ps2HostVu0();
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index c7fb87b..68549f9 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1,4 +1,5 @@
+ #include "runtime/ps2_host_vu.h"
++#include "runtime/ps2_host_vu0.h"
+ #include "runtime/ps2_host_ipu.h"
+ #include <functional>
+ #include "runtime/ps2_memory.h"
+@@ -17,6 +18,8 @@ namespace
+ {
+     PS2HostVu1 g_hostVu1{};
+     bool g_vu1MemoryHostOwned = false;
++    PS2HostVu0 g_hostVu0{};
++    bool g_vu0MemoryHostOwned = false;
+     PS2HostIpu g_hostIpu{};
+     std::function<void(uint32_t)> g_completeDmac;
+ 
+@@ -52,6 +55,16 @@ const PS2HostVu1 &ps2HostVu1()
+     return g_hostVu1;
+ }
+ 
++void ps2SetHostVu0(const PS2HostVu0 &hooks)
++{
++    g_hostVu0 = hooks;
++}
++
++const PS2HostVu0 &ps2HostVu0()
++{
++    return g_hostVu0;
++}
++
+ namespace
+ {
+     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
+@@ -321,12 +334,14 @@ PS2Memory::~PS2Memory()
+     }
+     if (m_vu0Code)
+     {
+-        delete[] m_vu0Code;
++        if (!g_vu0MemoryHostOwned)
++            delete[] m_vu0Code;
+         m_vu0Code = nullptr;
+     }
+     if (m_vu0Data)
+     {
+-        delete[] m_vu0Data;
++        if (!g_vu0MemoryHostOwned)
++            delete[] m_vu0Data;
+         m_vu0Data = nullptr;
+     }
+ 
+@@ -345,8 +360,11 @@ bool PS2Memory::initialize(size_t ramSize)
+         delete[] m_scratchpad;
+         delete[] iop_ram;
+         delete[] m_gsVRAM;
+-        delete[] m_vu0Code;
+-        delete[] m_vu0Data;
++        if (!g_vu0MemoryHostOwned)
++        {
++            delete[] m_vu0Code;
++            delete[] m_vu0Data;
++        }
+         if (!g_vu1MemoryHostOwned)
+         {
+             delete[] m_vu1Code;
+@@ -419,8 +437,18 @@ bool PS2Memory::initialize(size_t ramSize)
+         m_gsVRAM = new uint8_t[PS2_GS_VRAM_SIZE];
+         std::memset(m_gsVRAM, 0, PS2_GS_VRAM_SIZE);
+ 
+-        m_vu0Code = new uint8_t[PS2_VU0_CODE_SIZE];
+-        m_vu0Data = new uint8_t[PS2_VU0_DATA_SIZE];
++        if (ps2HostVu0().codeMem && ps2HostVu0().dataMem)
++        {
++            g_vu0MemoryHostOwned = true;
++            m_vu0Code = ps2HostVu0().codeMem;
++            m_vu0Data = ps2HostVu0().dataMem;
++        }
++        else
++        {
++            g_vu0MemoryHostOwned = false;
++            m_vu0Code = new uint8_t[PS2_VU0_CODE_SIZE];
++            m_vu0Data = new uint8_t[PS2_VU0_DATA_SIZE];
++        }
+         std::memset(m_vu0Code, 0, PS2_VU0_CODE_SIZE);
+         std::memset(m_vu0Data, 0, PS2_VU0_DATA_SIZE);
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 19bd2d6..1fe408f 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -14,6 +14,7 @@
+ #include "ps2_iop_host.h"
+ #include "runtime/ps2_host_gs.h"
+ #include "runtime/ps2_host_vu.h"
++#include "runtime/ps2_host_vu0.h"
+ #include "ps2x/iop/iop_subsystem.h"
+ 
+ #include <iostream>
+@@ -1546,6 +1547,14 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
+         return;
+     }
+ 
++    // Host VU0 (runtime/ps2_host_vu0.h), when it owns the VU0 memory the runtime uses.
++    const PS2HostVu0 &hostVu0 = ps2HostVu0();
++    if (hostVu0.callms && hostVu0.codeMem == vu0Code && hostVu0.dataMem == vu0Data)
++    {
++        hostVu0.callms(ctx, startPC, m_memory.getVU0CodeGeneration());
++        return;
++    }
++
+     m_vu0.reset();
+     copyVu0ContextToState(ctx, m_vu0.state());
+     m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE,
+@@ -1557,8 +1566,13 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
+ 
+ void PS2Runtime::vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address)
+ {
+-    // VCALLMS and VCALLMSR both route here.
+-    executeVU0Microprogram(rdram, ctx, address);
++    // Generated code calls this for VCALLMSR (VCALLMS calls executeVU0Microprogram directly). The recompiler computes
++    // the start address from ctx->vi[27], but vi[] only has the 16 integer registers: that read lands inside vu0_r.
++    // CMSAR0 (COP2 control register 27, written by CTC2 $vi27) is ctx->vu0_cmsar0, in units of 8 bytes.
++    (void)address;
++    const uint32_t startPC = (ctx->vu0_cmsar0 & 0x1FFu) << 3;
++    ctx->vu0_pc = startPC;
++    executeVU0Microprogram(rdram, ctx, startPC);
+ }
+ 
+ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx)

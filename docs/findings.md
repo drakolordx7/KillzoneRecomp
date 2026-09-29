@@ -96,3 +96,20 @@ The ELF is stripped, so Sony library functions are identified by `ps2_analyzer`'
 - Virtual keyboard (profile name): FUN_001af620. obj+0x228 = selected 3x3 block (8 = centre), picked with the left
   stick while held; the face buttons type the block's 4 letters (triangle top, circle right, cross bottom, square left).
   Centre block: X enter, triangle cancel, square backspace, O space.
+
+## VU0 micro mode (2026-09-29)
+- VCALLMS targets in gameplay (first mission, microVU0 at clamp 3, calls per 10 s at ~9 frames/s): 0x870 ~0.84M,
+  0x778/0x7B0 ~0.42M each (all three in FUN_00505a78, a loop: `cfc2.i $v0,$vi1` after 0x870 reads a test result),
+  0x020/0x270/0x520/0xD18 ~75-90k, 0xC80 ~55k, 0x2C0/0x4F0/0x000/0x6C8 < 1k. About 2M VU0 calls per 10 s, ~270 ms of
+  host time. Captured programs take 4-92 VU cycles; none uses M bits or VU1 registers.
+- VU0 now runs on kzvu's microVU0 (src/kz_vu.cpp, runtime patch 0007). Old path (KZ_VU0=interp) vs microVU0 in the
+  same headless run: ~7.0 vs ~10.0 vif frames/s in gameplay.
+- NaN/Inf in guest memory: from level load on (~t=125 s headless), VU0 inputs loaded from memory contain 0x7FC00000
+  (the x86 default NaN; the PS2 has no NaN). VU0 never produced one from finite inputs (KZ_VU0_STATS=1 counts both), so
+  the source is on the EE side; the generated FPU macros are plain IEEE (`FPU_DIV_S` = a / b in
+  ps2_runtime_macros.h, no PS2 max-value clamping). First seen in the input of program 0xC80 called at 0x3AC464
+  (`lqc2 $vf1, 0($a1)`). Not traced further.
+- VCALLMSR (0x31A8D8, 0x31A994 in FUN_0031a068) was generated as `ctx->vi[27]`, past the 16-entry vi[] (reads vu0_r);
+  the runtime now uses vu0_cmsar0 (patch 0007). No capture came from these two sites, so the fix is untested in-game.
+- PS2Recomp's interpreter vs microVU0/PCSX2 interpreter on clean captured inputs: identical except program 0xD18,
+  where `FMAND vi1, vi3` sees a different MAC flag and the program branches the other way (ext/kzvu/README.md).

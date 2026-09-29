@@ -39,6 +39,12 @@ struct KzvuConfig
 
 	KzvuXgkickFn xgkick = nullptr;
 	void* xgkickUser = nullptr;
+
+	// VU0 micro mode (VCALLMS/VCALLMSR): true: microVU0 recompiler. false: PCSX2's VU0 interpreter.
+	// iBitHack and flagHack apply to VU0 as well.
+	bool vu0UseJit = true;
+	// VU0 clamp mode (same meaning as clampMode); -1 = use clampMode.
+	int vu0ClampMode = -1;
 };
 
 // Allocates the 64 MB code cache, resets all VU1 state and applies `cfg`. Calling it again re-applies the config.
@@ -116,3 +122,46 @@ void kzvuGetVF(int index, uint32_t out[4]); // x, y, z, w as raw IEEE bits
 void kzvuSetVF(int index, const uint32_t in[4]);
 void kzvuGetACC(uint32_t out[4]);
 void kzvuSetACC(const uint32_t in[4]);
+
+// ---- VU0 micro mode -----------------------------------------------------------------------------------------------------
+// VU0 runs the microprograms the EE starts with VCALLMS/VCALLMSR. Its register file is the EE's COP2 register file, so
+// the host copies its COP2 state in with kzvu0SetRegs() before kzvu0Execute() and back out with kzvu0GetRegs().
+// Same threading rule as VU1: call from the game thread only.
+//
+// Memory: 4 KB micro memory and 4 KB data memory, owned by kzvu (static, 64-byte aligned, same reason as VU1's). Loads
+// and stores from VU0 micro code to data addresses 0x4000-0x43FF (qword 0x400+) reach VU1's VF/VI registers, as on the
+// PS2 (microVU maps them onto kzvu's VU1 state).
+uint8_t* kzvu0CodeMem();
+uint8_t* kzvu0DataMem();
+constexpr uint32_t kKzvu0CodeSize = 0x1000;
+constexpr uint32_t kKzvu0DataSize = 0x1000;
+// Call after VU0 micro memory changed (VIF0 MPG or EE stores). Same semantics as kzvuMicroWritten().
+void kzvu0MicroWritten(uint32_t offset, uint32_t size);
+
+// VU0 registers as the EE's COP2 sees them (CFC2/CTC2 numbering in the comments). Raw IEEE bits for floats.
+struct Kzvu0Regs
+{
+	uint32_t vf[32][4]; // VF0 is ignored on write (always 0,0,0,1)
+	uint32_t vi[16];    // 16-bit values; VI0 is ignored on write
+	uint32_t acc[4];
+	uint32_t status;    // vi16
+	uint32_t mac;       // vi17
+	uint32_t clip;      // vi18
+	uint32_t r;         // vi20 (23-bit mantissa; the exponent bits are forced to 0x3F800000 by RINIT/RXOR)
+	uint32_t i;         // vi21
+	uint32_t q;         // vi22
+};
+void kzvu0SetRegs(const Kzvu0Regs& in);
+void kzvu0GetRegs(Kzvu0Regs& out);
+
+// VCALLMS: starts VU0 at `startPcBytes` (byte address, multiple of 8; 0xFFFFFFFF = continue at TPC) and runs it until
+// the E bit (plus its delay slot), a D/T-bit stop (if enabled in FBRST, see kzvuSetFBRST: DE0 bit 2 / TE0 bit 3), or at
+// least `maxCycles` VU cycles. M-bit pauses (where a real VU0 lets an interlocked COP2 transfer through) are run past:
+// the whole program runs synchronously, as if the EE issued its next interlocking COP2 instruction right away. If a
+// program is still running from before (budget ran out), it is first run to completion. Returns VU cycles used.
+uint32_t kzvu0Execute(uint32_t startPcBytes, uint32_t maxCycles);
+bool kzvu0Running();        // VBS0
+uint32_t kzvu0VpuStat();    // VU0 half of VPU_STAT: 0x1 VBS0 busy, 0x2 VDS0 D stop, 0x4 VTS0 T stop
+uint32_t kzvu0TPC();        // TPC in bytes
+uint64_t kzvu0Cycles();     // total VU0 cycles executed since kzvuInit
+uint64_t kzvu0Calls();      // kzvu0Execute calls since kzvuInit
