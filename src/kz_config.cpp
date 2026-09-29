@@ -1,4 +1,5 @@
 #include "kz_config.h"
+#include "kz_input.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -131,7 +132,13 @@ bool kzSaveConfig(const std::filesystem::path &path, const KzConfig &c)
       << "\nRawMouse=" << (c.rawMouse ? 1 : 0) << "\nStickDeadzone=" << c.stickDeadzone << "\n\n"
       << "[Audio]\nMasterVolume=" << c.masterVolume << "\n\n"
       << "[Paths]\nISO=" << c.isoPath << "\n\n"
-      << "[Launcher]\nShow=" << (c.showLauncher ? 1 : 0) << "\n";
+      << "[Launcher]\nShow=" << (c.showLauncher ? 1 : 0) << "\n\n";
+    // Key/mouse bindings: keep the user's section (read before the file is rewritten), or write the defaults.
+    o << "[Bindings]\n; Key=Target. Targets: pad buttons (Cross Circle Square Triangle L1 R1 L2 R2 L3 R3 Start Select\n"
+      << "; Up Down Left Right) or MoveForward MoveBack StrafeLeft StrafeRight LookUp LookDown LookLeft LookRight.\n"
+      << "; Mouse1 left, Mouse2 right, Mouse3 middle, Mouse4/Mouse5 side, WheelUp/WheelDown; keys by SDL key name.\n";
+    for (const auto &[key, target] : kzInputBindingPairs(path))
+        o << key << "=" << target << "\n";
     std::ofstream out(path, std::ios::trunc);
     if (!out)
         return false;
