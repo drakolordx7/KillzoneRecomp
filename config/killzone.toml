@@ -75,3 +75,14 @@ skip_count = 0
 uncategorized_count = 16888
 runtime_call_name_count = 656
 runtime_call_source = "embedded_ps2_call_list_snapshot"
+
+# Frame timer runs on every vblank instead of every other one (docs/findings.md#frame-timing-key-for-high-refresh).
+# With the port's virtual vblank rate R (= target fps) and seconds-per-vsync (0x55A6E4) = 1/R, the simulation steps by
+# real elapsed time at R frames per second.
+[patches]
+instructions = [
+  { address = "0x001BFEA0", value = "0x00000000" }, # FUN_001bfe88: add.s $f0,$f0,$f0 -> nop  (tick = 1 vsync period)
+  { address = "0x001BFEB4", value = "0x00052802" }, # FUN_001bfe88: srl $a1,$a1,1 -> srl $a1,$a1,0
+  { address = "0x001BFEB8", value = "0x00031802" }, # FUN_001bfe88: srl $v1,$v1,1 -> srl $v1,$v1,0
+  { address = "0x001BFF3C", value = "0x00021002" }, # FUN_001bff10: srl $v0,$v0,1 -> srl $v0,$v0,0
+]
