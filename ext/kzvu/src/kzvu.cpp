@@ -74,9 +74,26 @@ static void ResetRegs()
 	kzvu::GifReset();
 }
 
+// Switches MXCSR to the VU's control register for the duration of a run (PCSX2 runs the EE thread with the same
+// value, so microVU's dispatcher does not switch it itself) and back to the host's afterwards.
+class ScopedVuFPCR
+{
+public:
+	ScopedVuFPCR()
+		: m_host(FPControlRegister::GetCurrent())
+	{
+		kzvu::SetHostFPCR(m_host);
+		FPControlRegister::SetCurrent(EmuConfig.Cpu.VU1FPCR);
+	}
+	~ScopedVuFPCR() { FPControlRegister::SetCurrent(m_host); }
+
+private:
+	FPControlRegister m_host;
+};
+
 static u32 RunCycles(u32 budget)
 {
-	VU0.VI[REG_FBRST].UL = s_fbrst & 0xFF00;
+	VU0.VI[REG_FBRST].UL = s_fbrst & 0x0C00; // DE1/TE1 only; FB1/RS1 are write-triggered actions
 	cpuRegs.cycle = VU1.cycle;
 	const u64 start = VU1.cycle;
 	CpuVU1->Execute(budget);
@@ -197,7 +214,7 @@ uint32_t kzvuExecute(uint32_t startPcBytes, uint32_t maxCycles)
 {
 	if (!s_init)
 		return 0;
-	const FPControlRegisterBackup fpcr(EmuConfig.Cpu.VU1FPCR);
+	const ScopedVuFPCR fpcr;
 
 	// vu1ExecMicro(): a still-running program is finished first.
 	u32 used = 0;
@@ -224,7 +241,7 @@ uint32_t kzvuContinue(uint32_t maxCycles)
 {
 	if (!s_init || !(VU0.VI[REG_VPU_STAT].UL & 0x100))
 		return 0;
-	const FPControlRegisterBackup fpcr(EmuConfig.Cpu.VU1FPCR);
+	const ScopedVuFPCR fpcr;
 	return RunCycles(maxCycles);
 }
 

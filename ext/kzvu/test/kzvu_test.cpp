@@ -20,6 +20,8 @@
 #include <string>
 #include <vector>
 
+#include <xmmintrin.h>
+
 // =====================================================================================================================
 // VU assembler (hand encoding; field layouts cross-checked against PCSX2's VUops.cpp opcode tables)
 // =====================================================================================================================
@@ -148,9 +150,13 @@ struct State
 };
 
 static std::vector<GifPacket> g_packets;
+static unsigned g_hostMxcsr = 0;
+static unsigned g_badCallbackMxcsr = 0; // callbacks that ran with a MXCSR other than the host's
 static void OnXgkick(void* user, const uint8_t* packet, uint32_t bytes, uint32_t startQw)
 {
 	g_packets.push_back({std::vector<uint8_t>(packet, packet + bytes), startQw});
+	if (_mm_getcsr() != g_hostMxcsr)
+		g_badCallbackMxcsr++;
 }
 static uint64_t g_benchPackets = 0;
 static void OnXgkickBench(void*, const uint8_t*, uint32_t, uint32_t)
@@ -169,12 +175,14 @@ static std::vector<uint32_t> Flatten(const std::vector<Pair>& code)
 	return w;
 }
 
+static bool g_iBitHack = true;
+
 static KzvuConfig MakeConfig(bool jit)
 {
 	KzvuConfig cfg;
 	cfg.useJit = jit;
-	cfg.clampMode = 0;   // Killzone GameIndex
-	cfg.iBitHack = true; // Killzone GameIndex
+	cfg.clampMode = 0;          // Killzone GameIndex
+	cfg.iBitHack = g_iBitHack;  // Killzone GameIndex: on
 	cfg.xgkick = OnXgkick;
 	return cfg;
 }
@@ -227,6 +235,7 @@ static GS& FakeGs() { return *reinterpret_cast<GS*>(g_fakeGs); }
 static State RunRecomp(VU1Interpreter& vu, const Program& p)
 {
 	vu.reset();
+	vu.state().q = 0.0f; // PS2Recomp resets Q to 1.0, kzvu (PCSX2) to 0.0; align so only program effects are compared
 	std::memset(g_rcode, 0, sizeof(g_rcode));
 	const std::vector<uint32_t> words = Flatten(p.code);
 	std::memcpy(g_rcode, words.data(), words.size() * 4);
@@ -469,27 +478,36 @@ static void CheckFmac(const Expect& e)
 }
 
 // 2) Integer ops, a counted loop with IBNE + delay slot, ISW/ILW.
+//
+// The loop decrements its counter in the instruction right before the branch (the usual compiler pattern). On the VU a
+// branch does not see an integer result written by the instruction immediately before it: it reads the previous value
+// (PCSX2 microVU, PCSX2's interpreter and PS2Recomp all model this). So `IADDI vi1,vi1,-1 ; IBNE vi1,vi0,loop` runs
+// count + 1 times and leaves vi1 = -1. The counter is initialised more than 4 instructions before the branch; see
+// ProgBranchEdge for what happens when it is not.
 static Program ProgIntLoop(uint32_t count)
 {
 	Program p;
-	p.name = "integer: IADDIU/IADD/IADDI/ISUB/IAND/IOR, IBNE loop with delay slot, ISW/ILW";
+	p.name = "integer: IADDIU/IADD/IADDI/ISUB/IAND/IOR/ISUBIU, IBNE loop with delay slot, ISW/ILW";
 	p.code = {
 		/* 0 */ {IADDIU(1, 0, count), NOPu},
 		/* 1 */ {IADDIU(2, 0, 0), NOPu},
-		/* 2 */ {IADD(2, 2, 1), NOPu},      // loop: vi2 += vi1
-		/* 3 */ {IADDI(1, 1, -1), NOPu},    // vi1--
-		/* 4 */ {IBNE(1, 0, -3), NOPu},     // -> 2 (target = 4*8 + 8 - 3*8 = 16)
-		/* 5 */ {IADDIU(3, 3, 1), NOPu},    // delay slot, runs every iteration
-		/* 6 */ {ISW(X, 2, 0, 0x30), NOPu}, // mem[0x30].x = vi2
-		/* 7 */ {ISW(W, 3, 0, 0x30), NOPu}, // mem[0x30].w = vi3
-		/* 8 */ {ILW(Y, 4, 0, 0x31), NOPu}, // vi4 = mem[0x31].y
-		/* 9 */ {ISUB(5, 2, 3), NOPu},
-		/*10 */ {IAND(6, 2, 3), NOPu},
-		/*11 */ {IOR(7, 2, 3), NOPu},
-		/*12 */ {ISUBIU(8, 2, 0x1234), NOPu},
-		/*13 */ {IADDI(9, 0, -16), NOPu},
-		/*14 */ {NOPl, NOPu | Ebit},
-		/*15 */ {NOPl, NOPu},
+		/* 2 */ {IADDIU(3, 0, 0), NOPu},
+		/* 3 */ {NOPl, NOPu},
+		/* 4 */ {NOPl, NOPu},
+		/* 5 */ {IADD(2, 2, 1), NOPu},      // loop: vi2 += vi1
+		/* 6 */ {IADDI(1, 1, -1), NOPu},    // vi1--
+		/* 7 */ {IBNE(1, 0, -3), NOPu},     // -> 5 (target = 7*8 + 8 - 3*8 = 40)
+		/* 8 */ {IADDIU(3, 3, 1), NOPu},    // delay slot, runs every iteration
+		/* 9 */ {ISW(X, 2, 0, 0x30), NOPu}, // mem[0x30].x = vi2
+		/*10 */ {ISW(W, 3, 0, 0x30), NOPu}, // mem[0x30].w = vi3
+		/*11 */ {ILW(Y, 4, 0, 0x31), NOPu}, // vi4 = mem[0x31].y
+		/*12 */ {ISUB(5, 2, 3), NOPu},
+		/*13 */ {IAND(6, 2, 3), NOPu},
+		/*14 */ {IOR(7, 2, 3), NOPu},
+		/*15 */ {ISUBIU(8, 2, 0x1234), NOPu},
+		/*16 */ {IADDI(9, 0, -16), NOPu},
+		/*17 */ {NOPl, NOPu | Ebit},
+		/*18 */ {NOPl, NOPu},
 	};
 	p.setQw(0x31, 0, 0xBEEF, 0, 0);
 	return p;
@@ -497,18 +515,40 @@ static Program ProgIntLoop(uint32_t count)
 
 static void CheckIntLoop(const Expect& e, uint32_t count)
 {
-	const uint32_t sum = count * (count + 1) / 2;
-	e.vi(1, 0);
+	const uint32_t sum = (count * (count + 1) / 2) & 0xffff;
+	const uint32_t iters = count + 1;
+	e.vi(1, 0xffff);
 	e.vi(2, sum);
-	e.vi(3, count);
+	e.vi(3, iters);
 	e.vi(4, 0xBEEF);
-	e.vi(5, sum - count);
-	e.vi(6, sum & count);
-	e.vi(7, sum | count);
+	e.vi(5, sum - iters);
+	e.vi(6, sum & iters);
+	e.vi(7, sum | iters);
 	e.vi(8, sum - 0x1234);
 	e.vi(9, static_cast<uint32_t>(-16));
-	e.memU(0x30, 0, sum & 0xffff);
-	e.memU(0x30, 3, count);
+	e.memU(0x30, 0, sum);
+	e.memU(0x30, 3, iters);
+}
+
+// 2b) Informational: the same loop with the counter initialised 2 instructions before the loop head, so the first
+// branch has two writes to vi1 within its 4-instruction window. PCSX2's two VU cores disagree here: microVU makes the
+// branch read vi1 as it was 4 instructions earlier (before the IADDIU, i.e. 0) and falls out of the loop after one
+// pass; PCSX2's interpreter and PS2Recomp read the value before the immediately preceding IADDI (10) and keep looping.
+static Program ProgBranchEdge()
+{
+	Program p;
+	p.name = "branch VI-delay edge case (informational)";
+	p.code = {
+		{IADDIU(1, 0, 10), NOPu},
+		{IADDIU(2, 0, 0), NOPu},
+		{IADD(2, 2, 1), NOPu},
+		{IADDI(1, 1, -1), NOPu},
+		{IBNE(1, 0, -3), NOPu},
+		{IADDIU(3, 3, 1), NOPu},
+		{NOPl, NOPu | Ebit},
+		{NOPl, NOPu},
+	};
+	return p;
 }
 
 // 3) LQI/SQI with VI post-increment in a loop.
@@ -526,10 +566,11 @@ static Program ProgLqiSqi()
 		/* 4 */ {NOPl, ADD(XYZW, 2, 1, 1)},        // vf2 = vf1 * 2
 		/* 5 */ {SQI(XYZW, 2, 2), NOPu},           // mem[vi2++] = vf2
 		/* 6 */ {IADDI(3, 3, -1), NOPu},
-		/* 7 */ {IBNE(3, 0, -5), NOPu},            // -> 3
-		/* 8 */ {NOPl, NOPu},
-		/* 9 */ {NOPl, NOPu | Ebit},
-		/*10 */ {NOPl, NOPu},
+		/* 7 */ {NOPl, NOPu},                      // spacer: the branch sees the decremented vi3
+		/* 8 */ {IBNE(3, 0, -6), NOPu},            // -> 3
+		/* 9 */ {NOPl, NOPu},
+		/*10 */ {NOPl, NOPu | Ebit},
+		/*11 */ {NOPl, NOPu},
 	};
 	return p;
 }
@@ -747,8 +788,11 @@ int main(int argc, char** argv)
 			benchRuns = std::atoi(argv[++i]);
 		else if (!std::strcmp(argv[i], "--no-bench"))
 			bench = false;
+		else if (!std::strcmp(argv[i], "--no-ibithack"))
+			g_iBitHack = false;
 	}
 
+	g_hostMxcsr = _mm_getcsr();
 	std::string err;
 	if (!kzvuInit(MakeConfig(true), &err))
 	{
@@ -836,35 +880,154 @@ int main(int argc, char** argv)
 		std::printf("    %s\n", g_failures == before ? "ok" : "FAILED");
 	}
 
+	// ---- T/D bits: with FBRST.TE1/DE1 set VU1 stops after the flagged pair, raises its interrupt and sets VPU_STAT
+	// VTS1/VDS1; MSCNT (kzvuExecute(0xFFFFFFFF)) resumes at TPC. PCSX2's microVU deliberately ignores the D bit
+	// (doDBitHandling = false in microVU_Misc.h: "shouldn't be enabled in released versions of games"), its interpreter
+	// honours it, so the D-bit run is informational.
+	for (const bool tbit : {true, false})
+	{
+		std::printf("[%s-bit stop + MSCNT resume%s]\n", tbit ? "t" : "d", tbit ? "" : " (informational)");
+		const int before = g_failures;
+		const std::vector<uint32_t> code = Flatten({
+			{IADDIU(1, 0, 1), NOPu},
+			{IADDIU(2, 0, 2), NOPu | (tbit ? Tbit : Dbit)},
+			{IADDIU(3, 0, 3), NOPu},
+			{IADDIU(4, 0, 4), NOPu | Ebit},
+			{NOPl, NOPu},
+		});
+		const uint32_t statBit = tbit ? 0x400 : 0x200;
+		uint32_t results[2][6] = {};
+		for (int jit = 1; jit >= 0; jit--)
+		{
+			kzvuSetConfig(MakeConfig(jit != 0));
+			kzvuReset();
+			kzvuWriteMicro(0, code.data(), static_cast<uint32_t>(code.size() * 4));
+			kzvuSetFBRST(tbit ? (1u << 11) : (1u << 10)); // TE1 / DE1
+			kzvuTakeInterrupt();
+			kzvuExecute(0, 1000);
+			uint32_t* r = results[jit];
+			r[0] = kzvuVpuStat();
+			r[1] = kzvuTakeInterrupt() ? 1 : 0;
+			r[2] = kzvuGetVI(2);
+			r[3] = kzvuGetVI(4);
+			kzvuSetFBRST(0);
+			if (!(r[0] & 0x100) && r[3] == 0)
+				kzvuExecute(0xFFFFFFFFu, 1000); // MSCNT: continue at TPC
+			r[4] = kzvuGetVI(4);
+			r[5] = kzvuVpuStat();
+			const char* impl = jit ? "jit" : "interp";
+			std::printf("    %-6s after stop: VPU_STAT=0x%04X irq=%u vi2=%u vi4=%u; after MSCNT: vi4=%u VPU_STAT=0x%04X\n", impl, r[0],
+				r[1], r[2], r[3], r[4], r[5]);
+			if (!tbit)
+				continue;
+			g_checks += 5;
+			if ((r[0] & (0x100 | statBit)) != statBit) Fail(std::string(impl) + ": expected VPU_STAT VTS1 set and VBS1 clear after the T bit");
+			if (!r[1]) Fail(std::string(impl) + ": no VU1 interrupt after the T bit");
+			if (r[2] != 2) Fail(std::string(impl) + ": the T-bit instruction pair did not complete");
+			if (r[3] != 0) Fail(std::string(impl) + ": execution went past the T bit");
+			if (r[4] != 4 || (r[5] & 0x100)) Fail(std::string(impl) + ": MSCNT did not run the rest of the program to its E bit");
+		}
+		if (tbit)
+		{
+			g_checks++;
+			if (std::memcmp(results[0], results[1], sizeof(results[0])) != 0)
+				Fail("jit and interp disagree on the T-bit sequence");
+		}
+		std::printf("    %s\n", g_failures == before ? "ok" : "FAILED");
+	}
+
+	// ---- informational: branch VI-delay edge case ---------------------------------------------------------------------
+	{
+		const Program p = ProgBranchEdge();
+		std::printf("[%s]\n", p.name.c_str());
+		auto show = [](const char* impl, const State& s) {
+			std::printf("    %-9s vi1=%u vi2=%u vi3=%u\n", impl, s.vi[1], s.vi[2], s.vi[3]);
+		};
+		show("jit", RunKzvu(p, true));
+		show("interp", RunKzvu(p, false));
+#ifdef KZVU_TEST_HAVE_PS2RECOMP
+		show("ps2recomp", RunRecomp(recomp, p));
+#endif
+	}
+
 	// ---- JIT invalidation ---------------------------------------------------------------------------------------------
 	{
 		std::printf("[invalidation: kzvuWriteMicro / kzvuMicroWritten]\n");
 		const int before = g_failures;
 		kzvuSetConfig(MakeConfig(true));
 		kzvuReset();
-		auto prog = [](uint32_t value) {
-			return Flatten({{IADDIU(1, 0, value), NOPu}, {NOPl, NOPu | Ebit}, {NOPl, NOPu}});
+		// A sets vf1.x = 1, B sets vf2.x = 1 (they differ in the upper instruction, which microVU always compares).
+		const std::vector<uint32_t> a = Flatten({{NOPl, ADDbc(X, 1, 0, 0, bcW)}, {NOPl, NOPu | Ebit}, {NOPl, NOPu}});
+		const std::vector<uint32_t> b = Flatten({{NOPl, ADDbc(X, 2, 0, 0, bcW)}, {NOPl, NOPu | Ebit}, {NOPl, NOPu}});
+		auto run = [] {
+			const uint32_t zero[4] = {};
+			kzvuSetVF(1, zero);
+			kzvuSetVF(2, zero);
+			kzvuExecute(0, 1000);
+			uint32_t v1[4], v2[4];
+			kzvuGetVF(1, v1);
+			kzvuGetVF(2, v2);
+			std::string r;
+			r += v1[0] == 0x3F800000u ? 'A' : '-';
+			r += v2[0] == 0x3F800000u ? 'B' : '-';
+			return r;
 		};
-		const std::vector<uint32_t> a = prog(111), b = prog(222);
-		auto run = [] { kzvuExecute(0, 1000); return kzvuGetVI(1); };
 		kzvuWriteMicro(0, a.data(), static_cast<uint32_t>(a.size() * 4));
+		std::string r = run();
 		g_checks++;
-		if (run() != 111) Fail("program A did not return 111");
+		if (r != "A-") Fail("program A ran as " + r);
 		kzvuWriteMicro(0, b.data(), static_cast<uint32_t>(b.size() * 4));
+		r = run();
 		g_checks++;
-		if (run() != 222) Fail("after kzvuWriteMicro(B) the JIT did not run B");
+		if (r != "-B") Fail("after kzvuWriteMicro(B) the JIT ran " + r);
 		std::memcpy(kzvuCodeMem(), a.data(), a.size() * 4);
 		kzvuMicroWritten(0, static_cast<uint32_t>(a.size() * 4));
+		r = run();
 		g_checks++;
-		if (run() != 111) Fail("after direct write of A + kzvuMicroWritten the JIT did not run A");
-		// Contract check: a direct write WITHOUT notification is not seen by the JIT (it keeps running cached code).
+		if (r != "A-") Fail("after a direct write of A + kzvuMicroWritten the JIT ran " + r);
+		// Contract: a direct write WITHOUT kzvuMicroWritten is not seen by the JIT (it keeps running the cached code).
 		std::memcpy(kzvuCodeMem(), b.data(), b.size() * 4);
-		const uint32_t stale = run();
-		std::printf("    direct write without kzvuMicroWritten -> JIT returned %u (%s)\n", stale,
-			stale == 111 ? "stale cached code, as documented" : "fresh");
-		kzvuMicroWritten(0, static_cast<uint32_t>(b.size() * 4));
+		r = run();
 		g_checks++;
-		if (run() != 222) Fail("after kzvuMicroWritten the JIT did not pick up B");
+		if (r != "A-") Fail("expected stale cached code after an unannounced write, JIT ran " + r);
+		std::printf("    unannounced direct write -> JIT ran %s (stale cached code, as documented)\n", r.c_str());
+		kzvuMicroWritten(0, static_cast<uint32_t>(b.size() * 4));
+		r = run();
+		g_checks++;
+		if (r != "-B") Fail("after kzvuMicroWritten the JIT ran " + r);
+		// IbitHack: immediates of IADDIU & co. are read from micro memory at run time, so a change to only such an
+		// immediate takes effect even without an invalidation (and costs no recompile).
+		const std::vector<uint32_t> c1 = Flatten({{IADDIU(1, 0, 111), NOPu}, {NOPl, NOPu | Ebit}, {NOPl, NOPu}});
+		const std::vector<uint32_t> c2 = Flatten({{IADDIU(1, 0, 222), NOPu}, {NOPl, NOPu | Ebit}, {NOPl, NOPu}});
+		kzvuWriteMicro(0, c1.data(), static_cast<uint32_t>(c1.size() * 4));
+		kzvuExecute(0, 1000);
+		const uint32_t v1 = kzvuGetVI(1);
+		std::memcpy(kzvuCodeMem(), c2.data(), c2.size() * 4); // no notification
+		kzvuExecute(0, 1000);
+		const uint32_t v2 = kzvuGetVI(1);
+		g_checks++;
+		if (v1 != 111 || v2 != (g_iBitHack ? 222u : 111u))
+			Fail("IADDIU immediate change: got " + std::to_string(v1) + " then " + std::to_string(v2));
+		std::printf("    unannounced IADDIU immediate change -> %u (iBitHack %s)\n", v2, g_iBitHack ? "on" : "off");
+		std::printf("    %s\n", g_failures == before ? "ok" : "FAILED");
+	}
+
+	// ---- host MXCSR: kzvu must leave the caller's MXCSR alone and give it to the XGKICK callback ----------------------
+	{
+		std::printf("[host state: MXCSR, shutdown/re-init]\n");
+		const int before = g_failures;
+		g_checks++;
+		if (_mm_getcsr() != g_hostMxcsr)
+			Fail("MXCSR changed across kzvu calls");
+		g_checks++;
+		if (g_badCallbackMxcsr)
+			Fail(std::to_string(g_badCallbackMxcsr) + " XGKICK callbacks ran with the VU's MXCSR instead of the host's");
+		kzvuShutdown();
+		g_checks++;
+		if (!kzvuInit(MakeConfig(true), &err))
+			Fail("re-init failed: " + err);
+		const State s = RunKzvu(ProgLqiSqi(), true);
+		CheckLqiSqi({"jit after re-init", s});
 		std::printf("    %s\n", g_failures == before ? "ok" : "FAILED");
 	}
 

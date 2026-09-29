@@ -7,3 +7,5 @@ ext/pcsx2/
 build/
 out/
 ext/sdl3/
+ext/kzvu/build/
+ext/kzvu/build-*/

@@ -124,6 +124,12 @@ static void* s_xgkick_user = nullptr;
 static std::vector<u8> s_gif_buf;   // bytes of the packet being collected
 static u32 s_gif_start_qw = 0;      // VU1 data address (qwords) the collected packet started at
 static u64 s_gif_packets = 0;
+static FPControlRegister s_host_fpcr = FPControlRegister::GetCurrent();
+
+void kzvu::SetHostFPCR(FPControlRegister fpcr)
+{
+	s_host_fpcr = fpcr;
+}
 
 void kzvu::SetXgkickCallback(XgkickFn fn, void* user)
 {
@@ -169,7 +175,13 @@ static void GifEmitComplete()
 		if (tag.tag.EOP)
 		{
 			if (s_xgkick_fn)
+			{
+				// VU code runs with the VU rounding mode (chop, DAZ/FTZ); the host's GIF/GS code gets its own MXCSR back.
+				const FPControlRegister vu_fpcr = FPControlRegister::GetCurrent();
+				FPControlRegister::SetCurrent(s_host_fpcr);
 				s_xgkick_fn(s_xgkick_user, &s_gif_buf[packet_start], static_cast<u32>(pos - packet_start), s_gif_start_qw);
+				FPControlRegister::SetCurrent(vu_fpcr);
+			}
 			s_gif_packets++;
 			packet_start = pos;
 		}

@@ -101,6 +101,7 @@ namespace kzvu
 	using XgkickFn = void (*)(void* user, const u8* packet, u32 bytes, u32 startQw);
 
 	void SetXgkickCallback(XgkickFn fn, void* user);
+	void SetHostFPCR(FPControlRegister fpcr); // MXCSR the XGKICK callback runs with (the host's, not the VU's)
 	void GifReset();                  // drop any partially collected packet
 	u64 GifPacketCount();             // packets delivered since start
 
