@@ -148,3 +148,40 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
     (except packets that write SIGNAL/FINISH/LABEL, whose CSR bits games poll).
   - `PS2X_IOP_BATCH` (patch 0011) now defaults to 1 (off): larger batches correlated with boot hangs; the
     re-entrancy of the batch counter was also fixed.
+
+- `0013-iop-rpc-semaphore-wait.patch`: fixes the intermittent boot/loading hang (game thread spinning at 0x14A028 in
+  FUN_00149f30, waiting for the FilePS2 read counters at +0x34/+0x38 to reach 0).
+  - **Cause.** RPC server functions run synchronously outside any IOP thread (`IopRpcBridge::handleRpc` ->
+    `callFunction`). `WaitSema` there returned at once without taking the semaphore when its count was 0.
+    PFILE_R.IRX's RPC (fn 0x320/0x330, read requests) appends to its streaming queue under semaphore `0x409c`
+    (FUN_00001c1c). The streaming thread (entry 0x22A4) removes finished requests under the same semaphore, and IOP
+    threads are preempted wherever their slice ends. At 0x26C4..0x26D8 (module offsets) the streaming thread has
+    loaded `next = cur->next` (0) but not yet run `if (next == 0) tail = 0`. An append in that window links the new
+    request behind the finished one, and the streaming thread then clears head and tail: the request is dropped, no
+    completion SIF command is ever sent, and the EE counter never reaches 0. The queue counters at `0x406C`/`0x4070`
+    are also updated with unlocked read-modify-writes on both sides.
+  - **Evidence** (`PS2X_IOP_SYNC_TRACE=1`, `PS2X_IOP_BATCH=4096`, fix disabled, 3 of 8 boots hung). In each hung boot,
+    the last contended `WaitSema(4)` from the RPC found the streaming thread preempted at 0x126C8, 0x126D0 and
+    0x126D0 (PFILE_R loads at 0x10000). The next once-per-second dump showed head 0x14094 = 0, tail 0x14098 = 0 and
+    queued count 0x1406C = 1 in two of them, with the streaming thread idle in its DelayThread poll. In the third
+    boot the count read 0; the unlocked counter update can lose that increment. In three of the five good
+    boots a contended wait also landed in that window without a hang. Whether the loss happens depends on the
+    loaded `next` being 0 and on a later append arriving while the orphan is still queued. The same
+    boots show ~12-20 contended outside-thread waits per boot on PSOUND_R.IRX's semaphore (ra 0x71260).
+  - **Fix.** `WaitSema` outside a thread on a semaphore with count 0 now runs the IOP scheduler (threads, due
+    interrupts, callbacks, timers) until the semaphore is signalled, then takes it. This is what the real IOP does
+    when the RPC server thread blocks. While such a wait is active, `SignalSema` keeps the count for the waiter and
+    ends the signalling thread's slice, because the RPC thread outranks it. The wait is not used from interrupt
+    handlers or guest callbacks, or while the scheduler is already running a thread. It gives up after 1 s of IOP
+    time and prints `[iop-sync] WaitSema(n) outside a thread ... TIMED OUT`. `PS2X_IOP_OUTSIDE_SEMA_WAIT=0` restores
+    the old behaviour.
+  - The body of `runCycles`' loop is now `scheduleStep()`, shared with the wait (same logic).
+  - **Tracing** (new private header `iop_trace.h`): `PS2X_IOP_SYNC_TRACE=1` logs contended outside-thread
+    semaphore waits (with all thread states and pcs) and, once per IOP second, the thread and semaphore states plus
+    the IOP words listed in `PS2X_IOP_WATCH` (comma-separated). `=2` also logs every RPC request (first 16 words)
+    and every IOP->EE SIF command (for FilePS2: the EE counter address and value).
+  - Measured (headless boots, 50 s, `KZ_FPS=60 KZ_IPU=off`; hung = dma constant from t=30 s to t=40 s):
+    `PS2X_IOP_BATCH=1`: 5 of 12 hung before (4 at 0x14A028, 1 at 0x14A1C0), 0 of 12 after.
+    `PS2X_IOP_BATCH=4096`: 3 of 8 before (plus 3 of 8 with the level-1 trace), 0 of 16 after.
+    With the fix and the trace, one 4096 boot resolved 14 contended PFILE_R waits in 1-31 IOP cycles and 22
+    PSOUND_R waits in 42-3840 cycles. No boot hit the 1 s timeout.
