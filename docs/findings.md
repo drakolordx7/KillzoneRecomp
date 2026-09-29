@@ -62,3 +62,10 @@ The ELF is stripped, so Sony library functions are identified by `ps2_analyzer`'
   (±8/+4 per vblank in `FUN_0018f0d0`) corrected to 60 Hz speed.
 - FMV/attract playback (`FUN_0026ecc8`) times itself with `FUN_001466f8` (ms timer), only uses vsync parity for fields.
 - Runtime: `ps2SetVblankPeriodMicros()` (runtime/ps2_host_gs.h) replaces the fixed 16667 us vblank period.
+
+## Widescreen (found 2026-09-29 with PCSX2 PINE)
+- Native 16:9 flag = word at `*(0x559178) + 0x34` (the global game object, which also holds the frame timer at +0x50..+0x70).
+  The community pnach address 0x5DA364 is that field in PCSX2's heap layout; the runtime's heap differs, and writing
+  0x5DA364 there corrupted rendering (grey, grainy menus). Game option label strings: "Aspect", "(4:3; 16:9)", "IsWideScreen".
+- Noise filter pnach: clear byte 0x55DF6C while halfword 0x57BA88 == 4 (in a level). Forcing 0xFF elsewhere was wrong.
+- Tool: tools/scripts/pine.py (PCSX2 PINE client; EnablePINE=true, PINESlot=28011 in tools/pcsx2/inis/PCSX2.ini).

@@ -13,6 +13,7 @@
 #include "kz_gs.h"
 #include "kz_timing.h"
 #include "kz_vu.h"
+#include "kz_ipu.h"
 
 #include <SDL3/SDL.h>
 
@@ -39,6 +40,7 @@ namespace
         int sampleSeconds = 0; // --sample N: dump all thread stacks to work/stacks.txt every N seconds
         bool selfTest = false;  // --selftest: run unit checks (config, input, disc, launcher render) and exit
         bool noLauncher = false; // --no-launcher: boot straight into the game
+        bool forceLauncher = false; // --launcher: show the launcher even if it is turned off in killzone.ini
     };
 
     Options parseArgs(int argc, char *argv[])
@@ -60,6 +62,8 @@ namespace
                 opts.selfTest = true;
             else if (arg == "--no-launcher")
                 opts.noLauncher = true;
+            else if (arg == "--launcher")
+                opts.forceLauncher = true;
             else
                 std::cerr << "[kz] ignoring unknown argument: " << arg << std::endl;
         }
@@ -162,7 +166,7 @@ int main(int argc, char *argv[])
         if (!opts.iso.empty())
             cfg.isoPath = std::filesystem::absolute(opts.iso).string();
         const bool headless = std::getenv("PS2X_HEADLESS") && std::getenv("PS2X_HEADLESS")[0] == '1';
-        if (!headless && !opts.noLauncher && (cfg.showLauncher || !kzCheckDisc(cfg.isoPath).ok))
+        if (!headless && !opts.noLauncher && (opts.forceLauncher || cfg.showLauncher || !kzCheckDisc(cfg.isoPath).ok))
         {
             if (!kzRunLauncher(cfg))
                 return 0;
@@ -248,8 +252,14 @@ int main(int argc, char *argv[])
             std::cerr << "[kz] VU1 recompiler init failed: " << vuError << std::endl;
             return 1;
         }
+        kzIpuInstall();
         PS2Runtime runtime;
         kzVuBindRuntime(runtime);
+        kzIpuBindRuntime(runtime);
+        static PS2Runtime *s_runtime = &runtime;
+        kzInputSetScriptClock([]() -> double {
+            return static_cast<double>(s_runtime->memory().gs().vsyncTick.load(std::memory_order_relaxed)) / kzTimingRate();
+        });
         if (!runtime.initialize("Killzone"))
         {
             std::cerr << "[kz] failed to initialize PS2 runtime" << std::endl;

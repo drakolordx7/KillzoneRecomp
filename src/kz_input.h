@@ -49,5 +49,8 @@ KzMouseDelta kzInputTakeMouseDelta();
 // When the engine aim patch is active, mouse motion goes there; otherwise it is mapped onto the right stick.
 void kzInputSetAimPatchActive(bool active);
 
+// Clock for KZ_INPUT_SCRIPT event times (seconds). Default: wall time.
+void kzInputSetScriptClock(double (*clock)());
+
 // Self-test of binding parsing and pad composition (no devices needed). Returns number of failures.
 int kzInputSelfTest();
