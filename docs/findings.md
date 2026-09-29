@@ -82,3 +82,17 @@ The ELF is stripped, so Sony library functions are identified by `ps2_analyzer`'
 - `FUN_0023e9c8` = pitch auto-centre while walking with no look input (gated by profile option FUN_001d6c68) - a pad assist.
 - Patch (src/kz_aim.cpp): hooks 0x23EE08 (remember player of local index 0), 0x21C550 (add mouse counts * 0.05 deg * sensitivity to
   f13/f14 for that player), 0x23E9C8 (skipped while keyboard/mouse is the active device). KZ_AIM=off disables, KZ_AIM_LOG=1 logs angles.
+
+## Controls (2026-09-29)
+- Action enum (reflection string at 0x5494B4): walk, strafe, pitch, turn, allowlook, sprint, primaryfire, secondaryfire,
+  action, selectweapon, grenadethrow, specialitem, reload, stancechange, zoommode, zoom (+2 pause/objectives entries).
+- Profile settings object (found at 0x102C880 in a gameplay RAM dump) holds the controller map at +0xEC (one int per
+  action, same order; getter FUN_001d6c58 returns settings+0xEC), YawSensitivity +0x138, PitchSensitivity +0x13C
+  (default 0.333). Button ids use the DS2 pressure order: 0 right, 1 left, 2 up, 3 down, 4 triangle, 5 circle,
+  6 cross, 7 square, 8 L1, 9 R1, 10 L2, 11 R2, 12/13 select/start, 14 L3, 15 R3; axes are 100+ (negative = inverted).
+- Default map: fire R1, secondary R2, action X, switch weapon O, grenade L1, special square, reload triangle,
+  crouch L2, sprint L3, zoom mode R3. No jump in Killzone 1. Buttons are read as analog values (FUN_001b33b8,
+  pressed if > 0.1 in FUN_001b3548), so the pad reply fills the DS2 pressure bytes too.
+- Virtual keyboard (profile name): FUN_001af620. obj+0x228 = selected 3x3 block (8 = centre), picked with the left
+  stick while held; the face buttons type the block's 4 letters (triangle top, circle right, cross bottom, square left).
+  Centre block: X enter, triangle cancel, square backspace, O space.
