@@ -15,6 +15,8 @@ patch_syscalls = false
 patch_cop0 = true
 patch_cache = true
 stubs = [
+  # --- manual bindings (docs/findings.md#library-bindings). New ones go in src/kz_overrides.cpp (no regen needed). ---
+  "sceSifLoadModule@0x002B6060",
   "SetGsCrt@0x002B0AA0",
   "AddIntcHandler@0x002B0B80",
   "AddIntcHandler@0x002B0B90",

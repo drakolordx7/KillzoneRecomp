@@ -1,0 +1,165 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..c44ae12 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -26,6 +26,8 @@
+ #include <thread>
+ #include <unordered_map>
+ #include <sstream>
++#include <cstdlib>
++#include <cstdio>
+ 
+ namespace ps2_stubs
+ {
+@@ -713,6 +715,38 @@ bool PS2Runtime::syncCoreSubsystems()
+     return true;
+ }
+ 
++namespace
++{
++    // Headless mode (no window/audio device) for automated runs, e.g. when the host session is locked.
++    // PS2X_HEADLESS=1 enables it; PS2X_HEADLESS_SHOTS=<dir> saves the presented frame as PNG every
++    // PS2X_HEADLESS_INTERVAL seconds (default 5); PS2X_HEADLESS_SECONDS=<n> stops the run after n seconds.
++    struct HeadlessConfig
++    {
++        bool enabled = false;
++        std::string shotDir;
++        int intervalSeconds = 5;
++        int maxSeconds = 0;
++    };
++
++    const HeadlessConfig &headlessConfig()
++    {
++        static const HeadlessConfig cfg = []()
++        {
++            HeadlessConfig c;
++            const char *on = std::getenv("PS2X_HEADLESS");
++            c.enabled = on && on[0] == '1';
++            if (const char *dir = std::getenv("PS2X_HEADLESS_SHOTS"))
++                c.shotDir = dir;
++            if (const char *iv = std::getenv("PS2X_HEADLESS_INTERVAL"))
++                c.intervalSeconds = std::max(1, std::atoi(iv));
++            if (const char *mx = std::getenv("PS2X_HEADLESS_SECONDS"))
++                c.maxSeconds = std::max(0, std::atoi(mx));
++            return c;
++        }();
++        return cfg;
++    }
++}
++
+ bool PS2Runtime::initialize(const char *title)
+ {
+     try
+@@ -731,12 +765,21 @@ bool PS2Runtime::initialize(const char *title)
+ #if defined(PLATFORM_VITA)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+ #else
+-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+-        InitAudioDevice();
+-        m_audioBackend.setAudioReady(IsAudioDeviceReady());
++        if (headlessConfig().enabled)
++        {
++            std::cerr << "[headless] no window/audio device" << std::endl;
++            m_audioBackend.setAudioReady(false);
++        }
++        else
++        {
++            SetConfigFlags(FLAG_WINDOW_RESIZABLE);
++            InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
++            InitAudioDevice();
++            m_audioBackend.setAudioReady(IsAudioDeviceReady());
++        }
+ #endif
+-        SetTargetFPS(60);
++        if (!headlessConfig().enabled)
++            SetTargetFPS(60);
+         if (m_debugUiInitCallback)
+         {
+             m_debugUiInitCallback(*this, m_debugUiUserData);
+@@ -2357,10 +2400,15 @@ void PS2Runtime::run()
+ 
+     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
+ 
++    const HeadlessConfig &headless = headlessConfig();
+     // A blank image to use as a framebuffer
+-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+-    Texture2D frameTex = LoadTextureFromImage(blank);
+-    UnloadImage(blank);
++    Texture2D frameTex{};
++    if (!headless.enabled)
++    {
++        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
++        frameTex = LoadTextureFromImage(blank);
++        UnloadImage(blank);
++    }
+ 
+     std::atomic<bool> gameThreadFinished{false};
+ 
+@@ -2385,8 +2433,51 @@ void PS2Runtime::run()
+         }
+         gameThreadFinished.store(true, std::memory_order_release); });
+ 
++    if (headless.enabled)
++    {
++        const auto start = std::chrono::steady_clock::now();
++        auto nextShot = start;
++        int shotIndex = 0;
++        std::vector<uint8_t> pixels;
++        while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
++        {
++            std::this_thread::sleep_for(std::chrono::milliseconds(16));
++            const auto now = std::chrono::steady_clock::now();
++            const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start).count();
++            if (headless.maxSeconds > 0 && elapsed >= headless.maxSeconds)
++            {
++                std::cerr << "[headless] time limit reached (" << headless.maxSeconds << "s)" << std::endl;
++                break;
++            }
++            if (now < nextShot)
++                continue;
++            nextShot = now + std::chrono::seconds(headless.intervalSeconds);
++            const auto ee = m_eeScheduler->snapshot();
++            std::cerr << "[headless] t=" << elapsed << "s pc=0x" << std::hex << m_debugPc.load(std::memory_order_relaxed)
++                      << " ra=0x" << m_debugRa.load(std::memory_order_relaxed) << std::dec
++                      << " threads=" << ee.threads.size() << " vsync=" << m_eeScheduler->currentVSyncTick()
++                      << " dma=" << m_memory.dmaStartCount() << " gif=" << m_memory.gifCopyCount()
++                      << " gsw=" << m_memory.gsWriteCount() << " vif=" << m_memory.vifWriteCount() << std::endl;
++            if (headless.shotDir.empty())
++                continue;
++            gs().latchHostPresentationFrame();
++            uint32_t w = 0u, h = 0u;
++            pixels.clear();
++            if (gs().copyLatchedHostPresentationFrame(pixels, w, h, nullptr, nullptr, nullptr) && w && h &&
++                pixels.size() >= static_cast<size_t>(w) * h * 4u)
++            {
++                for (size_t i = 3; i < pixels.size(); i += 4)
++                    pixels[i] = 0xFF; // PS2 alpha is not display alpha
++                Image img{pixels.data(), static_cast<int>(w), static_cast<int>(h), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++                char name[64];
++                std::snprintf(name, sizeof(name), "/frame_%03d_t%llds.png", shotIndex++, static_cast<long long>(elapsed));
++                ExportImage(img, (headless.shotDir + name).c_str());
++            }
++        }
++    }
++
+     uint64_t tick = 0;
+-    while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
++    while (!headless.enabled && !isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+     {
+         PS2_IF_AGRESSIVE_LOGS({
+             tick++;
+@@ -2465,8 +2556,11 @@ void PS2Runtime::run()
+         m_debugUiShutdownCallback(*this, m_debugUiUserData);
+         m_debugUiInitialized = false;
+     }
+-    UnloadTexture(frameTex);
+-    CloseWindow();
++    if (!headless.enabled)
++    {
++        UnloadTexture(frameTex);
++        CloseWindow();
++    }
+ 
+     RUNTIME_LOG("[run] exiting loop");
+ }
