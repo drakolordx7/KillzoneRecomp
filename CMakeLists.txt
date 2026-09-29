@@ -19,8 +19,9 @@ file(GLOB KZ_SRC CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.cpp")
 add_executable(killzone
     ${KZ_GENERATED_SRC}
     ${KZ_SRC}
-    ext/PS2Recomp/ps2xRuntime/src/main.cpp
 )
+# Our own code must not be merged into the generated-code unity batches.
+set_source_files_properties(${KZ_SRC} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
 target_include_directories(killzone PRIVATE "${KZ_GENERATED_DIR}" "${CMAKE_SOURCE_DIR}/src")
 target_link_libraries(killzone PRIVATE ps2_runtime)
 set_target_properties(killzone PROPERTIES
