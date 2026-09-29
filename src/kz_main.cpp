@@ -14,6 +14,8 @@
 #include "kz_timing.h"
 #include "kz_vu.h"
 #include "kz_ipu.h"
+#include "kz_aim.h"
+#include "runtime/ps2_host_arena.h"
 #include "kz_audio.h"
 
 #include <SDL3/SDL.h>
@@ -282,11 +284,15 @@ int main(int argc, char *argv[])
         }
         if (const char *dir = std::getenv("KZ_SHOT_DIR"))
             kzGsSetScreenshotSchedule(dir, std::getenv("KZ_SHOT_INTERVAL") ? std::atoi(std::getenv("KZ_SHOT_INTERVAL")) : 5);
+        // Killzone's allocator owns all RAM from the end of the ELF (0x5913F8) to the top (SetupHeap(end, -1)), and its
+        // main stack is 0x100000-0x140000. The runtime's own buffers and interrupt stacks go into the unused kernel area.
+        ps2SetRuntimeArena(0x00080000u, 0x000B0000u, 0x000B0000u, 0x00100000u);
         if (!runtime.loadELF(elf.string()))
         {
             std::cerr << "[kz] failed to load ELF: " << elf.string() << std::endl;
             return 1;
         }
+        kzAimInstall(runtime);
 
         // Guest vblank rate = target frame rate (kz_timing.h). Automation can force it with KZ_FPS.
         int displayHz = 60;
@@ -346,6 +352,14 @@ int main(int argc, char *argv[])
         }
         runtime.requestStop();
         runtimeThread.join();
+        if (const char *dump = std::getenv("KZ_DUMP_RAM")) // debugging: EE RAM image after the game thread stops
+        {
+            if (FILE *f = std::fopen(dump, "wb"))
+            {
+                std::fwrite(runtime.memory().getRDRAM(), 1, PS2_RAM_SIZE, f);
+                std::fclose(f);
+            }
+        }
         kzGsDetach();
         kzInputShutdown();
         if (window)
