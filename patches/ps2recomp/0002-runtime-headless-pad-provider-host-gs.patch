@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/include/runtime/ps2_host_gs.h b/ps2xRuntime/include/runtime/ps2_host_gs.h
 new file mode 100644
-index 0000000..0256fe0
+index 0000000..6cbed58
 --- /dev/null
 +++ b/ps2xRuntime/include/runtime/ps2_host_gs.h
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,21 @@
 +#pragma once
 +
 +#include <cstdint>
@@ -20,6 +20,11 @@ index 0000000..0256fe0
 +
 +void ps2SetHostGs(const PS2HostGs &hooks);
 +const PS2HostGs &ps2HostGs();
++
++// Guest vblank period (default 16667 us, NTSC). The host may raise the vblank rate (e.g. for high refresh output);
++// takes effect from the next scheduled vblank.
++void ps2SetVblankPeriodMicros(uint32_t micros);
++uint32_t ps2VblankPeriodMicros();
 diff --git a/ps2xRuntime/include/runtime/ps2_pad_provider.h b/ps2xRuntime/include/runtime/ps2_pad_provider.h
 new file mode 100644
 index 0000000..2833818
@@ -37,15 +42,63 @@ index 0000000..2833818
 +using PS2PadProvider = bool (*)(int port, int slot, uint8_t *data, size_t size);
 +void ps2SetPadProvider(PS2PadProvider provider);
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..d7acaff 100644
+index c5e31c4..9a16b89 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-@@ -1,3 +1,4 @@
+@@ -1,3 +1,5 @@
 +#include "runtime/ps2_host_gs.h"
++#include <atomic>
  #include "runtime/ee_scheduler.h"
  
  #include "ps2_log.h"
-@@ -1888,6 +1889,8 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -31,7 +33,11 @@ namespace
+     constexpr uint32_t WEF_OR = 0x01u;
+     constexpr uint32_t WEF_CLEAR = 0x10u;
+     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
+-    constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
++    std::atomic<uint32_t> g_vblankPeriodMicros{16667u};
++    std::chrono::microseconds vblankPeriod()
++    {
++        return std::chrono::microseconds(g_vblankPeriodMicros.load(std::memory_order_relaxed));
++    }
+     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
+     constexpr uint64_t kAlarmTickMicroseconds = 64u;
+     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
+@@ -50,7 +56,10 @@ namespace
+         return std::chrono::seconds(wholeSeconds) + std::chrono::nanoseconds(remainingNanoseconds);
+     }
+ 
+-    constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
++    uint64_t vblankPeriodCycles()
++    {
++        return microsecondsToEeCycles(g_vblankPeriodMicros.load(std::memory_order_relaxed));
++    }
+     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
+     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
+ 
+@@ -146,8 +155,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     main.status = EeThreadStatus::Ready;
+     m_threads.emplace(main.id, std::move(main));
+     m_readyQueues[0].push_back(kMainThreadId);
+-    scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
+-                  std::chrono::steady_clock::now() + kVBlankPeriod,
++    scheduleEvent(m_eeCycle + vblankPeriodCycles(),
++                  std::chrono::steady_clock::now() + vblankPeriod(),
+                   EeEvent{EeEventType::VBlankStart, 0, 0});
+     publishSnapshot();
+ }
+@@ -1850,8 +1859,8 @@ void EeScheduler::processDueDeadlines()
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
+                               scheduled.hostDeadline + kVBlankDuration,
+                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+-                scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
+-                              scheduled.hostDeadline + kVBlankPeriod,
++                scheduleEvent(scheduled.deadlineCycle + vblankPeriodCycles(),
++                              scheduled.hostDeadline + vblankPeriod(),
+                               EeEvent{EeEventType::VBlankStart, 0, 0});
+             }
+             processEvent(scheduled.event);
+@@ -1888,6 +1897,8 @@ void EeScheduler::processEvent(const EeEvent &event)
          }
          m_vsyncFlagAddress = 0u;
          m_vsyncTickAddress = 0u;
@@ -54,6 +107,20 @@ index c5e31c4..d7acaff 100644
          completeVSync(m_vsyncTick);
          if (m_gsVSyncCallback != 0u && m_runtime.hasFunction(m_gsVSyncCallback))
          {
+@@ -2144,3 +2155,13 @@ void EeScheduler::publishIdleDebugContext()
+         publishDebugContext(selected->activeContext());
+     }
+ }
++
++void ps2SetVblankPeriodMicros(uint32_t micros)
++{
++    g_vblankPeriodMicros.store(micros < 1000u ? 1000u : micros, std::memory_order_relaxed);
++}
++
++uint32_t ps2VblankPeriodMicros()
++{
++    return g_vblankPeriodMicros.load(std::memory_order_relaxed);
++}
 diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
 index c289ba0..52809f3 100644
 --- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
