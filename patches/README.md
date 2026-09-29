@@ -185,3 +185,10 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
     `PS2X_IOP_BATCH=4096`: 3 of 8 before (plus 3 of 8 with the level-1 trace), 0 of 16 after.
     With the fix and the trace, one 4096 boot resolved 14 contended PFILE_R waits in 1-31 IOP cycles and 22
     PSOUND_R waits in 42-3840 cycles. No boot hit the 1 s timeout.
+
+- `0014-jalr-resume-only-return.patch` (recompiler, needs regen): an unresolved indirect *call* (`jalr`) made every
+  instruction of the calling function an entry point (label + switch case per instruction in ~4000 functions), as if
+  it were an unresolved local jump. A call only needs its return address as a resume point. Same fix as the
+  PS2Recomp DQ8 fork (PR #254). Together with release-grade compiler flags for RelWithDebInfo (top-level
+  CMakeLists.txt: /Ob3 /GS- /arch:AVX2 /Qspectre- /Gy /Gw, /INCREMENTAL:NO /OPT:REF,ICF): Killzone in-game
+  18.6 -> 29.4 frames/s at 60 Hz vblank (headless, same scene).
