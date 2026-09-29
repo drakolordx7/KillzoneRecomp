@@ -1,4 +1,5 @@
 #include "kz_gs.h"
+#include "kz_timing.h"
 
 #include "kzgs.h"
 
@@ -147,6 +148,7 @@ namespace
     void onVsync(uint64_t, int field)
     {
         GsState &s = gs();
+        kzTimingOnVsync(s.runtime->memory().getRDRAM());
         {
             std::lock_guard<std::mutex> lock(s.pendingMutex);
             if (s.resizePending)

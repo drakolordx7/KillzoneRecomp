@@ -11,10 +11,12 @@
 #include "kz_iso.h"
 #include "kz_launcher.h"
 #include "kz_gs.h"
+#include "kz_timing.h"
 
 #include <SDL3/SDL.h>
 
 #include <atomic>
+#include <cmath>
 #include <thread>
 #include "runtime/ps2_pad_provider.h"
 
@@ -230,6 +232,16 @@ int main(int argc, char *argv[])
             std::cerr << "[kz] failed to load ELF: " << elf.string() << std::endl;
             return 1;
         }
+
+        // Guest vblank rate = target frame rate (kz_timing.h). Automation can force it with KZ_FPS.
+        int displayHz = 60;
+        if (window)
+        {
+            if (const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window)))
+                displayHz = static_cast<int>(std::lround(mode->refresh_rate));
+        }
+        const int fps = std::getenv("KZ_FPS") ? std::atoi(std::getenv("KZ_FPS")) : cfg.fpsLimit;
+        kzTimingInit(fps, displayHz);
 
         std::atomic<bool> runtimeDone{false};
         std::thread runtimeThread([&]() {
