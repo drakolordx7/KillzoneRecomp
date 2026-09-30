@@ -9,8 +9,11 @@ $src = "$root\build\$Config"
 $dst = "$root\dist\Killzone"
 
 if (-not (Test-Path "$src\killzone.exe")) { throw "build first: $src\killzone.exe missing" }
-Remove-Item -Recurse -Force $dst -ErrorAction SilentlyContinue
+# Update in place: replace the program files only. The player's data in the folder stays: killzone.ini (settings),
+# mc0/mc1 (memory cards: profiles and saves), disc (files extracted from their .iso) and cache (shader cache).
 New-Item -ItemType Directory -Force $dst | Out-Null
+Get-ChildItem $dst -File | Where-Object { $_.Extension -in '.exe', '.dll', '.pdb', '.txt' } | Remove-Item -Force
+if (Test-Path "$dst\resources") { Remove-Item -Recurse -Force "$dst\resources" }
 
 Copy-Item "$src\killzone.exe" $dst
 Get-ChildItem "$src\*.dll" | Copy-Item -Destination $dst
@@ -38,7 +41,9 @@ Controls (defaults; shown in the launcher's Controls tab, change them in killzon
 - W A S D: move                 - Left Shift: sprint             - C / Left Ctrl: crouch
 - R: reload                     - G: throw grenade               - Q / mouse wheel: switch weapon
 - E / F: use (ladders, emplaced guns, pick up)                  - X / Mouse4: special item
-- Escape: pause                 - Tab: objectives                - Space / Enter: confirm in menus
+- Escape: pause                 - Tab: objectives
+Menus: arrow keys or W/S/A/D to move, Enter / Space / E to select, Backspace to go back.
+Profile name: just type it (letters, digits, space, - _ .), Backspace deletes, Enter confirms, Escape cancels.
 Controllers (Xbox, DualShock, DualSense, ...) work out of the box with the original PS2 layout.
 
 Settings live in killzone.ini next to killzone.exe (the launcher writes it). Delete it to reset everything.
@@ -49,7 +54,7 @@ Status (test build)
 - Frame rate: "Match monitor refresh" (default) runs the game at your monitor's rate. Measured in gameplay:
   about 117-120 fps on 120 Hz, about 130-140 fps on 144 Hz.
 - The game plays its full intro movies before the main menu, as on the PS2.
-- The virtual memory card (profiles, saves) is kept in the killzone.exe folder.
+- The virtual memory card (profiles, saves) is kept in disc\mc0 next to killzone.exe; updates keep it.
 - If something goes wrong, run with the launcher and check the Display tab, or delete killzone.ini to reset.
 
 This package contains no Sony or Guerrilla code or assets.
