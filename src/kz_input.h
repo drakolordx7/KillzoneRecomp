@@ -54,6 +54,19 @@ bool kzInputUsingKeyboardMouse();
 // When the engine aim patch is active, mouse motion goes there; otherwise it is mapped onto the right stick.
 void kzInputSetAimPatchActive(bool active);
 
+// Text entry (the game's on-screen keyboard, e.g. the profile name). The game thread calls kzInputSetTextEntryActive()
+// every frame the keyboard screen is open; while it is, typing keys are queued as text instead of driving pad buttons.
+// kzInputTakeTextKey() pops one key: a printable ASCII character, or KZ_TEXT_ENTER / KZ_TEXT_CANCEL / KZ_TEXT_BACKSPACE.
+enum : uint16_t
+{
+    KZ_TEXT_BACKSPACE = 0x08,
+    KZ_TEXT_ENTER = 0x0D,
+    KZ_TEXT_CANCEL = 0x1B,
+};
+void kzInputSetTextEntryActive();
+bool kzInputTakeTextKey(uint16_t &key);
+// KZ_INPUT_SCRIPT "t:type=abc" queues text at t (automated tests of text entry; "\n" is not available, use t:enter).
+
 // Clock for KZ_INPUT_SCRIPT event times (seconds). Default: wall time.
 void kzInputSetScriptClock(double (*clock)());
 
