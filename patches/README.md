@@ -610,3 +610,6 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
     same program (`doJumpAsSameProgram`, no change).
   - **Left.** The EE thread and the GS thread (the PCSX2 renderer) for 120 fps; in the worker `mVUcompileJIT<1>` (the JR/JALR call itself, ~9 % of its
     busy time; `doConstProp` might remove some JRs but is untested and off in PCSX2) and the kzgs ring copy of ~5 MB per frame.
+
+- (no `0024`) clang-cl build: needed no `ext/PS2Recomp` change. The one compile fix is in `ext/kzvu` (main repo) and the flags are in the top-level `CMakeLists.txt`;
+  see docs/findings.md "clang-cl build".

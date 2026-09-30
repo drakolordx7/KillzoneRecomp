@@ -626,3 +626,70 @@ is not possible: the game's timing makes almost every frame differ between any t
 number, 597 of ~14.8 k distinct hashes shared).
 Runs note: both runs of one pair and one run of another died when a build re-staged `build\pd\resources` under them (their run dirs used a junction
 to it); `mkrun.ps1` copies it now.
+
+## clang-cl build (2026-09-30)
+
+Opt-in second toolchain: LLVM 23.1.2 `clang-cl` (`D:\LLVM\bin`) with `lld-link`, same sources, same options. MSVC stays the default (`tools\scripts\build.bat`).
+`tools\scripts\build_clang.ps1 [-Name clang] [-Cmake '<extra cmake args>']` configures and builds `build\<Name>`; it reuses `build\RelWithDebInfo`'s FFmpeg prefix,
+shader cache and FetchContent sources, so nothing is downloaded and nothing is written to C:.
+
+**What had to change** (no behaviour change, no `generated/` or `ext/PS2Recomp` edit, so there is no `patches/ps2recomp/0024-*.patch`):
+- `CMakeLists.txt`: a `KZ_CLANG_CL` branch of the RelWithDebInfo flags: `/Zi /O2 /Oi /Gy /Gw /GS- /clang:-march=x86-64-v3 /clang:-ffp-contract=off /DNDEBUG`
+  (`/O2` is `-O3` in clang-cl; no `/Ob3`, no `/Qspectre-`, no `/arch:AVX2` because `-march=x86-64-v3` covers it). **Never `/fp:fast`.** `-ffp-contract=off` is
+  explicit because clang-cl defaults to `-ffp-contract=on`, which would fuse `a*b+c` into FMA (x86-64-v3 has it) and change PS2 float results. The kz* libraries
+  keep their own `/fp:contract /arch:AVX2` (PCSX2 code, as under MSVC). Checked in the object code: 0 `vfmadd*` in 8 sampled generated unity objects
+  (hundreds of scalar `vmulss/vaddss/vsubss` in them); every compile line of the build carries `-ffp-contract=off`.
+- `ext/kzvu/shim/unity/KzvuMicroVU.cpp`: `memoHash` uses `_mm_aesenc_si128`; MSVC accepts it anywhere, clang needs the target feature, so the function has
+  `__attribute__((target("aes")))` under `__clang__`. That was the **only** compile error in the whole tree (runtime, IOP, kzgs, kzvu, kzipu, kzspu2, src/, 20 743
+  generated files, PCH + unity as configured). The `(__m128i)(x)` casts in the generated code and macros compile as they are; the MSVC-only guards (`if(MSVC)`)
+  are true for clang-cl. Warnings only: `-Wdeprecated-declarations` (fopen/strerror), the same as MSVC's C4996.
+- Aliasing: **`-fno-strict-aliasing` is not needed on the command line, because clang-cl already implies it.** It passes `-relaxed-aliasing` and `-fwrapv` by default (MSVC
+  compatibility), so the typed `*(uint32_t*)(rdram+a)` / `*(uint64_t*)` guest memory accesses of `ps2_cg.h` (a 32-bit store followed by a 64-bit load of the same guest address
+  would be a TBAA violation) keep MSVC's semantics. Strict aliasing was not tried; it would need `may_alias` access types first.
+- Opt-in extras in `CMakeLists.txt`: `-DKZ_CLANG_LTO=thin|full` (also pass `-DCMAKE_AR=<llvm>/bin/llvm-lib.exe`, MSVC's `lib.exe` does not index bitcode),
+  `-DKZ_CLANG_PGO_GEN=ON` (instrumented; `src/kz_main.cpp` calls `__llvm_profile_write_file()` before its `std::_Exit`, which skips the runtime's atexit writer; set
+  `LLVM_PROFILE_FILE=<dir>\kz_%p.profraw`, then `llvm-profdata merge -output=kz.profdata *.profraw`), `-DKZ_CLANG_PGO_USE=<file.profdata>`.
+- `tools/scripts/vif_run.ps1` bug found on the way: it set `KZ_PROFILE` to the empty string when not profiling, and an empty variable still counts as set (kz_main.cpp
+  `getenv("KZ_PROFILE")`), so every such run had the 20 s sampling profiler running from t=0. It now removes the variable. That profiler is what crashed twice (below).
+  `perf_run.ps1` has the same line and was left alone.
+
+**Build cost.** Clang, all 532 objects (generated code in 163 unity batches, PCH), `-j12`: 100 s wall, 1574 CPU-s (MSVC: "compile CPU 3 543 s" for the generated code alone,
+~15 min, see "Guest control flow without the scheduler"). The thin-LTO and PGO+LTO builds take the same wall time (99 / 97 s), the code generation moves into the link. Two builds
+of the same tree have the same size to the byte (87 265 792). `killzone.exe`: MSVC 74.1 MB, clang 87.3 MB, +LTO 82.9, +PGO 81.2, +PGO+LTO 79.6.
+
+**Correctness** (all runs headless, `KZ_FPS=120`, scripted input as in the perf runs):
+- Boot, menus, intro movie (`KZ_IPU` unset, 150 s, frames every 5 s: Sony/Guerrilla logos, the FMV; `f_ipu_clang`, `f_ipu_msvc`, `f2_ipu_pgolto`), level, weapon,
+  HUD, explosions, "mission objective" text, death and FAILED screen: the same scenes as the MSVC build, in every build variant (frame montages; not byte comparable, the timing
+  differs between any two runs).
+- `PS2X_STRESS_YIELD=97` boots to the menu (clang 120 s, PGO+LTO 100 s) with `KZ_CRASH_TRACE=1`, no crash.
+- `KZ_VU0_VERIFY=8 PS2X_LAZY_TIMERS=verify`, 235 s gameplay: clang 5.11 M VU0 calls, PGO 5.33 M, LTO 5.72 M, PGO+LTO 5.45 M checked, **0 mismatches** each; timer shadow 80-93 k
+  comparisons, 0 mismatches, 214 M early returns checked each. (Both paths of the VU0 check are clang-compiled: this shows they agree, not that they equal MSVC's results.)
+- No `missing` / `exception` / `no function` line in the stderr of any of the runs listed here (`unhandled import cdvdman:78` is in the MSVC log too).
+- Tests built with clang-cl in `build\clang_tests` (`-DKZVU_BUILD_TEST=ON -DKZGS_BUILD_TEST=ON -DKZIPU_BUILD_TEST=ON -DKZSPU2_BUILD_TEST=ON`): kzvu_test 1776 checks, 0 failures (as in patch 0022);
+  kzvu0_test 509 checks, 0 failures (103 captures, JIT != in-game 0, JIT != PCSX2 interpreter 0); kzgs_test PASS (0 failures); kzipu_test PASS (min 55.6 dB PSNR); kzspu2_test PASS.
+- **A crash, but not in the game:** 2 of 44 runs with the sampling profiler on (the `vif_run.ps1` bug above) died with 0xC0000005 after 10-35 s. The one with `KZ_CRASH_TRACE=1` died in
+  the `kz_profiler.cpp` thread inside `RtlVirtualUnwind` (unwinding another thread's stack), the other had no trace. 0 crashes in the ~50 runs without the profiler (20 x 30 s boots, ~30 x 235 s,
+  verify and stress runs). Whether an MSVC build dies the same way under this profiler was not measured. The profiler (`KZ_PROFILE`) is a diagnostic, not part of the game.
+
+**Speed.** `PS2X_SCHED_STATS=3`, the task's input script, `KZ_IPU=off`, `KZ_FPS=120`, `run_headless.ps1`, 235 s, fps = (vif counter at t=200 - at t=150) / 50, EE ms/frame =
+(1000 - pacing sleep) / fps as in `perf_metric.py`, no other killzone.exe running. The machine's speed drifts a lot between hours (the MSVC build measured 7.4-8.4 ms/frame in the first
+set and 5.4-5.8 ms in the second), so only runs interleaved in one series are comparable:
+
+| series | build | fps (runs) | EE ms/frame (runs) | median fps | median EE ms |
+|---|---|---|---|---|---|
+| A: 3 alternating pairs | MSVC | 73.4 / 76.4 / 78.4 | 8.38 / 7.60 / 7.42 | 76.4 | 7.60 |
+| | clang | 77.1 / 73.6 / 73.3 | 6.54 / 7.05 / 7.11 | 73.6 | 7.05 |
+| B: 4 rounds x 5 builds, order rotated each round | MSVC | 82.8 / 78.0 / 77.7 / 77.7 | 5.41 / 5.82 / 5.80 / 5.78 | 77.8 | 5.79 |
+| | clang | 79.2 / 79.4 / 77.7 / 77.3 | 5.06 / 5.03 / 5.09 / 5.08 | 78.5 | 5.07 |
+| | clang + ThinLTO | 80.6 / 82.1 / 79.0 / 82.8 | 4.90 / 4.74 / 5.09 / 4.67 | 81.3 | 4.82 |
+| | clang + PGO | 86.0 / 80.3 / 80.1 / 80.0 | 4.22 / 4.52 / 4.67 / 4.58 | 80.2 | 4.55 |
+| | clang + PGO + ThinLTO | 80.3 / 77.5 / 77.8 / 77.7 | 4.53 / 4.68 / 4.72 / 4.61 | 77.8 | 4.64 |
+
+Per-round difference to the MSVC run of the same round, EE ms/frame: clang -0.35 / -0.79 / -0.71 / -0.70 (median -0.71 ms, -12 %); ThinLTO -0.51 / -1.08 / -0.71 / -1.11 (-0.90, -16 %);
+PGO -1.19 / -1.30 / -1.13 / -1.20 (-1.20, -21 %); PGO+LTO -0.88 / -1.14 / -1.08 / -1.17 (-1.11, -19 %). The PGO profile was trained on this same scenario (one 250 s run of the
+instrumented build), so its number is the best case for this scene.
+- **fps did not move measurably** (medians 77.8 MSVC; 78.5 / 81.3 / 80.2 / 77.8 for the four clang builds; the spread inside one build is 3-6 fps): at 5-6 ms per frame the EE thread is
+  no longer the limit, the pacing sleep is 55-64 % of the second. The VIF1 worker (`PS2X_VIF1_STATS=1`, `vif_run.ps1`, 3 rounds, worker ms per frame): MSVC 5.53 / 5.51 / 5.46,
+  clang 5.23 / 5.30 / 5.47, PGO 5.35 / 5.45 / 5.27 (medians 5.51 / 5.30 / 5.35, -3 %): it is mostly microVU-generated code, which no host compiler changes. fps in those runs: 77.1 / 79.9 / 78.8 MSVC,
+  78.0 / 82.9 / 79.8 clang, 82.4 / 78.2 / 82.2 PGO. So the toolchain shaves the EE part (guest code plus runtime), which any later register-locals/fiber work builds on, but
+  120 fps also needs the worker, the GS thread and the frame-list hand-off ("What limits fps now" above) under 8.33 ms.

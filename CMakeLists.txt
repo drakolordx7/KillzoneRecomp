@@ -6,7 +6,44 @@ project(KillzoneRecomp CXX C)
 # memory helpers, __security_check_cookie in profiles). Keep strict float semantics (no /fp:fast: PS2 float
 # emulation depends on it). KZ_FAST_FLAGS=OFF restores CMake's defaults.
 option(KZ_FAST_FLAGS "Release-grade optimisation flags for RelWithDebInfo" ON)
-if(MSVC AND KZ_FAST_FLAGS)
+# clang-cl (opt-in: configure with -DCMAKE_C_COMPILER=<llvm>/clang-cl.exe -DCMAKE_CXX_COMPILER=<llvm>/clang-cl.exe, see
+# docs/perf_research.md "clang-cl build"): same option set, spelled for clang. Float semantics stay strict:
+# -ffp-contract=off (no FMA fusing of a*b+c: PS2 float emulation is bit-exact), never /fp:fast. The kz* libraries
+# (PCSX2 code) add their own /fp:contract /arch:AVX2 after these, as they do with MSVC.
+if(MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    set(KZ_CLANG_CL ON)
+else()
+    set(KZ_CLANG_CL OFF)
+endif()
+# Optional clang-cl extras (all OFF by default):
+#   -DKZ_CLANG_LTO=thin|full   link-time optimisation. Needs llvm-lib as the archiver (MSVC lib.exe does not index
+#                              bitcode): also pass -DCMAKE_AR=<llvm>/bin/llvm-lib.exe -DCMAKE_LINKER=<llvm>/bin/lld-link.exe
+#   -DKZ_CLANG_PGO_GEN=ON      instrumented build (writes <cwd>/kz_%p.profraw at exit; run a gameplay session,
+#                              then llvm-profdata merge -output=kz.profdata *.profraw)
+#   -DKZ_CLANG_PGO_USE=<file>  optimise with that .profdata
+set(KZ_CLANG_LTO "" CACHE STRING "clang-cl LTO mode: empty, thin or full")
+option(KZ_CLANG_PGO_GEN "clang-cl: build an instrumented (profile-generating) binary" OFF)
+set(KZ_CLANG_PGO_USE "" CACHE FILEPATH "clang-cl: .profdata to optimise with")
+if(KZ_CLANG_CL AND KZ_FAST_FLAGS)
+    set(_kz_clang_opt "/Zi /O2 /Oi /Gy /Gw /GS- /clang:-march=x86-64-v3 /clang:-ffp-contract=off /DNDEBUG")
+    set(_kz_clang_link "/DEBUG /INCREMENTAL:NO /OPT:REF /OPT:ICF")
+    if(KZ_CLANG_LTO)
+        string(APPEND _kz_clang_opt " /clang:-flto=${KZ_CLANG_LTO}")
+        string(APPEND _kz_clang_link " /lldltocache:${CMAKE_BINARY_DIR}/lto-cache")
+    endif()
+    if(KZ_CLANG_PGO_GEN)
+        string(APPEND _kz_clang_opt " /clang:-fprofile-instr-generate")
+        get_filename_component(_kz_llvm_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+        file(GLOB _kz_prof_rt "${_kz_llvm_bin}/../lib/clang/*/lib/windows/clang_rt.profile-x86_64.lib")
+        list(GET _kz_prof_rt 0 _kz_prof_rt)
+        string(APPEND _kz_clang_link " \"${_kz_prof_rt}\"")
+    elseif(KZ_CLANG_PGO_USE)
+        string(APPEND _kz_clang_opt " /clang:-fprofile-instr-use=${KZ_CLANG_PGO_USE} /clang:-Wno-profile-instr-unprofiled /clang:-Wno-profile-instr-out-of-date /clang:-Wno-backend-plugin")
+    endif()
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${_kz_clang_opt}")
+    set(CMAKE_C_FLAGS_RELWITHDEBINFO "${_kz_clang_opt}")
+    set(CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO "${_kz_clang_link}")
+elseif(MSVC AND KZ_FAST_FLAGS)
     set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "/Zi /O2 /Ob3 /Oi /Gy /Gw /GS- /Qspectre- /arch:AVX2 /DNDEBUG")
     set(CMAKE_C_FLAGS_RELWITHDEBINFO "/Zi /O2 /Ob3 /Oi /Gy /Gw /GS- /Qspectre- /arch:AVX2 /DNDEBUG")
     set(CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO "/DEBUG /INCREMENTAL:NO /OPT:REF /OPT:ICF")
@@ -44,6 +81,9 @@ add_library(kz_port STATIC
 target_include_directories(kz_port PRIVATE "${CMAKE_SOURCE_DIR}/src" "${KZ_IMGUI_DIR}" "${KZ_IMGUI_DIR}/backends")
 target_link_libraries(kz_port PRIVATE ps2_runtime SDL3::SDL3 imgui kzgs kzvu kzipu kzspu2)
 target_compile_definitions(kz_port PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+if(KZ_CLANG_CL AND KZ_CLANG_PGO_GEN)
+    target_compile_definitions(kz_port PRIVATE KZ_PGO_GEN=1)
+endif()
 
 add_executable(killzone
     ${KZ_GENERATED_SRC}

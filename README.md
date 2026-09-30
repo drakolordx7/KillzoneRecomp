@@ -23,4 +23,5 @@ No game code or data is in this repo. You supply your own disc image.
 2. Ghidra 12.1.3 + emotionengine-reloaded headless import → `ExportPS2Functions.java` → `work/config.toml` + `work/functions.csv` (16,931 functions).
 3. `ps2_recomp config/killzone.toml` → `generated/` (~82k files).
 4. `tools\scripts\build.bat` → `build/RelWithDebInfo/killzone.exe`.
+   Optional clang-cl build (opt-in; about 12 % less EE time per frame, see `docs/findings.md` "clang-cl build"): `tools\scripts\build_clang.ps1` → `build/clang/killzone.exe`.
 5. Reference: portable PCSX2 v2.8.2 in `tools/pcsx2` (BIOS supplied by the user).
