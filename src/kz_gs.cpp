@@ -430,7 +430,10 @@ bool kzGsAttach(PS2Runtime &runtime, void *hwnd, int windowHeight, const KzConfi
     hooks.exclusive = !(std::getenv("KZ_SW_GS") && std::getenv("KZ_SW_GS")[0] == '1');
     ps2SetHostGs(hooks);
     s.attached = true;
-    std::cout << "[kz] hardware GS attached (upscale " << kc.upscale << "x)" << std::endl;
+    static const char *kRendererNames[] = {"D3D11", "D3D12", "Vulkan"};
+    const int rendererIndex = static_cast<int>(kc.renderer);
+    std::cout << "[kz] hardware GS attached (" << (rendererIndex >= 0 && rendererIndex < 3 ? kRendererNames[rendererIndex] : "?")
+              << ", upscale " << kc.upscale << "x)" << std::endl;
     return true;
 }
 
