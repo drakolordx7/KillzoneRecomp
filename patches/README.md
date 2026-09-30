@@ -504,3 +504,64 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
     Built in a private build dir (a copy of `generated/` whose own `ps2_cg.h` wins the quoted include): the slow-path entries fall
     from 6.7 % to 1.7 % of the EE thread's samples, but EE ms/frame did not move (12.79 / 11.17 / 10.89 -> 12.16 / 11.78 / 11.04),
     so it is not adopted.
+
+- `0023-codegen-dispatch.patch` (recompiler + new header `ps2xRuntime/include/ps2_cg_dsp.h` + `EeScheduler.cpp`; needs a rebuilt
+  recompiler, a regen and a full rebuild; `tools/scripts/regen.py` sets `PS2X_CODEGEN_DSP=1` and `PS2X_CODEGEN_FOLD=1` by default,
+  both `=0` give the patch-0017 output, checked byte for byte: 82 652 files, 0 differences; the main repo carries the two regen.py
+  defaults and `tools/scripts/verify_resume_table.py`). Cuts the ~0.9 M guest-to-guest scheduler dispatches per second of gameplay
+  to ~8 k/s. `ps2_cg.h` is untouched (only generated code and the scheduler include the new header).
+  - **Where the dispatches came from** (counted in `EeScheduler::run` with `PS2X_SCHED_STATS=2`, gameplay t=150..200 s, per
+    second / per displayed frame, classified by how the previous guest entry ended). Same runtime, the generated code of
+    `build\RelWithDebInfo`: **923 k/s (16 041 per frame)** = 364 scheduler-originated (thread start, interrupt invocation) + 166 checkpoint
+    yields + 365 k *return-resumes* + 557 k *jumps*. Every return-resume and jump traced back to one mechanism: a function leaves
+    through a branch or fall-through into another function or `entry_*` fragment with `ctx->pc = target; return;`, the call site sees
+    `pc != return address`, treats it as a non-local return, sets `g_ps2GuestUnwinding`, every generated frame returns to the
+    scheduler, the scheduler dispatches the fragment and then, one dispatch per level, every caller's resume label. Yields are 166/s
+    (each unwinds ~40 frames, the ~8 k/s that is left). The rest: self-recursive functions (`jal` into the own function is a `goto`,
+    its `jr $ra` returned to the scheduler: 0x17f8e0 and 0x185e20, 25-30 k/s each) and the flag-wait loop `FUN_0014fd90` (up to 706 k/s
+    when the game sits in it: after a yield the function table resumed it in a nested `entry_*` copy of its tail, whose five blocks then
+    ran block to block through the scheduler).
+  - **Tail transfers** (`ps2_cg_dsp.h`). A generated function that leaves through a tail jump (conditional branch out of its range, `j`
+    to a non-function address, unresolved `jr $reg`, falling off its end) stores `ctx->pc = target | 1` (`ps2DspTail`) and returns.
+    The nearest enclosing call site (`ps2DspCall`, replaces `ps2CgCall`) recognises the mark and calls the target itself in a loop
+    (`ps2DspAfterCallSlow`): the callee's frame is gone (tail jump), the caller's frames stay, so the eventual `jr $ra` back to the
+    caller is an ordinary return. Only marked pcs are followed; a pc that is neither the return address nor marked is a non-local
+    return (longjmp, thread switch) and takes the old unwinding path. Each followed tail is charged 8 cycles against the checkpoint
+    budget like a dispatch was; when the budget runs out the checkpoint runs and a yield leaves `ctx->pc = target` (unmarked, registers
+    flushed) exactly as the scheduler expects. The scheduler is the outermost call site and follows marked tails the same way
+    (`ps2DspSchedulerFollow`, and clears the mark on whatever pc a function returned to it with). Guest words are 4-aligned, so
+    the mark cannot be mistaken for an address; the hot path (`pc == fall`) is unchanged, no global flag is read on it.
+    `PS2X_STRICT_RETURN_DIAGNOSTICS`, hooks installed with `replaceFunction` (they see `ctx->pc == entry`, unmarked) and
+    `kz_ipu`/`kz_aim` wrappers (`ctx->pc != ra` after the original returns means "yielded": a marked pc counts) work unchanged.
+  - **Recursion.** A `jr $ra` in a function that contains a self-recursive `jal` switches on the return address and `goto`s the
+    recursive return labels directly (charged 8 cycles; yields as before), 124 k/s in gameplay.
+  - **Fragment folding** (`PS2Recompiler::foldEntryFragments`, `PS2X_CODEGEN_FOLD=1`). Ghidra's export has 64 020 `entry_*`
+    blocks: 56 882 lie inside a real function (a copy of its tail from an inner label on) and 7 138 are standalone, in 2 181
+    contiguous chains of mean 24 instructions (largest 2 526). Each block was its own C++ function and its own table entry,
+    so a resume at an inner label ran the copy and then hopped block to block through the scheduler (registers written back and
+    reloaded at every hop), and the loops inside such functions never stayed inside them. Now a block nested in a real function
+    (its start is a decoded instruction of it, its end within it) is dropped and becomes a resume label of that function; contiguous
+    standalone blocks are merged into one function under the first block's name (up to 4 096 instructions; the others become
+    resume labels). Configured entry points that had been registered under a block move to the owner. 56 212 nested + 5 695
+    chained blocks folded: 82 652 -> 20 745 generated files, generated sources 556 -> 247 MB, `killzone.exe` 102.2 -> 74.1 MB, unity
+    compile CPU time (ninja log, loaded machine) 6 864 -> 3 543 s. Every table address is still present (144 623 in both trees, none
+    lost, none new) and `tools/scripts/verify_resume_table.py <dir>` checks that each of the 123 881 entries that now point into a
+    function whose start is a different address (was 61 974) has a `case` in that function's resume switch and that every `goto`
+    has its label. The first attempt lost 58 configured entry points (code pointers inside removed blocks): the check found them.
+  - **Resume switch guard.** A call enters at the function start, so generated code now tests `ctx->pc != START` before the `switch`
+    (a function with many resume labels no longer walks the switch on every call).
+  - **Debug.** `PS2X_SCHED_STATS=1|2` also prints, per 10 s, the dispatches by reason (scheduler / yield / return-resume / jump), the tail
+    jumps followed by call sites and the scheduler, the recursive returns kept local and missing tail targets (0 in every run).
+    `=2` adds per-reason (previous entry -> pc) pair histograms.
+  - **Measured** (headless, `KZ_FPS=120`, scripted input, t=150..200; machine shared with other builds and game instances, so
+    concurrent pairs, `PS2X_SCHED_STATS=1` in both). Baseline `build\RelWithDebInfo` vs this patch, 3 pairs: fps 56.1 / 60.9 / 59.9
+    vs 58.3 / 61.1 / 59.3 (median 59.9 vs 59.3: unchanged, the game sits on the 60 fps step of a 120 Hz vblank, see
+    docs/findings.md "EE thread frame budget"); EE host time per displayed frame (1000 ms - pacing sleep) / fps: 15.05 / 12.75 /
+    13.11 ms vs 12.84 / 12.08 / 12.62 ms (per pair -2.21 / -0.67 / -0.49 ms, median -0.67 ms = -5 %, mean -1.1 ms). A fourth pair with
+    the sampling profiler on: 12.27 vs 11.14 ms; `EeScheduler::run` self time 6.1 % of the EE thread before, not among the top 28
+    self-time entries after.
+    Intermediate build (call-site trampolines + local returns only, no scheduler follow, no folding): 214 k dispatches/s.
+  - **Correctness evidence.** See docs/findings.md "Guest control flow without the scheduler".
+  - **Left.** ~190 yields/s x ~40 unwound frames = the remaining ~8 k dispatches/s (needs stack switching or fibers to remove); the
+    memory slow paths (`ps2CgWr32Slow`/`ps2CgRd32Slow`/`Load32`/`Store32`, ~6 % of the EE thread in the profile: scratchpad and
+    MMIO addresses) are not control flow and were not touched.

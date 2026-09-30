@@ -9,6 +9,10 @@ import filecmp, os, re, shutil, subprocess, sys, tomllib
 
 # Killzone ships the register-locals code generator (patch 0017); PS2X_CODEGEN=classic regenerates the old style.
 os.environ.setdefault('PS2X_CODEGEN', 'locals')
+# Guest control flow without the scheduler (patch 0023): tail jumps followed by the caller (ps2_cg_dsp.h) and the entry_*
+# fragments folded into their functions. PS2X_CODEGEN_DSP=0 / PS2X_CODEGEN_FOLD=0 give the patch-0017 output.
+os.environ.setdefault('PS2X_CODEGEN_DSP', '1')
+os.environ.setdefault('PS2X_CODEGEN_FOLD', '1')
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]

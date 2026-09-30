@@ -465,3 +465,72 @@ the EE thread's non-sleeping host time per displayed frame (`tools/scripts/perf_
   bound, see above), the two slow-path store entries above (1.4 %), `PS2Runtime::Load32/Store32` themselves (1.2 / 0.7 %).
   Worker-side note from the same runs (`PS2X_VIF1_STATS=1`): the VIF1 worker is busy 4.2-5.2 s per 10 s at 45-55 fps
   (about 10 ms per job, of which VU1 ~8 ms), so at 120 fps the worker, not only the EE thread, is a limit.
+
+## Guest control flow without the scheduler (2026-09-30, patch 0023)
+The follow-up to "EE thread frame budget": ~1 M scheduler dispatches per second in gameplay, each ~50 ns plus a table probe and a
+cold switch at the target. Counted first, then removed. All numbers: headless, `KZ_FPS=120`, scripted input, gameplay window
+t=150..200 s, on a machine shared with other builds and game instances (other agents' regens and 3-5 game runs at the same time), so
+absolute frame rates are 56-64 and only concurrent pairs compare.
+- **Why each dispatch happened** (`PS2X_SCHED_STATS=2`, `[sched-stats] dispatch reasons`, classified in `EeScheduler::run` from how the
+  previous guest entry ended; mean of the five 10 s windows, per second and per displayed frame):
+
+  | build | dispatches/s | per frame | scheduler-originated | yield | return-resume | jump | tail jumps followed | local recursive returns |
+  |---|---|---|---|---|---|---|---|---|
+  | before (generated code of `build\RelWithDebInfo`, instrumented runtime) | 922 657 | 16 041 | 364 | 166 | 365 255 | 556 872 | 0 | 0 |
+  | call-site trampolines + local recursive returns (no scheduler follow, no folding) | 214 483 | 3 675 | 355 | 180 | 9 486 | 204 462 | 370 593 | 125 329 |
+  | final (+ scheduler follow + fragment folding) | 8 440 | 146 | 347 | 186 | 7 907 | 0 | 1 190 | 123 720 |
+
+  *Yield* = a checkpoint gave control back (166-186/s). *Return-resume* = the guest returned through
+  `$ra` to a call's return address after everything above it had been unwound. *Jump* = any other transfer: tail jump into another
+  function or `entry_*` fragment, fall-through into the next fragment, indirect jump. Top pairs before: 0x17f8e0 and 0x185e20
+  returning to themselves (self-recursive functions: `jal` to the own function is a `goto`, so its `jr $ra` left the function) 25-30 k/s
+  each; fragment loops 0x401720/401750/4017a4 (18 k/s each), 0x3fb108/170/184/18c (13-19 k/s each), 0x3b0c48/6c (7-14 k/s); the
+  pair 0x341648 -> 0x33cd84 (jump) and 0x33cd84 -> 0x341648 / 0x341674 (return-resume), 12 k/s each: the loop of `FUN_00341548`
+  (virtual calls at 0x341640 and 0x34166c; none of these pairs is left after the change);
+  the flag-wait loop `FUN_0014fd90` (0x14fe28/38/54/c0/c8: 7-28 k/s each in gameplay windows, 400-700 k/s each while the game
+  waits in the menu, because after one yield the function table resumed it in a nested `entry_*` copy of its tail and the loop
+  never came back into the function). The 7.9 k/s return-resumes left follow the yields: 7.9 k / 186 = ~42 unwound frames resumed
+  per yield (top pairs after: 0x2e67e4 -> 0x2e6944 -> 0x2ed824 -> 0x2e67e4, 1.0-1.2 k/s each).
+- **Returns.** A callee that returns normally (`pc == fall`) stays on the direct path (ps2CgCall / ps2DspCall: budget decrement,
+  table call, one compare); verified by reading the code and by the counts: no scheduler dispatch in either build is a normal return.
+  Return-resumes only follow yields and tail jumps.
+- **What changed in the generated code** (details in patches/README.md, 0023): tail jumps set `ctx->pc = target | 1` and return; the
+  caller loops (`ps2DspAfterCallSlow`, and the scheduler for the outermost frame) instead of unwinding; `jr $ra` back into a
+  self-recursive function's own return labels is a `goto`; 56 212 `entry_*` blocks nested inside real functions and 5 695 chained
+  standalone blocks are folded into their functions (82 652 -> 20 745 functions/files, `killzone.exe` 102.2 -> 74.1 MB,
+  compile CPU 6 864 -> 3 543 s); the function table maps every old block address to the owning function, whose resume switch has
+  a case for it; the switch is skipped when a call enters at the function start.
+- **fps and EE ms/frame** (concurrent pairs, `PS2X_SCHED_STATS=1`, EE ms/frame = (1000 ms - pacing sleep) / fps as in
+  perf_metric.py; baseline = `build\RelWithDebInfo`, new = this patch):
+
+  | pair | fps base / new | EE ms/frame base / new | change |
+  |---|---|---|---|
+  | 1 | 56.1 / 58.3 | 15.05 / 12.84 | -2.21 |
+  | 2 | 60.9 / 61.1 | 12.75 / 12.08 | -0.67 |
+  | 3 | 59.9 / 59.3 | 13.11 / 12.62 | -0.49 |
+  | 4 (sampling profiler on in both) | 62.5 / 63.9 | 12.27 / 11.14 | -1.13 |
+
+  Median of pairs 1-3: fps 59.9 -> 59.3 (no change: the frame list is kicked at a vblank, so 12-13 ms of EE work per frame is a
+  2-vblank frame at 120 Hz whatever the EE does; docs/findings.md "EE thread frame budget"), EE ms/frame 13.11 -> 12.62 (-5 %, mean
+  of pairs 1-3 -1.1 ms = -8 %). The profile of the EE thread (KZ_PROFILE=160,40) shows where it went: `EeScheduler::run` 6.1 % self
+  before, not in the top 28 after; total busy 72.3 % -> 67.9 % of the samples. What is left in that profile is spread thinly
+  (no guest function above ~1.2 %), plus the memory slow paths (`ps2CgWr32Slow`, `ps2CgRd32Slow`, `ps2CgWr128Slow`,
+  `PS2Runtime::Load32/Store32`, `writeIORegister`: 4.7 % before, 6.4 % after, self time; addresses outside the 32 MB RAM window) and `kzvu0Call`/`Vu0Execute`
+  (~3 %). Getting under the 8.33 ms vblank period needs the guest code itself to get ~35 % cheaper and the VIF1 worker to fit
+  as well; dispatch removal alone is worth 0.5-1 ms per frame here.
+- **Correctness evidence.**
+  - `PS2X_CODEGEN_DSP=0 PS2X_CODEGEN_FOLD=0` regenerates the patch-0017 output byte for byte (82 652 files, 0 differences).
+  - `tools/scripts/verify_resume_table.py` on the folded tree: 144 623 table entries, the same addresses as before (0 lost, 0 new), 123 881
+    of them inside a function that starts elsewhere, every one has a resume `case` in that function, no `goto` without its label.
+    (A first version lost 58 code-pointer entries that had been registered under removed blocks; found by diffing the tables.)
+  - Headless gameplay runs of the final build (hist runs and 3 pairs): menu -> profile -> level -> difficulty -> character -> mission,
+    HUD, weapon, explosions, mission-failed screen at the end, in the same order and looking like the baseline (frames compared side by
+    side: work/dsp_c_hist vs work/dsp_b0_hist); no `guest-branch` / `sched-trace` / `[error]` line in any run, `missing tail targets=0`
+    in all 23 windows of every run.
+  - With `KZ_IPU` unset (movies): Guerrilla logo, intro cinematic, menu with the movie background, mission (work/dspChk_ipu).
+  - `PS2X_STRESS_YIELD=97` (a checkpoint yield every 97th check, unwinding and resuming the whole stack at every kind of label):
+    the final build reaches the main menu in 9 of 9 boots (3 in pairs with the baseline, run to t=100 s: also the campaign submenu
+    after the scripted Start press; 6 as six concurrent boots next to 6 baseline boots, run to t=75 s), the baseline in 9 of 9. A tenth boot of the final build, the very
+    first stress run (started together with a regen and a movie run), showed the known `[IOP] module arena exhausted` MCSERV.IRX loop
+    (276 079 lines, stuck at `sceSifLoadModule`; "Boot flake" above: 1 in 30-40 boots under load, always with several instances
+    booting); it is IOP module loading, but 1 of 10 against 0 of 9 is too few runs to rule out a link to this change.
