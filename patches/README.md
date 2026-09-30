@@ -469,5 +469,7 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
     0.997-1.000 per 10 s segment (a constant offset per run pair); the gameplay segments differ between offload and baseline
     exactly as two baseline runs do (scene timing); overall RMS -14.8 / -14.6 / -14.8 / -14.8 dBFS (2 baseline, 2 offload runs),
     2 silent gaps > 20 ms inside sound in all four, `kz_audio` underruns 0. Movies play. The four `ps2xIOP` test executables pass.
+    Nowait calls on a client whose previous call had not completed: 0 of 27 684 in a run at 80 % machine load (queue latency
+    avg 1.5 ms, max 112 ms).
   - **Debug.** `PS2X_IOP_RPC_STATS=1` (the table, plus the EE-side `SifCallRpc` totals, calls on a still-busy client and the queue
     latency of offloaded calls), `PS2X_IOP_RPC_ASYNC=0`.

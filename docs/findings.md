@@ -367,6 +367,10 @@ agents' changes to `ps2_memory.cpp`/`ps2_runtime.cpp` that the later builds incl
 baseline binary 44.5 / 38.1 / 44.0, 45.0 / 48.1 / 59.3, 59.7 / 64.3 / 57.4 (median 48.1); offload builds 51.0 / 20.2 / 55.1,
 42.3 / 61.2 / 65.4, 63.6 / 58.3 / 60.9 (median 58.3); the newest binary with `PS2X_IOP_RPC_ASYNC=0`: 64.4 / 57.8 / 64.0.
 
+**Client reuse.** `PS2X_IOP_RPC_STATS=1` also counts nowait calls that arrive while the client's previous call has not completed (a
+call the inline path could never see): 0 of 27 684 calls in a full run at 80 % machine load, where the queue latency averaged 1.5 ms
+and reached 112 ms. Killzone waits for a call to complete before it reuses the client.
+
 **Checks.** 35 headless boots of 50-60 s (12 with the flag set, 12 default, 8 at `KZ_FPS=120`, 3 with movies on; one baseline with
 movies on), three instances at a time on a loaded machine: `dma=` advanced in every 5 s interval of all of them, no `TIMED OUT` from the
 outside-thread semaphore wait. Movies: the intro plays in both builds (work/vid_base, work/vid_async montages). Audio, `KZ_AUDIO_WAV`,
