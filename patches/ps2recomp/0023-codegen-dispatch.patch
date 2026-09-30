@@ -1,0 +1,710 @@
+diff --git a/ps2xRecomp/include/ps2recomp/code_generator.h b/ps2xRecomp/include/ps2recomp/code_generator.h
+--- a/ps2xRecomp/include/ps2recomp/code_generator.h
++++ b/ps2xRecomp/include/ps2recomp/code_generator.h
+@@ -5,6 +5,7 @@
+ #include <string>
+ #include <vector>
+ #include <map>
++#include <set>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include "ps2recomp/control_flow_analyzer.h"
+@@ -78,6 +79,12 @@
+         bool m_localsRestricted = false;
+         std::unordered_set<uint32_t> m_localsFunctions;
+         bool m_localsMode = false; // the function being emitted uses locals
++        // Guest control flow without the scheduler (runtime side: ps2_cg_dsp.h, patch 0023). PS2X_CODEGEN_DSP=1 on top of
++        // PS2X_CODEGEN=locals: tail jumps leave through the caller's trampoline instead of unwinding to the scheduler, and
++        // `jr $ra` back into a self-recursive function's own return labels stays local.
++        bool m_dspEnabled = false;
++        bool m_dspMode = false; // the function being emitted uses it (locals mode and enabled)
++        std::set<uint32_t> m_curSelfReturns; // return labels of the current function's own recursive `jal`s
+         std::unordered_set<uint32_t> m_curDelaySlotAddrs; // delay slot addresses of the current function
+         bool usesLocals(uint32_t functionStart) const;
+         // Text classification for locals mode: does the emitted statement need ctx->pc / a full GPR sync?
+diff --git a/ps2xRecomp/include/ps2recomp/ps2_recompiler.h b/ps2xRecomp/include/ps2recomp/ps2_recompiler.h
+--- a/ps2xRecomp/include/ps2recomp/ps2_recompiler.h
++++ b/ps2xRecomp/include/ps2recomp/ps2_recompiler.h
+@@ -79,6 +79,7 @@
+ 
+         bool decodeFunction(Function &function);
+         void discoverAdditionalEntryPoints();
++        void foldEntryFragments();
+         bool shouldSkipFunction(const Function &function) const;
+         bool isStubFunction(const Function &function) const;
+         bool isCorrectnessCriticalFunction(const Function &function) const;
+diff --git a/ps2xRecomp/src/lib/code_generator.cpp b/ps2xRecomp/src/lib/code_generator.cpp
+--- a/ps2xRecomp/src/lib/code_generator.cpp
++++ b/ps2xRecomp/src/lib/code_generator.cpp
+@@ -110,6 +110,10 @@
+         {
+             m_localsEnabled = std::string(mode) == "locals";
+         }
++        if (const char *dsp = std::getenv("PS2X_CODEGEN_DSP"))
++        {
++            m_dspEnabled = dsp[0] != '\0' && dsp[0] != '0';
++        }
+         if (const char *funcs = std::getenv("PS2X_CODEGEN_FUNCS"))
+         {
+             std::ifstream in(funcs);
+diff --git a/ps2xRecomp/src/lib/control_flow_emitter.cpp b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+--- a/ps2xRecomp/src/lib/control_flow_emitter.cpp
++++ b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+@@ -265,9 +265,14 @@
+             m_ss << indent << "PS2_FLUSH();\n";
+             if (isCall)
+             {
+-                m_ss << fmt::format("{}if (!ps2CgCall(rdram, ctx, runtime, 0x{:X}u, 0x{:X}u, 0x{:X}u, false)) {{ return; }}\n",
+-                                    indent, target, branchPc(), fallthroughPc());
++                m_ss << fmt::format("{}if (!{}(rdram, ctx, runtime, 0x{:X}u, 0x{:X}u, 0x{:X}u, false)) {{ return; }}\n",
++                                    indent, m_gen.m_dspMode ? "ps2DspCall" : "ps2CgCall", target, branchPc(), fallthroughPc());
+                 m_ss << indent << "PS2_RELOAD();\n";
++                return;
++            }
++            if (m_gen.m_dspMode)
++            {
++                m_ss << fmt::format("{}ps2DspTail(ctx, 0x{:X}u); return;\n", indent, target);
+                 return;
+             }
+         }
+@@ -286,8 +291,8 @@
+         {
+             m_ss << indent << "PS2_FLUSH();\n";
+             m_ss << indent << "ctx->pc = " << jumpTargetExpression << ";\n";
+-            m_ss << fmt::format("{}if (!ps2CgCall(rdram, ctx, runtime, {}, 0x{:X}u, 0x{:X}u, true)) {{ return; }}\n",
+-                                indent, jumpTargetExpression, branchPc(), fallthroughPc());
++            m_ss << fmt::format("{}if (!{}(rdram, ctx, runtime, {}, 0x{:X}u, 0x{:X}u, true)) {{ return; }}\n",
++                                indent, m_gen.m_dspMode ? "ps2DspCall" : "ps2CgCall", jumpTargetExpression, branchPc(), fallthroughPc());
+             m_ss << indent << "PS2_RELOAD();\n";
+             return;
+         }
+@@ -327,6 +332,13 @@
+             return;
+         }
+ 
++        if (m_gen.m_dspMode)
++        {
++            m_ss << fmt::format("{}ps2DspTailIndirect(rdram, ctx, runtime, {}, 0x{:X}u); return;\n", indent,
++                                jumpTargetExpression, branchPc());
++            return;
++        }
++
+         emitRuntimeBranchDispatch(jumpTargetExpression,
+                                   branchPc(),
+                                   0u,
+@@ -449,6 +461,20 @@
+                     continue;
+                 }
+                 m_ss << fmt::format("            case 0x{:X}u: goto label_{:x};\n", target, target);
++            }
++            m_ss << "            default: break;\n";
++            m_ss << "        }\n";
++        }
++
++        if (m_gen.m_dspMode && kind == RegisterBranchKind::Jump && rsReg == 31u && !m_gen.m_curSelfReturns.empty())
++        {
++            m_ss << "        switch (jumpTarget) {\n";
++            for (uint32_t target : m_gen.m_curSelfReturns)
++            {
++                m_ss << fmt::format("            case 0x{:X}u:\n", target);
++                m_ss << "                ++g_ps2DspStat[1];\n";
++                m_ss << fmt::format("                if ((g_ps2EeBudget -= 8) < 0) [[unlikely]] {{ ctx->pc = 0x{:X}u; PS2_FLUSH(); if (ps2CgBudgetSlow(runtime)) {{ return; }} }}\n", target);
++                m_ss << fmt::format("                goto label_{:x};\n", target);
+             }
+             m_ss << "            default: break;\n";
+             m_ss << "        }\n";
+@@ -580,7 +606,14 @@
+                 {
+                     m_ss << "            PS2_FLUSH();\n";
+                 }
+-                m_ss << fmt::format("            ctx->pc = 0x{:X}u;\n", target);
++                if (m_gen.m_dspMode)
++                {
++                    m_ss << fmt::format("            ps2DspTail(ctx, 0x{:X}u);\n", target);
++                }
++                else
++                {
++                    m_ss << fmt::format("            ctx->pc = 0x{:X}u;\n", target);
++                }
+                 m_ss << "            return;\n";
+             }
+             m_ss << "        }\n";
+@@ -605,7 +638,14 @@
+                 {
+                     m_ss << "            PS2_FLUSH();\n";
+                 }
+-                m_ss << fmt::format("            ctx->pc = 0x{:X}u;\n", target);
++                if (m_gen.m_dspMode)
++                {
++                    m_ss << fmt::format("            ps2DspTail(ctx, 0x{:X}u);\n", target);
++                }
++                else
++                {
++                    m_ss << fmt::format("            ctx->pc = 0x{:X}u;\n", target);
++                }
+                 m_ss << "            return;\n";
+             }
+             m_ss << "        }\n";
+diff --git a/ps2xRecomp/src/lib/function_emitter.cpp b/ps2xRecomp/src/lib/function_emitter.cpp
+--- a/ps2xRecomp/src/lib/function_emitter.cpp
++++ b/ps2xRecomp/src/lib/function_emitter.cpp
+@@ -5,6 +5,7 @@
+ #include "ps2recomp/r5900_decoder.h"
+ #include "ps2recomp/recompiler_reporter.h"
+ #include "ps2recomp/types.h"
++#include "ps2recomp/control_flow_utils.h"
+ 
+ #include <algorithm>
+ #include <cctype>
+@@ -210,6 +211,8 @@
+         // macros first, then rewritten to use C++ locals for the guest GPRs.
+         const bool locals = cg.usesLocals(function.start);
+         cg.m_localsMode = locals;
++        cg.m_dspMode = locals && cg.m_dspEnabled;
++        cg.m_curSelfReturns.clear();
+         cg.m_curDelaySlotAddrs.clear();
+         if (locals)
+         {
+@@ -233,7 +236,12 @@
+             ss << "#include \"ps2_stubs.h\"\n\n";
+             if (locals)
+             {
+-                ss << "#include \"ps2_cg.h\"\n\n";
++                ss << "#include \"ps2_cg.h\"\n";
++                if (cg.m_dspMode)
++                {
++                    ss << "#include \"ps2_cg_dsp.h\"\n";
++                }
++                ss << "\n";
+             }
+             ss << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
+             ss << "#include \"ps2_log.h\"\n";
+@@ -256,6 +264,23 @@
+         }
+ 
+         const std::unordered_set<uint32_t> &internalTargets = analysisResult.entryPoints;
++        if (cg.m_dspMode)
++        {
++            // A `jal` into this same function is a goto (control_flow_emitter emitInternalTarget); its return address is
++            // a label here. The matching `jr $ra` jumps to it directly (ps2_cg_dsp.h) instead of returning to the scheduler.
++            for (const Instruction &inst : instructions)
++            {
++                if (inst.opcode != OPCODE_JAL)
++                    continue;
++                const uint32_t callTarget = buildAbsoluteJumpTarget(inst.address, inst.target);
++                const uint32_t ret = inst.address + 8u;
++                if (internalTargets.contains(callTarget) && internalTargets.contains(ret) &&
++                    !cg.m_curDelaySlotAddrs.contains(ret))
++                {
++                    cg.m_curSelfReturns.insert(ret);
++                }
++            }
++        }
+         ConstantRegisterState constantRegisters;
+         GifDmaKickPlan gifDmaKickPlan{};
+         ss << "// Function: " << function.name << "\n";
+@@ -279,6 +304,12 @@
+         std::stringstream switchText;
+         if (!resumeTargets.empty())
+         {
++            // A call enters at the function start, which is not a resume label: test it first so that a function with many
++            // resume labels (folded blocks, PS2X_CODEGEN_FOLD) does not walk the switch on every call.
++            if (cg.m_dspMode)
++            {
++                switchText << "    if (ctx->pc != 0x" << std::hex << function.start << "u) [[unlikely]]\n" << std::dec;
++            }
+             switchText << "    switch (ctx->pc) {\n";
+             for (uint32_t target : resumeTargets)
+             {
+@@ -445,8 +476,17 @@
+         if (!instructions.empty())
+         {
+             body << "    PS2_FLUSH();\n";
+-            body << "    ctx->pc = 0x" << std::hex << function.end << "u;\n"
+-                 << std::dec;
++            if (cg.m_dspMode)
++            {
++                // Falling off the end continues in the next function or fragment: a tail jump.
++                body << "    ps2DspTail(ctx, 0x" << std::hex << function.end << "u);\n"
++                     << std::dec;
++            }
++            else
++            {
++                body << "    ctx->pc = 0x" << std::hex << function.end << "u;\n"
++                     << std::dec;
++            }
+         }
+ 
+         LocalsUsage use;
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -2098,6 +2098,16 @@
+             ++it;
+         }
+ 
++        foldEntryFragments();
++        totalTargets = 0u;
++        for (auto &[owner, targets] : m_resumeEntryTargetsByOwner)
++        {
++            (void)owner;
++            std::sort(targets.begin(), targets.end());
++            targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
++            totalTargets += targets.size();
++        }
++
+         m_codeGenerator->setResumeEntryTargets(m_resumeEntryTargetsByOwner);
+ 
+         if (totalTargets > 0u)
+@@ -2110,6 +2120,181 @@
+                 << " owner function(s)";
+             m_reporter.progress(msg.str());
+         }
++    }
++
++    // Ghidra's export splits code into many tiny `entry_*` blocks: 56 k of them lie inside a real function (a copy of the
++    // tail of that function from an inner label onwards), another 7 k form contiguous chains that are really one function.
++    // Every block is a separate C++ function, every jump between blocks returns to the scheduler (registers written back
++    // and reloaded, one guest dispatch), and the function table sends a resume at an inner label to the block instead of
++    // to the function that owns the code, so after one yield a loop keeps running block to block through the scheduler
++    // (the game's flag-wait loop was ~2 M dispatches per second). PS2X_CODEGEN_FOLD=1 removes the blocks as functions:
++    //  - a block nested in a real function (its start is a decoded instruction of it, its end within it) becomes a
++    //    resume label of that function; the table maps the block's start to the function (resume switch);
++    //  - contiguous standalone blocks are merged into one function under the first block's name (the others become
++    //    resume labels of it), up to kMaxFoldedInstructions instructions.
++    // The generated code for every removed block address is reachable through the owner's `switch (ctx->pc)`.
++    void PS2Recompiler::foldEntryFragments()
++    {
++        const char *env = std::getenv("PS2X_CODEGEN_FOLD");
++        if (!env || env[0] == '\0' || env[0] == '0')
++        {
++            return;
++        }
++        constexpr size_t kMaxFoldedInstructions = 4096u;
++
++        auto isCode = [](const Function &f)
++        { return f.isRecompiled && !f.isStub && !f.isSkipped && f.end > f.start; };
++        auto decodedHas = [](const std::vector<Instruction> &d, uint32_t address)
++        {
++            auto it = std::lower_bound(d.begin(), d.end(), address,
++                                       [](const Instruction &i, uint32_t a)
++                                       { return i.address < a; });
++            return it != d.end() && it->address == address;
++        };
++        auto isPinned = [&](const Function &f)
++        {
++            return (m_bootstrapInfo.valid && f.start == m_bootstrapInfo.entry) ||
++                   m_correctnessCriticalFunctionStarts.contains(f.start) ||
++                   m_stubFunctionStarts.contains(f.start) || m_skipFunctionStarts.contains(f.start);
++        };
++
++        std::vector<size_t> real;
++        for (size_t i = 0; i < m_functions.size(); ++i)
++        {
++            if (isCode(m_functions[i]) && !isEntryFunctionName(m_functions[i].name))
++            {
++                real.push_back(i);
++            }
++        }
++        std::sort(real.begin(), real.end(), [&](size_t a, size_t b)
++                  { return m_functions[a].start < m_functions[b].start; });
++
++        std::vector<char> folded(m_functions.size(), 0);
++        size_t nested = 0u, chained = 0u;
++
++        // 1. entry_* blocks inside a real function.
++        for (size_t i = 0; i < m_functions.size(); ++i)
++        {
++            const Function &s = m_functions[i];
++            if (!isCode(s) || !isEntryFunctionName(s.name) || isPinned(s))
++            {
++                continue;
++            }
++            auto it = std::upper_bound(real.begin(), real.end(), s.start,
++                                       [&](uint32_t a, size_t idx)
++                                       { return a < m_functions[idx].start; });
++            const Function *owner = nullptr;
++            for (int steps = 0; it != real.begin() && steps < 64; ++steps)
++            {
++                --it;
++                const Function &f = m_functions[*it];
++                if (f.start >= s.start || f.end <= s.start)
++                {
++                    continue;
++                }
++                if (s.end > f.end)
++                {
++                    continue;
++                }
++                auto dIt = m_decodedFunctions.find(f.start);
++                if (dIt == m_decodedFunctions.end() || !decodedHas(dIt->second, s.start))
++                {
++                    continue;
++                }
++                owner = &f;
++                break;
++            }
++            if (!owner)
++            {
++                continue;
++            }
++            {
++                // Configured entry points (code pointers) inside the block were registered under the block: hand them over.
++                std::vector<uint32_t> inherited;
++                auto own = m_resumeEntryTargetsByOwner.find(s.start);
++                if (own != m_resumeEntryTargetsByOwner.end())
++                {
++                    inherited = std::move(own->second);
++                    m_resumeEntryTargetsByOwner.erase(own);
++                }
++                auto &dst = m_resumeEntryTargetsByOwner[owner->start];
++                dst.push_back(s.start);
++                dst.insert(dst.end(), inherited.begin(), inherited.end());
++            }
++            folded[i] = 1;
++            ++nested;
++        }
++
++        // 2. contiguous standalone entry_* blocks.
++        std::vector<size_t> standalone;
++        for (size_t i = 0; i < m_functions.size(); ++i)
++        {
++            if (!folded[i] && isCode(m_functions[i]) && isEntryFunctionName(m_functions[i].name) &&
++                m_decodedFunctions.contains(m_functions[i].start))
++            {
++                standalone.push_back(i);
++            }
++        }
++        std::sort(standalone.begin(), standalone.end(), [&](size_t a, size_t b)
++                  { return m_functions[a].start < m_functions[b].start; });
++        for (size_t k = 0; k < standalone.size();)
++        {
++            const size_t head = standalone[k];
++            Function &h = m_functions[head];
++            std::vector<Instruction> merged = m_decodedFunctions[h.start];
++            size_t next = k + 1u;
++            while (next < standalone.size() && !isPinned(m_functions[standalone[next]]))
++            {
++                const size_t fi = standalone[next];
++                const Function &f = m_functions[fi];
++                if (f.start != h.end)
++                {
++                    break;
++                }
++                const std::vector<Instruction> &d = m_decodedFunctions[f.start];
++                if (d.empty() || merged.size() + d.size() > kMaxFoldedInstructions)
++                {
++                    break;
++                }
++                merged.insert(merged.end(), d.begin(), d.end());
++                m_resumeEntryTargetsByOwner[h.start].push_back(f.start);
++                auto own = m_resumeEntryTargetsByOwner.find(f.start);
++                if (own != m_resumeEntryTargetsByOwner.end())
++                {
++                    auto &dst = m_resumeEntryTargetsByOwner[h.start];
++                    dst.insert(dst.end(), own->second.begin(), own->second.end());
++                    m_resumeEntryTargetsByOwner.erase(f.start);
++                }
++                h.end = f.end;
++                folded[fi] = 1;
++                ++chained;
++                ++next;
++            }
++            if (next > k + 1u)
++            {
++                m_decodedFunctions[h.start] = std::move(merged);
++            }
++            k = next;
++        }
++
++        std::vector<Function> kept;
++        kept.reserve(m_functions.size());
++        for (size_t i = 0; i < m_functions.size(); ++i)
++        {
++            if (folded[i])
++            {
++                m_decodedFunctions.erase(m_functions[i].start);
++                m_resumeEntryTargetsByOwner.erase(m_functions[i].start);
++                continue;
++            }
++            kept.push_back(std::move(m_functions[i]));
++        }
++        m_functions = std::move(kept);
++
++        std::ostringstream msg;
++        msg << "folded " << nested << " entry_* blocks nested in real functions and " << chained
++            << " standalone entry_* blocks into contiguous chains; " << m_functions.size() << " functions remain";
++        m_reporter.progress(msg.str());
+     }
+ 
+     bool PS2Recompiler::decodeFunction(Function &function)
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -7,6 +7,7 @@
+ #include "../ps2_iop_post.h"
+ #include "../ps2_vif1_worker.h"
+ #include "ps2_runtime_macros.h"
++#include "ps2_cg_dsp.h" // g_ps2DspStat, PS2_TAIL_MARK (includes ps2_cg.h)
+ #include "ps2_cg.h" // g_ps2EeBudget: the guest code's checkpoint budget (the dispatch loop charges through it as well)
+ 
+ #include <algorithm>
+@@ -64,6 +65,16 @@
+         uint64_t checkpoints = 0, checkpointCycles = 0;
+         uint64_t yieldPending = 0, yieldDeadline = 0, yieldSlice = 0, yieldStress = 0;
+         std::unordered_map<uint32_t, uint64_t> pcHist, exitHist;
++        // Why each dispatch happened, judged from how the previous guest entry ended (kinds: 0 = scheduler-originated
++        // (new thread, invocation, event), 1 = yield (a checkpoint gave control back), 2 = return-resume (the guest
++        // returned through $ra to a call's return address: a caller resumed after an unwind), 3 = jump (any other pc:
++        // tail jump, fall into the next fragment, indirect jump). pairHist (=2 only): (previous entry pc << 32 | this pc).
++        uint64_t reasonCount[4] = {0, 0, 0, 0};
++        std::unordered_map<uint64_t, uint64_t> pairHist[4];
++        uint32_t lastEntryPc = 0, lastExitPc = 0;
++        int lastThread = -1;
++        bool lastValid = false;
++        uint64_t yieldsAtEntry = 0;
+         // rdtsc time split: inside guest functions vs the scheduler loop around them, for dispatches in the guest's
+         // vsync/flag wait loop (FUN_0014fd90 and its entry fragments, 0x14fd90..0x15008c) and everywhere else.
+         // Guest clock: cycles charged by the checkpoint estimate vs cycles added by the wall-clock floor, and host time
+@@ -106,6 +117,27 @@
+                 std::fprintf(stderr, " %06x:%.0f", v[i].second, v[i].first * k);
+             std::fprintf(stderr, "\n");
+         };
++        std::fprintf(stderr, "[sched-stats]   guest control flow kept off the scheduler per second (ps2_cg_dsp.h): tail jumps followed=%.0f "
++                             "recursive returns local=%.0f calls returned after a followed tail=%.0f missing tail targets=%.0f\n",
++                     g_ps2DspStat[0] * k, g_ps2DspStat[1] * k, g_ps2DspStat[2] * k, g_ps2DspStat[3] * k);
++        std::memset(g_ps2DspStat, 0, sizeof(g_ps2DspStat));
++        std::fprintf(stderr, "[sched-stats]   dispatch reasons per second: scheduler=%.0f yield=%.0f return-resume=%.0f jump=%.0f\n",
++                     st.reasonCount[0] * k, st.reasonCount[1] * k, st.reasonCount[2] * k, st.reasonCount[3] * k);
++        if (st.hist)
++        {
++            static const char *const kindName[4] = {"scheduler", "yield", "return-resume", "jump"};
++            for (int kind = 1; kind < 4; ++kind)
++            {
++                std::vector<std::pair<uint64_t, uint64_t>> v;
++                for (const auto &e : st.pairHist[kind])
++                    v.emplace_back(e.second, e.first);
++                std::sort(v.rbegin(), v.rend());
++                std::fprintf(stderr, "[sched-stats]   %s (prev entry->pc):", kindName[kind]);
++                for (size_t i = 0; i < v.size() && i < 14; ++i)
++                    std::fprintf(stderr, " %06x->%06x:%.0f", static_cast<uint32_t>(v[i].second >> 32), static_cast<uint32_t>(v[i].second), v[i].first * k);
++                std::fprintf(stderr, "\n");
++            }
++        }
+         top(st.pcHist, "dispatch pcs", k);
+         top(st.exitHist, "exit pcs (ctx->pc after return)", k);
+         std::fprintf(stderr, "[sched-stats]   transfers(exceptions)=%.0f/s\n", st.transfers * k);
+@@ -535,6 +567,35 @@
+                 ++g_schedStats.dispatches;
+                 if (g_schedStats.hist)
+                     ++g_schedStats.pcHist[context.pc];
++                {
++                    SchedStats &st = g_schedStats;
++                    unsigned kind = 0;
++                    uint32_t prevEntry = 0;
++                    if (st.lastValid && st.lastThread == running->id && st.lastExitPc == context.pc)
++                    {
++                        prevEntry = st.lastEntryPc;
++                        const uint64_t y = st.yieldPending + st.yieldDeadline + st.yieldSlice + st.yieldStress;
++                        kind = 3;
++                        if (y != st.yieldsAtEntry)
++                            kind = 1;
++                        else if (context.pc >= 8u && context.pc < 0x2000000u)
++                        {
++                            uint32_t w = 0;
++                            std::memcpy(&w, m_rdram + context.pc - 8u, 4);
++                            // pc is a call's return address (jal / jalr two words before) and the guest returned through
++                            // $ra (a callee returned to a caller that had been unwound). A branch that merely lands on such
++                            // an address is a jump.
++                            if (((w >> 26) == 3u || ((w >> 26) == 0u && (w & 0x3fu) == 9u)) && getRegU32(&context, 31) == context.pc)
++                                kind = 2;
++                        }
++                    }
++                    ++st.reasonCount[kind];
++                    if (st.hist)
++                        ++st.pairHist[kind][(static_cast<uint64_t>(prevEntry) << 32) | context.pc];
++                    st.lastEntryPc = context.pc;
++                    st.yieldsAtEntry = st.yieldPending + st.yieldDeadline + st.yieldSlice + st.yieldStress;
++                    st.lastValid = false;
++                }
+                 statSpin = context.pc >= 0x14fd90u && context.pc < 0x15008cu;
+                 statT0 = __rdtsc();
+                 if (g_schedStats.tscPrevExit != 0u)
+@@ -545,9 +606,14 @@
+             schedTrace('E', running->id, running->invocations.size(), context);
+             g_ps2GuestUnwinding = false;
+             function(m_rdram, &context, &m_runtime);
++            ps2DspSchedulerFollow(m_rdram, &context, &m_runtime);
++            context.pc &= ~PS2_TAIL_MARK; // a tail jump the guest's call sites did not follow (ps2_cg_dsp.h): dispatch its target
+             schedTrace('X', running->id, running->invocations.size(), context);
+             if (g_schedStats.on)
+             {
++                g_schedStats.lastExitPc = context.pc;
++                g_schedStats.lastThread = running->id;
++                g_schedStats.lastValid = true;
+                 if (g_schedStats.hist)
+                     ++g_schedStats.exitHist[context.pc];
+                 g_schedStats.tscPrevExit = __rdtsc();
+diff --git a/ps2xRuntime/include/ps2_cg_dsp.h b/ps2xRuntime/include/ps2_cg_dsp.h
+new file mode 100644
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_cg_dsp.h
+@@ -0,0 +1,158 @@
++#ifndef PS2_CG_DSP_H
++#define PS2_CG_DSP_H
++// Guest control flow without the scheduler (PS2X_CODEGEN_DSP=1 with PS2X_CODEGEN=locals, patch 0023).
++//
++// Included by generated code in addition to ps2_cg.h, which stays untouched (a change there rebuilds every build tree).
++//
++// 1. Tail transfers. When a generated function leaves through a jump to another function or fragment (a conditional
++//    branch out of its range, a `j` to something that is not a function start, an unresolved `jr $reg`, falling off
++//    its end into the next fragment), it stores ctx->pc = target | 1 (ps2DspTail) and returns. The low bit marks
++//    "this is a tail jump, not a return". Guest code addresses are word aligned, so it cannot be mistaken for one.
++//    The nearest enclosing call site (ps2DspCall) sees pc != its return address, recognises the mark and calls the
++//    target itself in a loop (ps2DspAfterCallSlow): the callee's frame is gone (it was a tail jump), the caller's frames
++//    stay alive, so the eventual `jr $ra` back to the caller is an ordinary return and no frame has to be re-entered
++//    through the scheduler. Before this, every such transfer set g_ps2GuestUnwinding, every frame returned to the
++//    scheduler, and the scheduler re-entered the target and then, one dispatch per level, every caller's resume label.
++//    Only marked pcs are followed. A pc that is neither the return address nor marked is a non-local return (longjmp,
++//    thread switch): the old unwinding protocol applies unchanged.
++//    The scheduler clears the mark on the pc of a function that returned to it (EeScheduler::run).
++//    Budget and yields: each followed tail jump is charged like a dispatch (8 cycles against g_ps2EeBudget); when the
++//    budget runs out the checkpoint runs, and a yield leaves ctx->pc = target (unmarked) with the registers already
++//    flushed, exactly what the scheduler expects to resume.
++// 2. Self-recursive returns. `jal` to an address inside the same function is a goto, so the matching `jr $ra` returned
++//    to the scheduler, which re-entered the function at the return label. A `jr $ra` in such a function now jumps to
++//    the label directly when the target is one of the function's own recursive return addresses.
++
++#include "ps2_cg.h"
++
++// Counters (the scheduler prints them with PS2X_SCHED_STATS): 0 = tail jumps followed by a call site, 1 = self-recursive
++// returns kept local, 2 = calls that returned into the caller after at least one tail jump, 3 = unresolved targets.
++inline uint64_t g_ps2DspStat[4] = {0, 0, 0, 0};
++
++#define PS2_TAIL_MARK 1u
++
++// ctx->pc = target, marked as a tail jump. Registers must already be flushed.
++PS2CG_FORCEINLINE void ps2DspTail(R5900Context *ctx, uint32_t target)
++{
++    ctx->pc = target | PS2_TAIL_MARK;
++}
++
++// Slow path of a call: the callee returned with ctx->pc != the return address, or the scheduler is unwinding. Follows
++// tail jumps until the guest returns to `fall` (returns true: the caller continues), yields or leaves non-locally
++// (returns false with g_ps2GuestUnwinding set, as the old ps2CgAfterCallSlow did).
++PS2CG_NOINLINE inline bool ps2DspAfterCallSlow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t target,
++                                               uint32_t fall)
++{
++    uint32_t entryPc = target;
++    bool followed = false;
++    for (;;)
++    {
++        if (rt->isStopRequested() || ctx->pc == 0u || g_ps2GuestUnwinding)
++            return false;
++        if ((ctx->pc & PS2_TAIL_MARK) == 0u)
++        {
++            if (ctx->pc == entryPc)
++                ctx->pc = fall;
++            if (ctx->pc == fall)
++            {
++                g_ps2DspStat[2] += followed ? 1u : 0u;
++                return true;
++            }
++            g_ps2GuestUnwinding = true; // non-local return (longjmp, thread switch): the scheduler continues at ctx->pc
++            return false;
++        }
++        const uint32_t pc = ctx->pc & ~PS2_TAIL_MARK;
++        ctx->pc = pc;
++        if (pc == fall)
++        {
++            g_ps2DspStat[2] += followed ? 1u : 0u;
++            return true;
++        }
++        if ((g_ps2EeBudget -= 8) < 0) [[unlikely]]
++        {
++            if (ps2CgBudgetSlow(rt))
++                return false; // yield: pc = target, registers flushed, scheduler resumes there
++        }
++        const uint32_t slot = (pc - g_ps2RecompiledFunctionTableBase) >> 2;
++        PS2Runtime::RecompiledFunction fn = nullptr;
++        if (((pc & 3u) == 0u) & (slot < g_ps2RecompiledFunctionTableSlotCount))
++            fn = g_ps2RecompiledFunctionTable[slot];
++        if (fn == nullptr) [[unlikely]]
++        {
++            ++g_ps2DspStat[3];
++            g_ps2GuestUnwinding = true; // the scheduler reports the missing function
++            return false;
++        }
++        ++g_ps2DspStat[0];
++        followed = true;
++        entryPc = pc;
++        fn(rdram, ctx, rt);
++    }
++}
++
++// The scheduler is the outermost call site: it enters the function it resumes or dispatches directly (after a yield, the
++// innermost frame), so a tail jump made there has no ps2DspCall above it. The scheduler follows marked tail jumps the same
++// way (EeScheduler::run): each one is charged like a dispatch, a yield or an unwind ends the loop, anything else (missing
++// target, stop) leaves ctx->pc unmarked for the scheduler's own dispatch checks.
++PS2CG_NOINLINE inline void ps2DspSchedulerFollow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
++{
++    while ((ctx->pc & PS2_TAIL_MARK) != 0u)
++    {
++        const uint32_t pc = ctx->pc & ~PS2_TAIL_MARK;
++        ctx->pc = pc;
++        if (g_ps2GuestUnwinding || pc == 0u || rt->isStopRequested())
++            return;
++        if ((g_ps2EeBudget -= 8) < 0) [[unlikely]]
++        {
++            if (ps2CgBudgetSlow(rt))
++                return;
++        }
++        const uint32_t slot = (pc - g_ps2RecompiledFunctionTableBase) >> 2;
++        PS2Runtime::RecompiledFunction fn = nullptr;
++        if (((pc & 3u) == 0u) & (slot < g_ps2RecompiledFunctionTableSlotCount))
++            fn = g_ps2RecompiledFunctionTable[slot];
++        if (fn == nullptr) [[unlikely]]
++            return;
++        ++g_ps2DspStat[0];
++        fn(rdram, ctx, rt);
++    }
++}
++
++// JAL / JALR; same contract as ps2CgCall (ps2_cg.h). ctx->pc == target and every modified GPR are already in ctx.
++PS2CG_FORCEINLINE bool ps2DspCall(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t target, uint32_t src,
++                                  uint32_t fall, bool indirect)
++{
++    if ((g_ps2EeBudget -= 8) < 0) [[unlikely]]
++    {
++        if (ps2CgBudgetSlow(rt))
++            return false;
++    }
++    const uint32_t slot = (target - g_ps2RecompiledFunctionTableBase) >> 2;
++    if (((target & 3u) != 0u) | (slot >= g_ps2RecompiledFunctionTableSlotCount)) [[unlikely]]
++        return ps2CgCallSlow(rdram, ctx, rt, target, src, fall, indirect);
++    const PS2Runtime::RecompiledFunction fn = g_ps2RecompiledFunctionTable[slot];
++    if (fn == nullptr) [[unlikely]]
++        return ps2CgCallSlow(rdram, ctx, rt, target, src, fall, indirect);
++    fn(rdram, ctx, rt);
++    if (!g_ps2GuestUnwinding && ctx->pc == fall) [[likely]]
++        return true;
++    return ps2DspAfterCallSlow(rdram, ctx, rt, target, fall);
++}
++
++// Unresolved `jr $reg` to another function or fragment (jump tables that were not resolved, function pointers, tail
++// calls through a register). Registers are flushed. Leaves through the caller's trampoline when the target exists;
++// otherwise the runtime reports it exactly as before. Returns nothing: the generated function returns afterwards.
++PS2CG_FORCEINLINE void ps2DspTailIndirect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t target,
++                                          uint32_t src)
++{
++    const uint32_t slot = (target - g_ps2RecompiledFunctionTableBase) >> 2;
++    if (((target & 3u) == 0u) & (slot < g_ps2RecompiledFunctionTableSlotCount) &&
++        g_ps2RecompiledFunctionTable[slot] != nullptr) [[likely]]
++    {
++        ps2DspTail(ctx, target);
++        return;
++    }
++    (void)rt->dispatchGuestBranch(rdram, ctx, target, src, 0u, PS2Runtime::GuestBranchKind::IndirectJump, "JR");
++}
++
++#endif // PS2_CG_DSP_H
