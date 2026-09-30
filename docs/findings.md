@@ -283,7 +283,7 @@ machine (the least loaded run of the final binary measured 73 fps with the sampl
   next frame list only when D1 is idle (`FUN_00151fc8`, docs/perf_research.md section 2.6; not re-checked here), so a worker that needs more than one vblank period (8.33 ms) per frame gives
   2-vblank frames whatever the EE does. 120 fps needs the worker's per-frame time (mostly VU1) well under 8.3 ms too,
   not only the EE thread.
-- **The guest cycle estimate is not the limiter.** `PS2X_EE_CYCLE_SCALE=0.5` (charge half the cycles per call/back edge; a
+- **The guest cycle estimate is not the limiter.** (Superseded once the EE was no longer the busiest stage: it is, see "Frame pipeline timeline".) `PS2X_EE_CYCLE_SCALE=0.5` (charge half the cycles per call/back edge; a
   temporary knob, not kept) cut the estimated cycles from 215 to 135 M/s and left fps at 57.5 vs 58.8 in a concurrent pair.
 - **Where the ~1 M scheduler dispatches/s come from** (`PS2X_SCHED_STATS=2` histograms; every dispatch is an entry into
   a guest function from the scheduler loop): tail jumps between `entry_*` fragments and the returns after a
@@ -693,3 +693,114 @@ instrumented build), so its number is the best case for this scene.
   clang 5.23 / 5.30 / 5.47, PGO 5.35 / 5.45 / 5.27 (medians 5.51 / 5.30 / 5.35, -3 %): it is mostly microVU-generated code, which no host compiler changes. fps in those runs: 77.1 / 79.9 / 78.8 MSVC,
   78.0 / 82.9 / 79.8 clang, 82.4 / 78.2 / 82.2 PGO. So the toolchain shaves the EE part (guest code plus runtime), which any later register-locals/fiber work builds on, but
   120 fps also needs the worker, the GS thread and the frame-list hand-off ("What limits fps now" above) under 8.33 ms.
+
+## Frame pipeline timeline (2026-09-30, patch 0025)
+
+Question: gameplay at `KZ_FPS=120` ran ~80 fps although every stage fits in one 8.33 ms vblank (EE ~5.5 ms, VIF1/VU1/GIF worker ~4.5 ms,
+GS thread ~3.3 ms), i.e. frames took ~1.5 vblanks. Answer: nothing in the EE -> D1 -> worker -> GS hand-off serialised them. The EE
+thread's *estimated cycle clock* did (details and the fix below): 81.8 -> 118.1 fps (medians of 3 interleaved runs each).
+
+**Recorder.** `KZ_TIMELINE=<file.csv>` (+ `KZ_TL_START`/`KZ_TL_END`, default 160..200 s of run time) writes one CSV row per event, QPC ns
+clock (`include/runtime/ps2_timeline.h`); `tools/scripts/tl_analyze.py <csv> [--frames N [K] | --dump T0_MS D_MS]` makes the tables below.
+The event list is in patches/README.md (0025). Runs: the task scene (`KZ_FPS=120 KZ_IPU=off`, scripted input), 235 s, build `build\tl`
+(MSVC, RelWithDebInfo), snapshot with `mkrun.ps1`; `tl_run.ps1`, `tl_ab.ps1`, `tl_boots.ps1` drive them. The recorder costs nothing
+measurable (81.4 fps in the first baseline run with it on, 79.0-80.8 fps in the A/B runs without it).
+
+**What the game does per frame** (from the generated code, confirmed by the hooks): the EE builds a frame list; `FUN_001759c0` spins until
+D1_CHCR.STR is clear (`FUN_00175948(0, 0x10009000, 0x100)`) and then sets the byte `0x55A795` (previous kick finished, the next may start);
+the vblank handler `FUN_00152018` -> `FUN_00151fc8` kicks only when that byte is set *and* the next buffer's state byte
+(`0x55A6E8 + (cur^1)`) is 2 (list finished); the kick `FUN_00150090` clears the byte, flips the buffer index and stores CHCR=0x145 (when D1 is
+still busy it calls an object method with a message first, then kicks anyway); `FUN_001759f8` waits, with a timeout, until the byte is set.
+So a frame list can only be kicked at a vblank.
+
+**Baseline timeline** (`work/tl2.csv`, window t=160..200 s, 81.4 fps by the vif counter, 82.1 D1 kicks/s; 4800 vblanks = 120.0/s):
+
+| candidate | measured | verdict |
+|---|---|---|
+| D1 completion reaches the EE late | kick -> worker job start 0.01 ms (median); job 4.49 ms (p90 5.48, max 11.5); kick -> completion posted 4.54 ms; posted -> applied on the EE 0.01 ms (max 0.27); no busy read of D1/D2 CHCR at all (0 `CHCR_BUSY` events), so the game's D1-idle spin never waits; completion later than one vblank after its kick in 3 of the 1432 frames that took >= 2 vblanks | not it |
+| game waits for the previous frame's DMA | the line above: `FUN_001759c0` finds STR clear on its first read | not it |
+| the kick only happens at a vblank | kick check at 4800 vblanks, (flag, next-buffer state): (1,2) 3208 = kick, **(1,0) 1554 = D1 free but the frame list not finished**, (0,*) 38 | the symptom: the EE's list is late for 32 % of the vblanks, see below |
+| kzgs `maxQueuedFrames=2` | frames queued after each push: always 1; frame-throttle waits 0; ring-full waits 0 | not it |
+| barriers | 2757 waits, 421 ms = 1.05 % of the window, all "VIF register write" in the vblank handler waiting for the 0.005 ms GS-half job | not it |
+| present-skip logic | 4710 of 4800 vblanks present (the game flips DISPFB every vblank, so the registers differ); `GSvsync` 0.13 ms | not it |
+| worker / GS capacity | worker busy 36.8 % (DMA jobs), GS thread busy 39.4 % = 3.3 ms per vblank | fits |
+| EE thread | asleep in `processDueDeadlines` (pacing) 55.2 % of the window; idle waits (no runnable guest thread, i.e. blocked on a semaphore / event flag) 0.0 % | see below |
+
+**Per-frame breakdown** (kick to kick; the game kicks once per frame, 0.38 ms after its vblank; "EE awake" = frame length minus the EE's
+sleeps; ms):
+
+| class | frames | length | EE awake | EE pacing sleep | D1 done after kick | worker job |
+|---|---|---|---|---|---|---|
+| 1 vblank | 1850 | 8.42 | 3.78 | 4.64 | 4.28 | 4.27 |
+| 2 vblanks | 1409 | 16.66 | **7.40** | **9.26** | 4.77 | 4.76 |
+| 3+ vblanks | 23 | 41.01 | 22.32 | 18.69 | 11.21 | 5.03 |
+
+In 1292 of the 1432 frames that took two or more vblanks the EE's awake time was under one vblank (8.33 ms). Twelve consecutive frames from
+t=19999 ms of the window: vblanks per frame 2 2 2 1 2 2 (19: a screenshot stall, below) 2 2 2 2 2 2, length 16-18 ms, EE awake 6.8-9.4 ms, D1 done 4.4-5.3 ms after the kick.
+
+**Critical path** (one 2-vblank frame, `work/tl2.csv` frame 1002; ms after its kick; clock = the EE cycle clock relative to the kick):
+```
+0.000  D1_KICK (its vblank was 0.4 ms ago); the worker starts the job 0.005 ms later
+3.473  EE goes to sleep, clock = +2 457 360 cycles: one vblank's cycles (2.46 M) are used up after 3.5 ms of host time
+5.475  worker job done, completion posted; the EE is woken by the event, applies it, sleeps on
+7.500  EE wakes at the host deadline of V1: VBLANK; kick check (flag 1, next buffer state 0): list not finished, no kick
+7.650  another sleep, 0.9 ms (the VBlankEnd event, 0.5 ms of guest time after the vblank)
+9.370  FUN_001bff10 entered, clock = +3 376 462 cycles
+12.310 EE sleeps again, clock = V1 + 2.46 M: the second vblank's cycles are used up
+16.444 VBLANK V2; kick check (1, 2); D1_KICK at 16.793
+```
+The worker (4.8 ms), its completion and the GS thread were done long before V1. The list was late because the EE thread's *guest cycle clock*
+reached each vblank's cycle deadline early and the scheduler put the thread to sleep until the host deadline (`EeScheduler::processDueDeadlines`:
+a scheduled event is due only when both its cycle deadline and its host deadline have passed). The cycles are an estimate charged per call /
+back edge (`ps2_cg.h`) and run 2-2.4x faster than wall time here (one vblank's 2.46 M cycles in 3.5-4.2 ms of EE time). A frame whose estimated
+work is over one vblank period's cycles (this one: 3.4 M; half the frames) takes two vblanks in the guest's time, however little host time it
+needed, and the EE sleeps for the rest (55 % of the window). In this frame the EE was awake for ~4.5 ms up to the limiter; without the sleeps the list
+would have been ready before V1 and kicked there. At 60 Hz the budget is 4.9 M cycles per vblank and every frame fits. So the critical path of
+a frame is the EE's estimated cycles rounded up to whole vblanks, not a wait on D1, the worker, kzgs or the GS. This corrects "The guest cycle
+estimate is not the limiter" in "EE thread frame budget": that test (a temporary `PS2X_EE_CYCLE_SCALE=0.5`) ran when the EE was the busiest
+stage (~100 % busy), where halving the charge could not show.
+
+**Fix: `PS2X_EE_CYCLE_SCALE`** (default `auto`, `=1` = old behaviour). `EeScheduler::checkpointDue` multiplies the cycles it charges by a
+factor; `auto` = vblank period / 60 Hz period, at most 1 (0.5 at 120 Hz, 0.417 at 144, 0.25 at 240, 1.0 at <= 60 Hz, where nothing changes). The
+game then gets the same estimated cycles per vblank as at its native 60 Hz (timers, IOP time and the iterations of guest spin loops per vblank are
+what they are at 60 Hz), like the frame-timer and fade corrections in `kz_timing`; it is the EE cycle rate setting of PCSX2. The order of DMA, VIF,
+GIF and GS accesses is decided by the guest program and the worker's FIFO, not by the clock, so the guest sees the same DMA/VIF/GS state; only
+the amount of guest code that runs between two vblanks changes. The wall-clock floor of the clock stays (`accountCycles`).
+
+**Measured.** fps = (vif counter at t=200 - at t=150) / 50, `tl_ab.ps1`: one instance at a time, order rotated per round, machine otherwise idle (CPU 8-12 %).
+
+| variant | runs (fps) | median |
+|---|---|---|
+| `PS2X_EE_CYCLE_SCALE=1` (old), final binary (`r_tl3`) | 82.1 / 81.8 / 81.2 | **81.8** |
+| default (auto = 0.5), final binary | 117.4 / 118.1 / 118.8 | **118.1** |
+| `=1` (old), first set (`r_tl2`, before removing an always-on kzgs trace hook) | 79.0 / 80.8 / 79.8 | 79.8 |
+| default (auto = 0.5), first set | 119.8 / 119.2 / 117.8 | 119.2 |
+| 0.75, 0.6 (one run each, `r_tl2`) | 105.6, 116.6 | |
+
+(Earlier old-clock runs of the same scene: 79.9 / 81.2 / 75.1 and 77.3 / 77.6 / 78.2, so the old clock spreads 75-82.) `KZ_FPS=240`, scale 0.25, one
+run: 178.7 fps. Timeline with the fix (`work/pm_tl.csv`, 117.7 kicks/s): 4680 of 4707 frames take one vblank (the others: 6 with two kicks in
+one vblank, 16 with two vblanks, 5 longer), kick check (1,0) 17 times (1554 before), EE awake 5.09 ms per frame (p90 7.2; over one vblank in 11
+frames = 0.2 %), EE pacing sleep 40 %, D1 job 3.8 ms, GS thread 38.6 % busy (3.2 ms per vblank); consecutive frames are 7.3-9.3 ms long, one
+vblank each. The two timelines are different runs of a non-deterministic scene (in the montages the fixed run reached the death screen earlier); the A/B table is
+the comparison, the timelines explain it.
+
+**Correctness.** 12 boots of 50 s, 3 at a time (`tl_boots.ps1`): all exit 0, `dma=` advances in every 10 s heartbeat (e.g. 1 -> 1438 -> 2930 ->
+4289 -> 5610; the boots, frames, WAV and verify runs are on the build before the last trace-hook change, and 12 more boots on the final binary gave the same); the same at `KZ_FPS=60` (no scale applied: the log has no `[sched] EE cycle clock scale` line and the code path is the old
+one), 144 (0.417) and 240 (0.25), 2 boots each; 2 boots of 100 s with `PS2X_STRESS_YIELD=97 KZ_CRASH_TRACE=1`; the only warning line is the
+known `unhandled import cdvdman:78`. `KZ_VU0_VERIFY=8 PS2X_LAZY_TIMERS=verify`, 235 s gameplay (118 fps): 6.7 M VU0 calls checked, 101 753 timer
+comparisons and 423 M early returns, 0 mismatches. Frames of the default vs the old clock (montages of every 10 s with `KZ_IPU=off`, every 5 s
+with `KZ_IPU` unset): Sony / Guerrilla logos, the intro movie with its shots at the same timestamps, the menu video backgrounds, profile /
+level / difficulty / character screens, the loading screen (further along at the same time with the faster clock), level, weapon, HUD, explosions
+and smoke, death screen: the same, no flicker, missing geometry or new artifacts. SPU2 WAV over 130 s with `KZ_IPU` unset: 130.01 s (old) vs
+130.00 s, per-10 s RMS and peaks equal (e.g. -15.5 / -15.3 dBFS, peaks 23 726 / 22 977 in both), same music (correlation 0.95 at a constant 5 ms
+offset; the movie segment matches at a 383 ms start offset, correlation 0.97), `kz_audio` reports 1.000x real time. No `TIMED OUT` lines. The
+game's simulation speed is unchanged: the vsync counter runs at 120.0/s in both and the frame timer counts vblank ticks; the scripted menu /
+tutorial steps reach the same scenes at the same times. What the scale can change is guest code with a fixed-iteration timeout that waits for
+something on host time (CD, IOP): it has less host time at 0.5. None was seen; loading screens, IOP RPC waits and the movie start passed in every run.
+
+**What limits fps now.** At 120 Hz nothing in the pipeline: EE awake 5.1 ms, worker 3.8-4.5 ms and GS thread 3.2 ms per vblank average against
+8.33 ms. The ~2 % missing to 120 are (a) the headless screenshot every 10 s (`KZ_SHOT_INTERVAL`): `saveShot` runs on the worker thread inside
+`runVsync` and stalls the pipeline for 130-175 ms (four such jobs in every 40 s window, t=160/170/180/190 s; ~0.6 s = 1.5 %; it is in the old
+numbers too), and (b) heavy frames, where the EE has the least headroom (awake p90 7.2 ms; 0.2 % of the frames are over one vblank). At 240 Hz
+(4.17 ms vblank) the stages no longer fit: 2-vblank frames have EE awake 6.4 ms and a 5.0 ms worker job (178.7 fps). Further gains at higher rates
+are the EE's guest code (clang-cl PGO took ~1.2 ms per frame off it, see "clang-cl build") and the VU1 side of the worker, not the hand-off.

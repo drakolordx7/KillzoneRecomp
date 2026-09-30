@@ -8,6 +8,7 @@
 #include "ps2_runtime.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/ps2_host_gs.h"
+#include "runtime/ps2_timeline.h"
 
 #include <SDL3/SDL.h>
 
@@ -328,9 +329,26 @@ namespace
         alignas(16) uint8_t regs[0x2000] = {};
     };
 
+    // kzgs trace hook -> timeline recorder (KZ_TIMELINE); see ext/kzgs/include/kzgs.h for the ids.
+    void onKzgsTrace(int id, uint32_t a)
+    {
+        using namespace ps2tl;
+        static const Id map[] = {Count, GS_IDLE_B, GS_IDLE_E, GS_VSYNC_B, GS_VSYNC_E, GS_THROTTLE_B, GS_THROTTLE_E, GS_RING_B, GS_RING_E, GS_QUEUED};
+        if (id >= 1 && id <= 9)
+            rec(map[id], a);
+    }
+
+    void runVsyncBody(VsyncJob *rawJob);
+
     void runVsync(void *arg)
     {
-        std::unique_ptr<VsyncJob> job(static_cast<VsyncJob *>(arg));
+        ps2tl::Span tl(ps2tl::VSYNC_B, ps2tl::VSYNC_E);
+        runVsyncBody(static_cast<VsyncJob *>(arg));
+    }
+
+    void runVsyncBody(VsyncJob *rawJob)
+    {
+        std::unique_ptr<VsyncJob> job(rawJob);
         GsState &s = gs();
         if (!s.attached.load(std::memory_order_acquire))
             return;
@@ -415,6 +433,8 @@ bool kzGsAttach(PS2Runtime &runtime, void *hwnd, int windowHeight, const KzConfi
     GsState &s = gs();
     s.runtime = &runtime;
     kzgsSetLogCallback(&onLog);
+    if (const char *tl = std::getenv("KZ_TIMELINE"); tl && *tl) // the hook costs a clock read per GS idle wait: only when recording
+        kzgsSetTraceHook(&onKzgsTrace);
     s.windowHeight = windowHeight;
     snapshotPrivRegs(s, s.privRegs);
     KzgsConfig kc = toKzgs(cfg, windowHeight);

@@ -130,3 +130,10 @@ bool kzgsReadback(std::vector<uint8_t>& rgba, int& width, int& height);
 // Optional sink for GS log lines (device info, warnings, errors). Called from the GS thread. nullptr = OutputDebugString.
 using KzgsLogFn = void (*)(int level /*0 error, 1 warning, 2 info*/, const char* msg);
 void kzgsSetLogCallback(KzgsLogFn fn);
+
+// Optional frame-pipeline trace sink (timeline recorder, patch 0025). Called from the GS thread and from the producer
+// thread, must be cheap and lock-free. id: 2 GS thread idle time in us since the previous frame (reported when a frame starts), 3/4 GS thread renders+presents a frame
+// begin/end, 5/6 producer waits for the GS thread (maxQueuedFrames) begin/end, 7/8 producer waits for ring space
+// begin/end, 9 frames queued (a) after a vsync was pushed. nullptr = off.
+using KzgsTraceFn = void (*)(int id, uint32_t a);
+void kzgsSetTraceHook(KzgsTraceFn fn);

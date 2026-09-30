@@ -613,3 +613,34 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
 
 - (no `0024`) clang-cl build: needed no `ext/PS2Recomp` change. The one compile fix is in `ext/kzvu` (main repo) and the flags are in the top-level `CMakeLists.txt`;
   see docs/findings.md "clang-cl build".
+
+- `0025-frame-pipeline.patch` (runtime: `include/runtime/ps2_timeline.h` (new), `Kernel/EeScheduler.cpp`, `include/runtime/ee_scheduler.h`, `ps2_vif1_worker.cpp`,
+  `ps2_runtime.cpp`; the rest is in the main repo: `ext/kzgs` (`kzgsSetTraceHook`), `src/kz_gs.cpp`, `src/kz_overrides.cpp`, `tools/scripts/tl_*`). No header that
+  generated code includes changed, so no regen. Gameplay at `KZ_FPS=120`: **81.8 -> 118.1 fps** (medians of 3 interleaved sequential runs each; a first set with an earlier build of the same change: 79.8 -> 119.2). Timeline, per-frame
+  breakdown, the measurements and the evidence: docs/findings.md "Frame pipeline timeline". The patch is the diff of those files against their state before this
+  work (it applies to that tree). Applying 0001-0023 one after another to a fresh checkout of the pinned commit fails at 0004 and at
+  0010, 0012, 0013, 0016 and 0018-0023 (not investigated: a failed patch leaves its files unpatched for the later ones), so the series has not been replay-tested.
+  - **Timeline recorder** (`KZ_TIMELINE=<file.csv>`, window `KZ_TL_START`/`KZ_TL_END` seconds of run time, default 160..200; nothing is recorded or allocated without
+    it, and the guest-function hooks are only installed with it). One 24-byte record per event (one relaxed `fetch_add` and a QPC read, ~30 ns), written as
+    CSV when the first event after the window arrives. Events: guest vblank (with the EE cycle clock), EE sleeps (pacing sleep in `processDueDeadlines`, idle wait),
+    VIF barriers that actually wait, completion apply (by scheduler event / barrier / register poll), DMAC interrupts queued, guest invocations (interrupt /
+    callback start and end with their pc), D1 kick (bytes, cycle clock), first busy / first idle read of D1/D2 CHCR, worker job begin/end (DMA / MSCAL /
+    GS half of the vblank), completion posted, kz `runVsync`, kzgs producer waits (frame throttle, ring full), GS thread frame begin/end and idle time, frames
+    queued; and entry/exit of the guest functions FUN_001bff10 (frame limiter), FUN_00150090 (the kick), FUN_00151fc8 (kick check in the vblank handler: flag,
+    next buffer state), FUN_00152018 (the vblank handler), FUN_001759c0 / FUN_001759f8 (only seen when called through the function table; the game calls them
+    directly, so they do not show). `tools/scripts/tl_analyze.py` turns a CSV into the summary and per-frame tables; `tl_run.ps1`, `tl_ab.ps1` (interleaved
+    sequential A/B runs, rotated order, CPU load logged) and `tl_boots.ps1` (N boots, exit code and `dma=` advance) drive the runs.
+  - **EE cycle clock scale** (`PS2X_EE_CYCLE_SCALE`, default `auto`; `=1` restores the old behaviour). The vblank event needs its cycle deadline *and* its
+    host deadline, and the cycles the guest code's checkpoints charge run 2-2.4x faster than wall time on this host (one vblank's 2.46 M cycles were used up in 3.5-4.2 ms of EE time), so a frame whose estimated work is more
+    than one vblank period's cycles (2.46 M at 120 Hz; a measured heavy frame cost 3.4 M) spans two vblanks although the host executed it in less than one; the EE then
+    sleeps in `processDueDeadlines` until the second vblank. `checkpointDue` now multiplies the charge by a Q16 factor. `auto` = 60 Hz period / vblank period,
+    at most 1 (0.5 at 120 Hz, 0.417 at 144, 0.25 at 240; 1 = unchanged at 60 Hz or below): the game gets the same estimated cycles per vblank as at its native 60 Hz,
+    so timers, IOP time and guest spin-loop iterations per vblank are what they are at 60 Hz (the same thing `kz_timing` does for the frame timer and the fade).
+    `<f>` sets a fixed factor, `0` makes the clock follow wall time only (`accountCycles` already floors it there).
+  - **Measured.** `KZ_FPS=120` scripted scene, fps = (vif at t=200 - vif at t=150) / 50, 3 rounds alternating `PS2X_EE_CYCLE_SCALE=1` / default, one instance at a
+    time: 82.1 / 81.8 / 81.2 -> 117.4 / 118.1 / 118.8 (medians 81.8 -> 118.1; first set 79.0 / 80.8 / 79.8 -> 119.8 / 119.2 / 117.8). Fixed factors, one run each: 0.75 -> 105.6, 0.6 -> 116.6.
+  - **Evidence.** 12 boots of 50 s (3 at a time) plus 2 each at `KZ_FPS=60` (no scale, nothing changed), 144 (0.417) and 240 (0.25) and 2 boots of 100 s with
+    `PS2X_STRESS_YIELD=97 KZ_CRASH_TRACE=1`: every boot exited 0 and `dma=` advanced in every heartbeat; `KZ_VU0_VERIFY=8 PS2X_LAZY_TIMERS=verify` 235 s gameplay: 6.7 M
+    VU0 calls and 101 k timer comparisons, 0 mismatches; frames (menus, intro movie and menu video backgrounds with `KZ_IPU` unset, loading screen, level, weapon,
+    HUD, explosions, death screen) as in the old clock; SPU2 WAV over 130 s: 130.01 s (old clock) vs 130.00 s (new), equal per-10 s RMS and peaks, same music (correlation 0.95 at
+    the usual constant offset); no `TIMED OUT` or new warning lines.

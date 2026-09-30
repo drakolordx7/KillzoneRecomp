@@ -123,6 +123,13 @@ namespace
 	static int s_max_queued_frames = 2;
 	static bool s_self_contained_packets = true;
 	static KzgsLogFn s_log_fn = nullptr;
+	static KzgsTraceFn s_trace_fn = nullptr;
+	static s64 s_trace_idle_ns = 0; // GS thread only
+	static inline void Trace(int id, u32 a = 0)
+	{
+		if (KzgsTraceFn fn = s_trace_fn)
+			fn(id, a);
+	}
 
 	static constexpr u32 Align16(u32 v) { return (v + 15u) & ~15u; }
 
@@ -137,8 +144,14 @@ namespace
 			const u64 to_end = RING_SIZE - pos;
 			const u64 required = (need <= to_end) ? need : (to_end + need);
 			u64 r = s_read_pos.load(std::memory_order_acquire);
+			bool ring_waited = false;
 			while ((RING_SIZE - (s_local_write - r)) < required)
 			{
+				if (!ring_waited)
+				{
+					ring_waited = true;
+					Trace(7);
+				}
 				s_producer_waiting.store(1, std::memory_order_seq_cst);
 				r = s_read_pos.load(std::memory_order_seq_cst);
 				if ((RING_SIZE - (s_local_write - r)) >= required)
@@ -147,6 +160,8 @@ namespace
 				r = s_read_pos.load(std::memory_order_acquire);
 			}
 			s_producer_waiting.store(0, std::memory_order_relaxed);
+			if (ring_waited)
+				Trace(8);
 
 			if (need > to_end)
 			{
@@ -351,6 +366,8 @@ namespace
 		for (;;)
 		{
 			u64 w = s_write_pos.load(std::memory_order_acquire);
+			const bool was_idle = (w == r);
+			const auto idle_t0 = was_idle && s_trace_fn ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 			while (w == r)
 			{
 				s_consumer_sleeping.store(1, std::memory_order_seq_cst);
@@ -361,6 +378,8 @@ namespace
 				w = s_write_pos.load(std::memory_order_acquire);
 			}
 			s_consumer_sleeping.store(0, std::memory_order_relaxed);
+			if (was_idle && s_trace_fn)
+				s_trace_idle_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - idle_t0).count();
 
 			const CmdHeader hdr = *reinterpret_cast<const CmdHeader*>(s_ring + (r % RING_SIZE));
 			const u8* payload = s_ring + (r % RING_SIZE) + sizeof(CmdHeader);
@@ -378,7 +397,11 @@ namespace
 				case Cmd::Vsync:
 				{
 					ApplyVsyncRegs(*reinterpret_cast<const VsyncPayload*>(payload));
+					Trace(2, static_cast<u32>(s_trace_idle_ns / 1000)); // idle time (us) since the previous frame
+					s_trace_idle_ns = 0;
+					Trace(3);
 					GSvsync(hdr.a, hdr.b != 0);
+					Trace(4);
 					s_queued_frames.fetch_sub(1, std::memory_order_acq_rel);
 					s_queued_frames.notify_all();
 				}
@@ -593,11 +616,17 @@ void kzgsVsync(int field, bool regsWritten)
 	// Frame pacing: don't let the game run more than N frames ahead of the GPU.
 	s32 queued = s_queued_frames.fetch_add(1, std::memory_order_acq_rel) + 1;
 	Push(Cmd::Vsync, static_cast<u32>(field & 1), regsWritten ? 1u : 0u, &p, sizeof(p));
+	Trace(9, static_cast<u32>(queued));
+	const bool throttled = queued > s_max_queued_frames;
+	if (throttled)
+		Trace(5);
 	while (queued > s_max_queued_frames)
 	{
 		s_queued_frames.wait(queued, std::memory_order_acquire);
 		queued = s_queued_frames.load(std::memory_order_acquire);
 	}
+	if (throttled)
+		Trace(6);
 }
 
 void kzgsWriteCSR(uint32_t csr)
@@ -665,4 +694,9 @@ void kzgs::RunOnGSThread(std::function<void()> fn)
 void kzgsSetLogCallback(KzgsLogFn fn)
 {
 	s_log_fn = fn;
+}
+
+void kzgsSetTraceHook(KzgsTraceFn fn)
+{
+	s_trace_fn = fn;
 }
