@@ -355,3 +355,10 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
     are not propagated to the guest in threaded mode (Killzone never enables them). VU0 microcode that reads VU1
     registers through VU0 memory (0x4000+) is not synchronised with the worker (none of the 103 captured Killzone VU0
     calls touches them). GIF/VIF1 completion interrupts now arrive ~1-15 ms after the CHCR store instead of inside it.
+
+- `0018-scheduler-event-fastpath.patch`: `EeScheduler::processPendingEvents` runs on nearly every scheduler iteration
+  and took two locks, allocated/freed a `std::deque` and read the host clock (deadline scan) even with nothing to do
+  (~24% of the game thread in a 120 Hz profile). Now: an atomic queued-event count skips the lock + deque when empty,
+  the checkpoint flag is recomputed lock-free (re-checked against a concurrent post), and `processDueDeadlines`
+  returns immediately while the EE cycle is below the earliest deadline. Killzone at 120 Hz vblank, gameplay-only
+  window, 3 runs: ~46 -> 68-76 frames/s.

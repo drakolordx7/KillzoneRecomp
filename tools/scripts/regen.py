@@ -6,6 +6,9 @@ delete stale ones.
 Usage: python tools/scripts/regen.py
 """
 import filecmp, os, re, shutil, subprocess, sys, tomllib
+
+# Killzone ships the register-locals code generator (patch 0017); PS2X_CODEGEN=classic regenerates the old style.
+os.environ.setdefault('PS2X_CODEGEN', 'locals')
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
