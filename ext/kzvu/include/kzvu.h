@@ -1,7 +1,10 @@
 // kzvu - PCSX2's VU1 (microVU x86-64 recompiler, VU interpreter fallback) as a static library.
 //
-// One VU1 per process. All functions must be called from the same host thread (the game thread); nothing in kzvu
-// is thread-safe and there is no MTVU thread.
+// One VU1 per process. Nothing in kzvu is thread-safe, but the two VUs may run on two host threads: every VU1 function
+// (kzvuExecute, kzvuContinue, kzvuSetTop, kzvuSetFBRST for VU1, kzvuMicroWritten, the XGKICK callback, ...) must be
+// called from ONE thread that has called kzvuBindVu1Thread() first, and every VU0 function (kzvu0*) from another one.
+// Without kzvuBindVu1Thread() all functions belong to the same thread, as before. Once VU1 code has been compiled on a
+// thread, VU1 must stay on that thread (the JIT embeds per-thread state addresses). There is no MTVU thread in kzvu.
 //
 // GPL-3.0+ (PCSX2 code).
 #pragma once
@@ -46,6 +49,11 @@ struct KzvuConfig
 	// VU0 clamp mode (same meaning as clampMode); -1 = use clampMode.
 	int vu0ClampMode = -1;
 };
+
+// Makes the calling thread the VU1 thread (see the top of this file). Call it on that thread before its first VU1 call,
+// and before any VU1 program has run anywhere. VU0/VU1 then use separate VPU_STAT / FBRST words and separate
+// pending-interrupt and FBRST state, so a VU0 call on the EE thread can overlap a VU1 program on this one.
+void kzvuBindVu1Thread();
 
 // Allocates the 64 MB code cache, resets all VU1 state and applies `cfg`. Calling it again re-applies the config.
 bool kzvuInit(const KzvuConfig& cfg, std::string* err = nullptr);
@@ -99,6 +107,27 @@ uint32_t kzvuVpuStat();
 bool kzvuTakeInterrupt();
 // Total VU1 cycles executed since kzvuInit.
 uint64_t kzvuCycles();
+
+// ---- diagnostics: microVU1's recompiler state (read only; call from the VU1 thread) -------------------------------------
+struct KzvuVu1CodeStats
+{
+	uint64_t codeBytes;       // JIT code emitted so far in the current cache (drops back to ~0 when the cache is reset)
+	uint64_t cacheBytes;      // size of the cache before it resets
+	uint32_t programsCreated; // microPrograms created since the last cache reset
+	uint32_t programsCached;  // microPrograms currently in the per-startPC lists
+};
+void kzvuVu1CodeStats(KzvuVu1CodeStats* out);
+struct KzvuVu1ProgDiff
+{
+	uint32_t programs;  // programs cached for this start PC
+	uint32_t ranges;    // compiled ranges of the compared program
+	uint32_t wordIndex; // first micro-memory word (32-bit index) that differs from the cached program, ~0u = identical
+	uint32_t oldWord;
+	uint32_t newWord;
+};
+// Compares VU1 micro memory with cached program number `which` (0 = most recently used) for `startPcBytes`, over the
+// ranges it was compiled for. False if there is no such program.
+bool kzvuVu1DiffCachedProgram(uint32_t startPcBytes, uint32_t which, KzvuVu1ProgDiff* out);
 // Number of GIF packets delivered to the XGKICK callback since kzvuInit.
 uint64_t kzvuXgkickCount();
 

@@ -47,3 +47,11 @@
 #define EmuConfig kzvu_EmuConfig
 #define gifUnit kzvu_gifUnit
 #define vu1Thread kzvu_vu1Thread
+
+// VU0 (PCSX2: `static VURegs& VU0 = vuRegs[0]`) becomes a per-thread pointer. VU1 code reads and writes VU0's VPU_STAT and
+// FBRST registers (busy / D-T stop bits, D/T enables); with VU1 on its own host thread and VU0 on the EE thread those
+// are separate words, or the two VUs' unlocked read-modify-writes would lose each other's updates. A thread that ran
+// kzvuBindVu1Thread() sees a private VURegs there (the JIT embeds the address at compile time on the compiling
+// thread, so microVU1 code compiled on that thread uses it too); every other thread sees vuRegs[0].
+// Header code parsed before this point keeps the original reference.
+#define VU0 (*kzvu_vu0)

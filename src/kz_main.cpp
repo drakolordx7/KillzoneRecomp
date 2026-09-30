@@ -204,7 +204,9 @@ int main(int argc, char *argv[])
         {
             double start = 0, duration = 20;
             std::sscanf(prof, "%lf,%lf", &start, &duration);
-            kzStartProfiler(start, duration, "work/profile.txt");
+            // KZ_PROFILE_OUT=<file> keeps concurrent runs from overwriting each other's profile.
+            const char *profOut = std::getenv("KZ_PROFILE_OUT");
+            kzStartProfiler(start, duration, profOut && *profOut ? profOut : "work/profile.txt");
         }
 
         PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();

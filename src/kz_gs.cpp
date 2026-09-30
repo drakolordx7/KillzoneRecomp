@@ -102,11 +102,11 @@ namespace
         return k;
     }
 
-    // Runtime GSRegisters -> PCSX2 GSPrivRegSet layout (see kzgs.h).
-    void snapshotPrivRegs(GsState &s)
+    // Runtime GSRegisters -> PCSX2 GSPrivRegSet layout (see kzgs.h), into `out` (0x2000 bytes).
+    void snapshotPrivRegs(GsState &s, uint8_t *out)
     {
         const GSRegisters &r = s.runtime->memory().gs();
-        auto put = [&s](uint32_t off, uint64_t v) { std::memcpy(s.privRegs + off, &v, 8); };
+        auto put = [out](uint32_t off, uint64_t v) { std::memcpy(out + off, &v, 8); };
         // sceGsResetGraph is an HLE stub in the runtime and never programs the CRTC sync registers. PCSX2 derives the
         // video mode from SMODE1.CMOD/LC (0 = VESA, wrong display rules) and field flipping from SYNCV.VFP, so fall
         // back to the NTSC values libgraph writes.
@@ -235,8 +235,37 @@ namespace
             std::fwrite(data, size, 1, t.f);
     }
 
+    // KZ_GS_HASH=1: one line per vsync with the number of GIF packets per path and an order-sensitive FNV-1a hash of
+    // every packet since the previous vsync (path, size, bytes). Used to compare the packet stream of the synchronous
+    // and the threaded VIF1 path (same game state -> same hashes). Only touched from the thread that feeds kzgs.
+    struct FrameHash
+    {
+        bool enabled = std::getenv("KZ_GS_HASH") && std::getenv("KZ_GS_HASH")[0] == '1';
+        uint64_t h = 0xcbf29ce484222325ull;
+        uint32_t packets[4] = {};
+        void add(const void *p, size_t n)
+        {
+            const uint8_t *b = static_cast<const uint8_t *>(p);
+            for (size_t i = 0; i < n; ++i)
+                h = (h ^ b[i]) * 0x100000001b3ull;
+        }
+    };
+    FrameHash &frameHash()
+    {
+        static FrameHash f;
+        return f;
+    }
+
     void onGifPacket(int path, const uint8_t *data, uint32_t sizeBytes)
     {
+        if (FrameHash &fh = frameHash(); fh.enabled)
+        {
+            const uint32_t hdr[2] = {static_cast<uint32_t>(path), sizeBytes};
+            fh.add(hdr, sizeof(hdr));
+            fh.add(data, sizeBytes);
+            if (path >= 1 && path <= 3)
+                ++fh.packets[path];
+        }
         if (trace().active(gs().frames.load(std::memory_order_relaxed)))
             traceRecord(1, static_cast<uint32_t>(path), data, sizeBytes);
         if (path >= 1 && path <= 3)
@@ -285,11 +314,22 @@ namespace
                      static_cast<unsigned long long>(g_imageTransfers.load()), static_cast<unsigned long long>(g_lastBitblt.load()));
     }
 
-    void onVsync(uint64_t, int field)
+    // The GS half of a guest vblank. With the runtime's VIF1 worker thread it runs on that thread, after every GIF packet
+    // queued before the vblank (PS2HostGs::vsyncOrdered); otherwise inline. `job` carries the privileged registers as the
+    // EE saw them at the vblank.
+    struct VsyncJob
     {
+        int field = 0;
+        alignas(16) uint8_t regs[0x2000] = {};
+    };
+
+    void runVsync(void *arg)
+    {
+        std::unique_ptr<VsyncJob> job(static_cast<VsyncJob *>(arg));
         GsState &s = gs();
-        kzTimingOnVsync(s.runtime->memory().getRDRAM());
-        kzPatchesApply(s.runtime->memory().getRDRAM(), kzConfig());
+        if (!s.attached.load(std::memory_order_acquire))
+            return;
+        const int field = job->field;
         {
             std::lock_guard<std::mutex> lock(s.pendingMutex);
             if (s.resizePending)
@@ -303,7 +343,7 @@ namespace
                 s.configPending = false;
             }
         }
-        snapshotPrivRegs(s);
+        std::memcpy(s.privRegs, job->regs, sizeof(s.privRegs));
         if (trace().active(s.frames.load(std::memory_order_relaxed)))
         {
             traceRecord(2, static_cast<uint32_t>(field), s.privRegs, sizeof(s.privRegs));
@@ -311,6 +351,14 @@ namespace
         }
         else if (trace().f && s.frames.load(std::memory_order_relaxed) == trace().start + trace().frames)
             std::fflush(trace().f), std::fprintf(stderr, "[kz] GS trace complete\n");
+        if (FrameHash &fh = frameHash(); fh.enabled)
+        {
+            std::fprintf(stderr, "[gshash] f=%llu p1=%u p2=%u p3=%u h=%016llx\n",
+                         static_cast<unsigned long long>(s.frames.load(std::memory_order_relaxed)), fh.packets[1],
+                         fh.packets[2], fh.packets[3], static_cast<unsigned long long>(fh.h));
+            fh.h = 0xcbf29ce484222325ull;
+            fh.packets[1] = fh.packets[2] = fh.packets[3] = 0;
+        }
         kzgsVsync(field, true);
         s.frames.fetch_add(1, std::memory_order_relaxed);
         debugLine(s);
@@ -323,6 +371,17 @@ namespace
                 saveShot(s, std::chrono::duration_cast<std::chrono::seconds>(now - s.start).count());
             }
         }
+    }
+
+    void onVsync(uint64_t, int field)
+    {
+        GsState &s = gs();
+        kzTimingOnVsync(s.runtime->memory().getRDRAM());
+        kzPatchesApply(s.runtime->memory().getRDRAM(), kzConfig());
+        auto *job = new VsyncJob;
+        job->field = field;
+        snapshotPrivRegs(s, job->regs);
+        ps2RunAfterQueuedGif(&runVsync, job);
     }
 
     void onLog(int level, const char *msg)
@@ -339,7 +398,7 @@ bool kzGsAttach(PS2Runtime &runtime, void *hwnd, int windowHeight, const KzConfi
     s.runtime = &runtime;
     kzgsSetLogCallback(&onLog);
     s.windowHeight = windowHeight;
-    snapshotPrivRegs(s);
+    snapshotPrivRegs(s, s.privRegs);
     KzgsConfig kc = toKzgs(cfg, windowHeight);
     if (!kzgsOpen(hwnd, kc, s.privRegs, error))
         return false;
@@ -347,6 +406,7 @@ bool kzGsAttach(PS2Runtime &runtime, void *hwnd, int windowHeight, const KzConfi
     PS2HostGs hooks;
     hooks.gifPacket = &onGifPacket;
     hooks.vsync = &onVsync;
+    hooks.vsyncOrdered = true; // onVsync sends its GS half through ps2RunAfterQueuedGif
     // Killzone never reads GS memory back (traces: only host->local transfers), so kzgs alone consumes the GIF
     // stream. KZ_SW_GS=1 keeps the runtime's software GS processing in parallel (debug).
     hooks.exclusive = !(std::getenv("KZ_SW_GS") && std::getenv("KZ_SW_GS")[0] == '1');
@@ -359,8 +419,10 @@ bool kzGsAttach(PS2Runtime &runtime, void *hwnd, int windowHeight, const KzConfi
 void kzGsDetach()
 {
     GsState &s = gs();
-    if (!s.attached.exchange(false))
+    if (!s.attached.load())
         return;
+    ps2FlushQueuedGif(); // vsync jobs still queued on the VIF1 worker use kzgs
+    s.attached = false;
     ps2SetHostGs(PS2HostGs{});
     kzgsClose();
 }

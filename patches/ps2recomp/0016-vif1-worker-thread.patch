@@ -1,0 +1,1587 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 4ee586f..08727b4 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -390,6 +390,8 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_vfs.cpp
+     src/lib/ps2_runtime.cpp
+     src/lib/ps2_vif1_interpreter.cpp
++    src/lib/ps2_vif1_worker.cpp
++    src/lib/ps2_vif1_worker_win.cpp
+     src/lib/vu/ps2_vu1_core.cpp
+     src/lib/vu/ps2_vu1_upper.cpp
+     src/lib/vu/ps2_vu1_lower.cpp
+diff --git a/ps2xRuntime/include/runtime/ps2_host_gs.h b/ps2xRuntime/include/runtime/ps2_host_gs.h
+index 74fd8a2..fd252e8 100644
+--- a/ps2xRuntime/include/runtime/ps2_host_gs.h
++++ b/ps2xRuntime/include/runtime/ps2_host_gs.h
+@@ -14,11 +14,24 @@ struct PS2HostGs
+     // its VRAM uploads, register state and vertex work on the EE thread). Only valid for games that never read GS
+     // memory back through the built-in GS (local->host transfers).
+     bool exclusive = false;
++    // true: `vsync` splits its work. Whatever has to happen on the EE thread at the vblank (guest memory patches) runs
++    // in the hook itself; the part that talks to the GS runs through ps2RunAfterQueuedGif(), so with the VIF1 worker
++    // thread the EE does not have to wait for the worker to finish the frame's GIF packets first. false: the runtime
++    // waits for the worker before calling `vsync` (the hook may then do everything inline).
++    bool vsyncOrdered = false;
+ };
+ 
+ void ps2SetHostGs(const PS2HostGs &hooks);
+ const PS2HostGs &ps2HostGs();
+ 
++// Calls fn(arg) after every GIF packet queued so far (PATH1/2/3, from DMA started before this call) has been handed to
++// the host GS: inline on the calling thread when the VIF1/VU1/GIF work is synchronous (or when called from the worker
++// itself), otherwise later on the VIF1 worker thread, in order with the GIF work. The caller does not wait; it must keep
++// `arg` alive until fn ran (fn usually deletes it).
++void ps2RunAfterQueuedGif(void (*fn)(void *), void *arg);
++// Blocks until the worker has run everything queued so far (any thread except the worker). Teardown helper.
++void ps2FlushQueuedGif();
++
+ // Guest vblank period (default 16667 us, NTSC). The host may raise the vblank rate (e.g. for high refresh output);
+ // takes effect from the next scheduled vblank.
+ void ps2SetVblankPeriodMicros(uint32_t micros);
+diff --git a/ps2xRuntime/include/runtime/ps2_host_vu.h b/ps2xRuntime/include/runtime/ps2_host_vu.h
+index 79ebec1..eeef139 100644
+--- a/ps2xRuntime/include/runtime/ps2_host_vu.h
++++ b/ps2xRuntime/include/runtime/ps2_host_vu.h
+@@ -1,19 +1,22 @@
+-#pragma once
+-
+-#include <cstdint>
+-
+-// Optional host VU1 (e.g. a recompiling VU). When set before PS2Memory::initialize(), VU1 code/data memory is the
+-// host's (never freed by the runtime), and MSCAL/MSCNT from VIF1 run the host VU instead of the built-in interpreter.
+-// codeGeneration increments whenever VU1 code memory was written (MPG or direct stores) since the runtime started;
+-// the host uses it to invalidate recompiled programs. vpuStat is VU0 VPU_STAT; the host updates the VU1 bits.
+-// Called on the EE game thread.
+-struct PS2HostVu1
+-{
+-    uint8_t *codeMem = nullptr; // 16 KB
+-    uint8_t *dataMem = nullptr; // 16 KB
+-    void (*mscal)(uint32_t startPcBytes, uint32_t top, uint32_t itop, uint32_t fbrst, uint64_t codeGeneration, uint32_t *vpuStat) = nullptr;
+-    void (*mscnt)(uint32_t top, uint32_t itop, uint32_t fbrst, uint64_t codeGeneration, uint32_t *vpuStat) = nullptr;
+-};
+-
+-void ps2SetHostVu1(const PS2HostVu1 &hooks);
+-const PS2HostVu1 &ps2HostVu1();
++#pragma once
++
++#include <cstdint>
++
++// Optional host VU1 (e.g. a recompiling VU). When set before PS2Memory::initialize(), VU1 code/data memory is the
++// host's (never freed by the runtime), and MSCAL/MSCNT from VIF1 run the host VU instead of the built-in interpreter.
++// codeGeneration increments whenever VU1 code memory was written (MPG or direct stores) since the runtime started;
++// the host uses it to invalidate recompiled programs. vpuStat is VU0 VPU_STAT; the host updates the VU1 bits.
++// Called on the EE game thread, or, with the VIF1 worker thread (PS2X_VIF1_THREAD, default on), on that worker thread:
++// then every mscal/mscnt call and every XGKICK it produces runs on the worker, never on the EE thread.
++struct PS2HostVu1
++{
++    uint8_t *codeMem = nullptr; // 16 KB
++    uint8_t *dataMem = nullptr; // 16 KB
++    void (*mscal)(uint32_t startPcBytes, uint32_t top, uint32_t itop, uint32_t fbrst, uint64_t codeGeneration, uint32_t *vpuStat) = nullptr;
++    void (*mscnt)(uint32_t top, uint32_t itop, uint32_t fbrst, uint64_t codeGeneration, uint32_t *vpuStat) = nullptr;
++    // Optional: called once on the VIF1 worker thread before it runs its first job (per-thread host VU setup).
++    void (*bindWorkerThread)() = nullptr;
++};
++
++void ps2SetHostVu1(const PS2HostVu1 &hooks);
++const PS2HostVu1 &ps2HostVu1();
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 4ea4687..c6e2579 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "ps2_log.h"
+ #include "../ps2_iop_post.h"
++#include "../ps2_vif1_worker.h"
+ #include "ps2_runtime_macros.h"
+ 
+ #include <algorithm>
+@@ -2009,6 +2010,16 @@ void EeScheduler::processEvent(const EeEvent &event)
+         }
+         m_vsyncFlagAddress = 0u;
+         m_vsyncTickAddress = 0u;
++        // Threaded VIF1/GIF: the frame's GIF packets must all be in the host GS before its vsync marker: wait for the
++        // worker, unless the host's vsync hook orders itself behind the worker's queue (PS2HostGs::vsyncOrdered). The
++        // worker's D/T-stop enables follow the guest's FBRST, sampled here.
++        if (ps2Vif1Active())
++        {
++            if (!ps2HostGs().vsyncOrdered || ps2Vif1ForceVsyncBarrier())
++                ps2Vif1Barrier(Vif1BarrierReason::Vsync);
++            if (const R5900Context *fbrstCtx = currentContext())
++                ps2Vif1SetFbrst(fbrstCtx->vu0_fbrst);
++        }
+         if (const auto hostVsync = ps2HostGs().vsync)
+             hostVsync(m_vsyncTick, (m_vsyncTick & 1u) != 0u ? 1 : 0);
+         completeVSync(m_vsyncTick);
+@@ -2035,6 +2046,8 @@ void EeScheduler::processEvent(const EeEvent &event)
+         // Wake-up for work the IOP thread posted (threaded IOP mode): apply it here, on the EE thread.
+         if (event.id == kIopPostedWorkEventId)
+             ps2IopDrainPosted(m_runtime);
++        else if (event.id == kVif1WorkerEventId)
++            ps2Vif1ApplyEvent(m_runtime); // VIF1/GIF worker finished a DMA job: CHCR/D_STAT/DMAC handlers
+         break;
+     case EeEventType::Alarm:
+     {
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index 7b3437c..d7b84c2 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -1,6 +1,8 @@
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include "runtime/ps2_host_gs.h"
++#include "../ps2_vif1_worker.h"
+ #include <algorithm>
++#include <chrono>
+ #include <cstring>
+ 
+ namespace
+@@ -116,7 +118,17 @@ void GifArbiter::drain()
+         if (!pkt.data.empty())
+         {
+             if (g_hostGs.gifPacket)
+-                g_hostGs.gifPacket(static_cast<int>(pkt.pathId), pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
++            {
++                if (ps2Vif1StatsEnabled() && ps2Vif1OnWorkerThread())
++                {
++                    const auto t0 = std::chrono::steady_clock::now();
++                    g_hostGs.gifPacket(static_cast<int>(pkt.pathId), pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
++                    ps2Vif1StatAddGifNs(static_cast<uint64_t>(
++                        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()));
++                }
++                else
++                    g_hostGs.gifPacket(static_cast<int>(pkt.pathId), pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
++            }
+             if (!(g_hostGs.gifPacket && g_hostGs.exclusive) ||
+                 packetWritesGsEvent(pkt.data.data(), static_cast<uint32_t>(pkt.data.size())))
+                 m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index e079404..e5ff0c9 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -2,6 +2,7 @@
+ #include "runtime/ps2_host_vu0.h"
+ #include "runtime/ps2_host_ipu.h"
+ #include "runtime/ps2_dma_stats.h"
++#include "ps2_vif1_worker.h"
+ #include <cstdlib>
+ #include <functional>
+ #include "runtime/ps2_memory.h"
+@@ -362,6 +363,7 @@ PS2Memory::PS2Memory()
+ 
+ PS2Memory::~PS2Memory()
+ {
++    ps2Vif1WorkerShutdown();
+     if (m_rdram)
+     {
+         delete[] m_rdram;
+@@ -442,6 +444,7 @@ bool PS2Memory::initialize(size_t ramSize)
+         m_vu1Data = nullptr;
+     };
+ 
++    ps2Vif1WorkerShutdown();
+     cleanup();
+     m_seenGifCopy = false;
+     m_dmaStartCount.store(0, std::memory_order_relaxed);
+@@ -733,11 +736,16 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
+     {
+         return ptr;
+     }
++    // VU1 memory belongs to the VIF1 worker thread while it has work: wait for it before the EE touches it.
+     if (const uint8_t *ptr = mapRange(PS2_VU1_CODE_BASE, PS2_VU1_CODE_SIZE, m_vu1Code))
+     {
++        ps2Vif1Barrier(Vif1BarrierReason::Vu1Memory);
+         return ptr;
+     }
+-    return mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
++    const uint8_t *dataPtr = mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
++    if (dataPtr)
++        ps2Vif1Barrier(Vif1BarrierReason::Vu1Memory);
++    return dataPtr;
+ }
+ 
+ uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
+@@ -1278,6 +1286,7 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+     {
+         alignas(16) uint8_t fifoData[16];
+         _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
++        ps2Vif1Barrier(Vif1BarrierReason::VifFifo);
+         processVIF1Data(fifoData, sizeof(fifoData));
+         return;
+     }
+@@ -1429,6 +1438,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+     if (address >= 0x10003C00u && address < 0x10003E00u)
+     {
+         m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
++        // vif1_regs and the VIF1/PATH3 state are owned by the VIF1 worker while it has work.
++        if (address != 0x10003C00u && address != 0x10003C20u)
++            ps2Vif1Barrier(Vif1BarrierReason::VifRegister);
+ 
+         switch (address)
+         {
+@@ -1562,7 +1574,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+                     // Only a runaway guard: Killzone gameplay frames are ~4400 tags in one VIF1 chain (PCSX2 savestate).
+                     const int kMaxChainTags = 1 << 20;
+-                    std::vector<uint8_t> chainBuf;
++                    std::vector<uint8_t> chainBuf = ps2ChainBufferAcquire(channelBase);
++                    const uint64_t walkStart = ps2Vif1StatsEnabled() ? ps2Vif1NowNs() : 0u;
+ 
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+                     {
+@@ -1749,6 +1762,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         if (tagsProcessed >= kMaxChainTags)
+                             st.vif1ChainTagLimit.fetch_add(1, std::memory_order_relaxed);
+                     }
++                    ps2ChainBufferNoteSize(channelBase, chainBuf.size());
++                    if (walkStart)
++                        ps2Vif1StatAddWalkNs(ps2Vif1NowNs() - walkStart);
+                     m_ioRegisters[channelBase + 0x30] = tagAddr;
+                     m_ioRegisters[channelBase + 0x40] = asr0;
+                     m_ioRegisters[channelBase + 0x50] = asr1;
+@@ -1776,6 +1792,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             m_pendingVif0Transfers.push_back(std::move(pt));
+                         }
+                     }
++                    else
++                        ps2ChainBufferRecycle(std::move(chainBuf));
+                     // else if (channelBase == 0x10009000u)
+                     // {
+ 
+@@ -1790,7 +1808,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     (channelBase == 0x1000A000u) ? (m_gifPacketCallback || m_gifArbiter != nullptr) : true;
+                 if (autoProcessTransfers)
+                 {
+-                    processPendingTransfers();
++                    // Threaded VIF1/GIF: hand the snapshotted transfers to the worker (CHCR.STR stays set until it is done).
++                    if (!ps2Vif1DispatchAsync(*this))
++                        processPendingTransfers();
+                 }
+             }
+         }
+@@ -2102,6 +2122,8 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
+ 
+ void PS2Memory::processPendingTransfers()
+ {
++    // Synchronous entry (HLE stubs, VIF0 transfers): the worker must be idle and its completions applied first.
++    ps2Vif1Barrier(Vif1BarrierReason::SyncTransfer);
+     const bool hadGif = !m_pendingGifTransfers.empty();
+     uint32_t observedGifQwc = 0u;
+     for (const auto &transfer : m_pendingGifTransfers)
+@@ -2181,6 +2203,8 @@ void PS2Memory::processPendingTransfers()
+             }
+         }
+     }
++    for (auto &p : m_pendingGifTransfers)
++        ps2ChainBufferRecycle(std::move(p.chainData));
+     m_pendingGifTransfers.clear();
+ 
+     const bool hadVif0 = !m_pendingVif0Transfers.empty();
+@@ -2239,6 +2263,8 @@ void PS2Memory::processPendingTransfers()
+             }
+         }
+     }
++    for (auto &p : m_pendingVif0Transfers)
++        ps2ChainBufferRecycle(std::move(p.chainData));
+     m_pendingVif0Transfers.clear();
+ 
+     const bool hadVif1 = !m_pendingVif1Transfers.empty();
+@@ -2297,6 +2323,8 @@ void PS2Memory::processPendingTransfers()
+             }
+         }
+     }
++    for (auto &p : m_pendingVif1Transfers)
++        ps2ChainBufferRecycle(std::move(p.chainData));
+     m_pendingVif1Transfers.clear();
+ 
+     if (m_gifArbiter)
+@@ -2387,6 +2415,7 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t
+ {
+     if (!data || sizeBytes < 16)
+         return;
++    ps2Vif1Barrier(Vif1BarrierReason::GifSubmit); // no-op on the worker itself
+ 
+     if (pathId == GifPathId::Path3)
+     {
+@@ -2411,6 +2440,7 @@ void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
+ {
+     if (!m_rdram || qwCount == 0)
+         return;
++    ps2Vif1Barrier(Vif1BarrierReason::GifSubmit);
+     const uint64_t bytes64 = static_cast<uint64_t>(qwCount) * 16ull;
+     uint32_t sizeBytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
+     uint32_t bytesLeft = sizeBytes;
+@@ -2724,6 +2754,9 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+         return g_hostIpu.read32(address);
+     if (address == 0x1000E010u && g_hostIpu.poll)
+         g_hostIpu.poll();
++    // Threaded VIF1/GIF: DMA status the EE reads may have completed on the worker; apply it now.
++    if ((address >= 0x10009000u && address < 0x1000A100u) || address == 0x1000E010u)
++        ps2Vif1PollCompletions();
+     size_t timerIndex = 0u;
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+@@ -2785,6 +2818,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+ 
+     if (address == 0x10003020u) // GIF_STAT
+     {
++        ps2Vif1Barrier(Vif1BarrierReason::GifStat); // M3P is the worker's PATH3 mask state
+         uint32_t stat = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
+         const uint32_t mode = m_ioRegisters.count(0x10003010u) ? m_ioRegisters[0x10003010u] : 0u;
+         const uint32_t ctrl = m_ioRegisters.count(0x10003000u) ? m_ioRegisters[0x10003000u] : 0u;
+@@ -2805,6 +2839,8 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+         {
+             if ((address & 0xFF) == 0x00)
+             {
++                if ((address == 0x10009000u || address == 0x1000A000u) && ps2Vif1ChannelBusy(address))
++                    return m_ioRegisters[address] | 0x100u; // a worker job is still running: STR stays set
+                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
+                 m_ioRegisters[address] = channelStatus;
+                 return channelStatus;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 06e5347..af6dcb9 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -16,6 +16,7 @@
+ #include "runtime/ps2_host_vu.h"
+ #include "runtime/ps2_host_vu0.h"
+ #include "runtime/ps2_dma_stats.h"
++#include "ps2_vif1_worker.h"
+ #include <array>
+ #include <cstdio>
+ 
+@@ -814,6 +815,7 @@ bool PS2Runtime::syncCoreSubsystems()
+     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
+                                     { m_gs.processGIFPacket(data, size); });
+     m_memory.setGifArbiter(&m_gifArbiter);
++    ps2Vif1WorkerBind(*this, m_memory); // PS2X_VIF1_THREAD: VIF1/VU1/GIF on a worker thread
+     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
+                                  {
+                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 8c45bb9..5d9ebf7 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,6 +1,7 @@
+ // Based on Blackline Interactive implementation
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_dma_stats.h"
++#include "ps2_vif1_worker.h"
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -77,9 +78,190 @@ namespace
+         return legacy;
+     }
+ 
++    // PS2X_VIF_UNPACK_FAST=0 turns the plain-UNPACK fast path off (A/B measurements).
++    bool unpackFastEnabled()
++    {
++        static const bool on = []
++        {
++            const char *v = std::getenv("PS2X_VIF_UNPACK_FAST");
++            return !(v && *v == '0');
++        }();
++        return on;
++    }
++
++    // PS2X_MPG_SKIP_SAME=0: bump the VU1 code generation on every MPG, even when the bytes did not change.
++    bool mpgSkipSameEnabled()
++    {
++        static const bool on = []
++        {
++            const char *v = std::getenv("PS2X_MPG_SKIP_SAME");
++            return !(v && *v == '0');
++        }();
++        return on;
++    }
++
+     // Bytes of source data per vector, by VN<<2|VL (PCSX2 nVifT).
+     constexpr uint8_t kVifGsize[16] = {4, 2, 1, 0, 8, 4, 2, 0, 12, 6, 3, 0, 16, 8, 4, 2};
+ 
++    // ---- UNPACK fast path ------------------------------------------------------------------------------------------
++    // Plain UNPACK (no mask, STMOD 0, not fill mode: WL <= CL) is nearly all of Killzone's ~8700 UNPACKs per frame. The
++    // generic loop below does per-element bounds checks and a per-field mask/mode switch for every quadword; here each
++    // vector is one SSE load/convert/store, for the vectors whose source lies entirely inside the data (the rest, the
++    // tail, still goes through the generic loop, so out-of-range reads stay zero). V3 reads four elements like V4 (W is
++    // the first element of the next vector), so V3-n loads the same bytes as V4-n.
++    struct ConvV4_32
++    {
++        static __m128i load(const uint8_t *p) { return _mm_loadu_si128(reinterpret_cast<const __m128i *>(p)); }
++    };
++    struct ConvV2_32
++    {
++        static __m128i load(const uint8_t *p)
++        {
++            return _mm_shuffle_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i *>(p)), _MM_SHUFFLE(1, 0, 1, 0));
++        }
++    };
++    struct ConvS_32
++    {
++        static __m128i load(const uint8_t *p)
++        {
++            uint32_t v;
++            std::memcpy(&v, p, 4);
++            return _mm_set1_epi32(static_cast<int32_t>(v));
++        }
++    };
++    template <bool Usn>
++    struct ConvV4_16
++    {
++        static __m128i load(const uint8_t *p)
++        {
++            const __m128i h = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(p));
++            return Usn ? _mm_cvtepu16_epi32(h) : _mm_cvtepi16_epi32(h);
++        }
++    };
++    template <bool Usn>
++    struct ConvV2_16
++    {
++        static __m128i load(const uint8_t *p)
++        {
++            uint32_t v;
++            std::memcpy(&v, p, 4);
++            const __m128i h = _mm_cvtsi32_si128(static_cast<int32_t>(v));
++            return _mm_shuffle_epi32(Usn ? _mm_cvtepu16_epi32(h) : _mm_cvtepi16_epi32(h), _MM_SHUFFLE(1, 0, 1, 0));
++        }
++    };
++    template <bool Usn>
++    struct ConvS_16
++    {
++        static __m128i load(const uint8_t *p)
++        {
++            uint16_t v;
++            std::memcpy(&v, p, 2);
++            return _mm_set1_epi32(Usn ? static_cast<int32_t>(v) : static_cast<int32_t>(static_cast<int16_t>(v)));
++        }
++    };
++    template <bool Usn>
++    struct ConvV4_8
++    {
++        static __m128i load(const uint8_t *p)
++        {
++            uint32_t v;
++            std::memcpy(&v, p, 4);
++            const __m128i b = _mm_cvtsi32_si128(static_cast<int32_t>(v));
++            return Usn ? _mm_cvtepu8_epi32(b) : _mm_cvtepi8_epi32(b);
++        }
++    };
++    template <bool Usn>
++    struct ConvV2_8
++    {
++        static __m128i load(const uint8_t *p)
++        {
++            uint16_t v;
++            std::memcpy(&v, p, 2);
++            const __m128i b = _mm_cvtsi32_si128(static_cast<int32_t>(v));
++            return _mm_shuffle_epi32(Usn ? _mm_cvtepu8_epi32(b) : _mm_cvtepi8_epi32(b), _MM_SHUFFLE(1, 0, 1, 0));
++        }
++    };
++    template <bool Usn>
++    struct ConvS_8
++    {
++        static __m128i load(const uint8_t *p)
++        {
++            return _mm_set1_epi32(Usn ? static_cast<int32_t>(*p) : static_cast<int32_t>(static_cast<int8_t>(*p)));
++        }
++    };
++    struct ConvV4_5
++    {
++        static __m128i load(const uint8_t *p)
++        {
++            uint16_t v;
++            std::memcpy(&v, p, 2);
++            return _mm_set_epi32(static_cast<int32_t>((v & 0x8000u) >> 8), static_cast<int32_t>((v & 0x7C00u) >> 7),
++                                 static_cast<int32_t>((v & 0x03E0u) >> 2), static_cast<int32_t>((v & 0x001Fu) << 3));
++        }
++    };
++
++    template <class Conv>
++    uint32_t unpackPlainRun(uint8_t *vuMem, uint32_t vuMemSize, uint32_t &addr, uint32_t &vcl, uint32_t &src,
++                            uint32_t count, uint32_t vsize, uint32_t wl, uint32_t skipBytes, const uint8_t *data)
++    {
++        uint32_t a = addr, c = vcl, s = src;
++        const uint32_t wrap = vuMemSize - 16u;
++        for (uint32_t i = 0; i < count; ++i)
++        {
++            _mm_storeu_si128(reinterpret_cast<__m128i *>(vuMem + (a & wrap)), Conv::load(data + s));
++            a += 16u;
++            ++c;
++            s += vsize;
++            if (c >= wl)
++            {
++                a += skipBytes;
++                c = 0u;
++            }
++        }
++        addr = a;
++        vcl = c;
++        src = s;
++        return count;
++    }
++
++    // Number of leading vectors handled (updates addr/vcl/src); 0 if none.
++    uint32_t unpackPlain(uint32_t vnvl, bool usn, uint8_t *vuMem, uint32_t vuMemSize, uint32_t &addr, uint32_t &vcl,
++                         uint32_t &src, uint32_t num, uint32_t wl, uint32_t skipBytes, const uint8_t *data,
++                         uint32_t dataBytes)
++    {
++        const uint32_t vsize = kVifGsize[vnvl];
++        const uint32_t vn = vnvl >> 2;
++        const uint32_t elem = vnvl == 15u ? 2u : (4u >> (vnvl & 3u));
++        const uint32_t need = (vn == 2u) ? vsize + elem : vsize; // V3 also reads the first element of the next vector
++        if (dataBytes < need)
++            return 0u;
++        const uint32_t count = std::min<uint32_t>(num, 1u + (dataBytes - need) / vsize);
++#define KZ_UNPACK_RUN(CONV) return unpackPlainRun<CONV>(vuMem, vuMemSize, addr, vcl, src, count, vsize, wl, skipBytes, data)
++#define KZ_UNPACK_RUN_USN(CONV) \
++    if (usn) \
++        KZ_UNPACK_RUN(CONV<true>); \
++    KZ_UNPACK_RUN(CONV<false>)
++        switch (vnvl)
++        {
++        case 0: KZ_UNPACK_RUN(ConvS_32);
++        case 1: KZ_UNPACK_RUN_USN(ConvS_16);
++        case 2: KZ_UNPACK_RUN_USN(ConvS_8);
++        case 4: KZ_UNPACK_RUN(ConvV2_32);
++        case 5: KZ_UNPACK_RUN_USN(ConvV2_16);
++        case 6: KZ_UNPACK_RUN_USN(ConvV2_8);
++        case 8: KZ_UNPACK_RUN(ConvV4_32);
++        case 9: KZ_UNPACK_RUN_USN(ConvV4_16);
++        case 10: KZ_UNPACK_RUN_USN(ConvV4_8);
++        case 12: KZ_UNPACK_RUN(ConvV4_32);
++        case 13: KZ_UNPACK_RUN_USN(ConvV4_16);
++        case 14: KZ_UNPACK_RUN_USN(ConvV4_8);
++        case 15: KZ_UNPACK_RUN(ConvV4_5);
++        default: return 0u;
++        }
++#undef KZ_UNPACK_RUN_USN
++#undef KZ_UNPACK_RUN
++    }
++
+     // VIF1 UNPACK with PCSX2's semantics (Vif_Unpack.cpp: vifUnpackSetup, _nVifUnpackLoop, UNPACK_S/V2/V4/V4_5,
+     // writeXYZW):
+     //  - WL = 0 means 256; fill mode is CL < WL. In fill mode the source pointer only advances for the first CL
+@@ -91,7 +273,7 @@ namespace
+     //  - The destination address wraps in VU1 memory (0x3FF0).
+     // data/dataBytes is the source stream for this UNPACK; reads past it return zero.
+     void vif1UnpackPcsx2(uint8_t *vuMem, uint32_t vuMemSize, VIFRegisters &regs, uint32_t cmd, const uint8_t *data,
+-                         uint32_t dataBytes)
++                         uint32_t dataBytes, bool allowFast = true)
+     {
+         const uint32_t upk = (cmd >> 24) & 0x1Fu; // mask bit | VN | VL
+         const uint32_t vnvl = upk & 0xFu;
+@@ -139,7 +321,10 @@ namespace
+ 
+         uint32_t src = 0u;  // byte offset of the current source vector
+         uint32_t vcl = 0u;  // write-cycle counter (PCSX2 vif.cl)
+-        for (uint32_t n = 0; n < num; ++n)
++        uint32_t n = 0u;
++        if (allowFast && unpackFastEnabled() && !isFill && !doMask && mode == 0u)
++            n = unpackPlain(vnvl, usn, vuMem, vuMemSize, addr, vcl, src, num, wl, skipBytes, data, dataBytes);
++        for (; n < num; ++n)
+         {
+             uint32_t in[4];
+             if (vnvl == 15u)
+@@ -211,6 +396,50 @@ namespace
+         regs.num = 0u;
+     }
+ 
++    // PS2X_VIF_UNPACK_CHECK=<n>: runs every n-th UNPACK twice, with and without the fast path, from the same VU1 memory /
++    // VIF state, and reports differences (count and the first few) on stderr.
++    uint32_t unpackCheckEvery()
++    {
++        static const uint32_t every = []
++        {
++            const char *v = std::getenv("PS2X_VIF_UNPACK_CHECK");
++            return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u;
++        }();
++        return every;
++    }
++
++    void checkedUnpack(uint8_t *vuMem, uint32_t vuMemSize, VIFRegisters &regs, uint32_t cmd, const uint8_t *data,
++                       uint32_t dataBytes)
++    {
++        static uint64_t counter = 0, checked = 0, mismatches = 0;
++        static std::vector<uint8_t> before, fastOut;
++        if ((counter++ % unpackCheckEvery()) != 0u)
++        {
++            vif1UnpackPcsx2(vuMem, vuMemSize, regs, cmd, data, dataBytes, true);
++            return;
++        }
++        before.assign(vuMem, vuMem + vuMemSize);
++        const VIFRegisters regsBefore = regs;
++        vif1UnpackPcsx2(vuMem, vuMemSize, regs, cmd, data, dataBytes, true);
++        fastOut.assign(vuMem, vuMem + vuMemSize);
++        const VIFRegisters regsFast = regs;
++        std::memcpy(vuMem, before.data(), vuMemSize);
++        regs = regsBefore;
++        vif1UnpackPcsx2(vuMem, vuMemSize, regs, cmd, data, dataBytes, false);
++        ++checked;
++        const bool same = std::memcmp(fastOut.data(), vuMem, vuMemSize) == 0 &&
++                          std::memcmp(&regsFast, &regs, sizeof(regs)) == 0;
++        if (!same)
++        {
++            if (++mismatches <= 8)
++                std::fprintf(stderr, "[vif1-unpack-check] MISMATCH cmd=%08x cycle=%04x mode=%u mask=%08x bytes=%u\n", cmd,
++                             regsBefore.cycle, regsBefore.mode, regsBefore.mask, dataBytes);
++        }
++        if ((checked % 200000u) == 0u)
++            std::fprintf(stderr, "[vif1-unpack-check] checked=%llu mismatches=%llu\n",
++                         static_cast<unsigned long long>(checked), static_cast<unsigned long long>(mismatches));
++    }
++
+     void writeFile(const std::string &path, const void *data, size_t size)
+     {
+         if (FILE *f = std::fopen(path.c_str(), "wb"))
+@@ -530,6 +759,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ {
+     if (sizeBytes == 0u)
+         return;
++    // VIF1 state belongs to the worker thread while it has work (no-op when this is the worker).
++    ps2Vif1Barrier(Vif1BarrierReason::Other);
+ 
+     if (Vif1Dump *dump = vif1Dump())
+     {
+@@ -665,7 +896,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             vif1_regs.stat ^= (1u << 7); // toggle DBF
+ 
+             count(st.vif1Mscal);
+-            if (m_vu1MscalCallback)
++            // Threaded mode: the host VU1 only ever runs on the worker thread (see ps2_vif1_worker.h).
++            if (!ps2Vif1Mscal(startPC, runTop, runItop) && m_vu1MscalCallback)
+                 m_vu1MscalCallback(startPC, runTop, runItop);
+             continue;
+         }
+@@ -684,7 +916,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             vif1_regs.stat ^= (1u << 7); // toggle DBF
+ 
+             count(st.vif1Mscnt);
+-            if (m_vu1MscntCallback)
++            if (!ps2Vif1Mscnt(runTop, runItop) && m_vu1MscntCallback)
+                 m_vu1MscntCallback(runTop, runItop);
+             continue;
+         }
+@@ -727,8 +959,17 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
+                 if (pos + copyBytes <= sizeBytes)
+                 {
+-                    std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
+-                    markVU1CodeModified();
++                    // The game re-sends microcode all the time; an upload that changes nothing must not invalidate the
++                    // host VU's recompiled programs (each generation change makes the next MSCALs search the program
++                    // lists again).
++                    const bool same = std::memcmp(m_vu1Code + destAddr, data + pos, copyBytes) == 0;
++                    if (!same || !mpgSkipSameEnabled())
++                    {
++                        std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
++                        markVU1CodeModified();
++                    }
++                    if (ps2Vif1StatsEnabled())
++                        ps2Vif1StatMpg(same);
+                 }
+             }
+             pos += mpgBytes;
+@@ -841,7 +1082,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                                                         : writeVectorCount;
+                 const uint32_t srcBytes = (srcVectors * kVifGsize[opcode & 0xFu] + 3u) & ~3u;
+                 if (m_vu1Data && pos + srcBytes <= sizeBytes)
+-                    vif1UnpackPcsx2(m_vu1Data, PS2_VU1_DATA_SIZE, vif1_regs, cmd, data + pos, srcBytes);
++                {
++                    if (unpackCheckEvery() == 0u)
++                        vif1UnpackPcsx2(m_vu1Data, PS2_VU1_DATA_SIZE, vif1_regs, cmd, data + pos, srcBytes);
++                    else
++                        checkedUnpack(m_vu1Data, PS2_VU1_DATA_SIZE, vif1_regs, cmd, data + pos, srcBytes);
++                }
+                 pos += srcBytes;
+                 if (pos > sizeBytes)
+                     break;
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_worker.cpp b/ps2xRuntime/src/lib/ps2_vif1_worker.cpp
+new file mode 100644
+index 0000000..15eb62a
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_vif1_worker.cpp
+@@ -0,0 +1,707 @@
++#include "ps2_vif1_worker.h"
++
++#include "ps2_runtime.h"
++#include "runtime/ee_scheduler.h"
++#include "runtime/gs/ps2_gif_arbiter.h"
++#include "runtime/ps2_host_gs.h"
++#include "runtime/ps2_host_vu.h"
++#include "runtime/ps2_memory.h"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <deque>
++#include <exception>
++#include <functional>
++#include <immintrin.h>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++namespace
++{
++    using Clock = std::chrono::steady_clock;
++
++    constexpr uint32_t kVif1Channel = 0x10009000u;
++    constexpr uint32_t kGifChannel = 0x1000A000u;
++    constexpr uint32_t kDStat = 0x1000E010u;
++
++    struct Job
++    {
++        std::vector<std::vector<uint8_t>> gif;  // PATH3 packets, submitted (undrained) first, as the synchronous code did
++        std::vector<std::vector<uint8_t>> vif1; // buffers for processVIF1Data, in order
++        bool hadGif = false;
++        bool hadVif1 = false;
++        std::function<void()> call; // if set: run this on the worker instead (MSCAL from the EE thread)
++    };
++
++    struct Completion
++    {
++        bool hadGif;
++        bool hadVif1;
++    };
++
++    struct Stats
++    {
++        bool enabled = false;
++        std::atomic<uint64_t> jobs{0};
++        std::atomic<uint64_t> jobBytes{0};
++        std::atomic<uint64_t> dispatchNs{0}; // EE: transfer -> job conversion + enqueue
++        std::atomic<uint64_t> walkNs{0};     // EE: DMA chain walk + snapshot copy (in the DMA-start store)
++        std::atomic<uint64_t> mpgs{0};       // MPG uploads
++        std::atomic<uint64_t> mpgsSame{0};   // ... that did not change VU1 code memory
++        std::atomic<uint64_t> workerNs{0};   // worker: time inside jobs
++        std::atomic<uint64_t> vuNs{0};       // worker: time inside the host VU1 (MSCAL/MSCNT, includes XGKICK -> GS)
++        std::atomic<uint64_t> gifNs{0};      // worker: time inside the host GS packet hook
++        std::atomic<uint64_t> barriers[static_cast<size_t>(Vif1BarrierReason::Count)]{};
++        std::atomic<uint64_t> barrierWaits[static_cast<size_t>(Vif1BarrierReason::Count)]{};
++        std::atomic<uint64_t> barrierNs[static_cast<size_t>(Vif1BarrierReason::Count)]{};
++        std::atomic<uint64_t> busyReads{0};
++        std::atomic<uint64_t> syncFallbacks{0};
++    };
++
++    struct Worker
++    {
++        std::atomic<bool> active{false};
++        PS2Runtime *runtime = nullptr;
++        PS2Memory *memory = nullptr;
++        bool disabledByEnv = false;
++        Stats stats;
++
++        std::thread thread;
++        bool started = false;
++        uint32_t mxcsr = 0;
++
++        std::mutex mutex; // queue + idle signalling
++        std::condition_variable cv;
++        std::condition_variable idleCv;
++        std::deque<Job> queue;
++        bool stop = false;
++        std::atomic<uint32_t> pending{0};     // jobs in the queue (written under mutex, read by the spinning worker)
++        uint64_t enqueued = 0;                // EE thread only (written under mutex)
++        std::atomic<uint64_t> finished{0};    // worker
++
++        std::mutex doneMutex;
++        std::vector<Completion> done;
++        std::atomic<uint64_t> doneCount{0}; // completions pushed by the worker
++        uint64_t applied = 0;               // EE thread only: completions applied
++        int outstanding[3] = {0, 0, 0};     // EE thread only, by channel index (1 VIF1, 2 GIF)
++
++        std::atomic<uint32_t> fbrst{0};
++        uint32_t vpuStat = 0; // worker only: sink for the host VU1's VPU_STAT bits
++        uint32_t delayUs = 0; // PS2X_VIF1_DELAY_US: sleep before every job (stress test)
++    };
++
++    Worker g;
++    thread_local bool t_onWorker = false;
++
++    uint64_t nowNs()
++    {
++        return static_cast<uint64_t>(
++            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
++    }
++
++    void raiseDStat(PS2Memory &m, uint32_t channelBit)
++    {
++        uint32_t dstat = m.m_ioRegisters.count(kDStat) ? m.m_ioRegisters[kDStat] : 0u;
++        dstat |= (1u << channelBit);
++        const uint32_t status = dstat & 0x3FFu;
++        const uint32_t mask = (dstat >> 16) & 0x3FFu;
++        if ((status & mask) != 0u)
++            dstat |= (1u << 31);
++        else
++            dstat &= ~(1u << 31);
++        m.m_ioRegisters[kDStat] = dstat;
++    }
++
++    void printStats(uint64_t elapsedMs)
++    {
++        Stats &s = g.stats;
++        std::fprintf(stderr,
++                     "[vif1-thread] t=%llums jobs=%llu bytes=%llu mpg=%llu(same %llu) walk=%.2fms dispatch=%.2fms worker=%.2fms (vu1 %.2fms, hostgs %.2fms) busyReads=%llu syncFallbacks=%llu barriers:",
++                     static_cast<unsigned long long>(elapsedMs), static_cast<unsigned long long>(s.jobs.exchange(0)),
++                     static_cast<unsigned long long>(s.jobBytes.exchange(0)),
++                     static_cast<unsigned long long>(s.mpgs.exchange(0)),
++                     static_cast<unsigned long long>(s.mpgsSame.exchange(0)), s.walkNs.exchange(0) / 1e6,
++                     s.dispatchNs.exchange(0) / 1e6,
++                     s.workerNs.exchange(0) / 1e6, s.vuNs.exchange(0) / 1e6, s.gifNs.exchange(0) / 1e6,
++                     static_cast<unsigned long long>(s.busyReads.exchange(0)),
++                     static_cast<unsigned long long>(s.syncFallbacks.exchange(0)));
++        static const char *names[] = {"vu1mem", "vifreg", "gifstat", "viffifo", "gifsubmit", "sync", "vsync", "other"};
++        for (size_t i = 0; i < static_cast<size_t>(Vif1BarrierReason::Count); ++i)
++        {
++            const uint64_t n = s.barriers[i].exchange(0);
++            const uint64_t w = s.barrierWaits[i].exchange(0);
++            const uint64_t ns = s.barrierNs[i].exchange(0);
++            if (n)
++                std::fprintf(stderr, " %s=%llu(wait %llu, %.2fms)", names[i], static_cast<unsigned long long>(n),
++                             static_cast<unsigned long long>(w), ns / 1e6);
++        }
++        std::fprintf(stderr, "\n");
++    }
++
++    void runJob(Job &job)
++    {
++        PS2Memory &m = *g.memory;
++        if (job.call)
++        {
++            job.call();
++            return;
++        }
++        for (const auto &buf : job.gif)
++            m.submitGifPacket(GifPathId::Path3, buf.data(), static_cast<uint32_t>(buf.size()), false);
++        for (const auto &buf : job.vif1)
++            m.processVIF1Data(buf.data(), static_cast<uint32_t>(buf.size()));
++        if (m.m_gifArbiter)
++            m.m_gifArbiter->drain();
++    }
++
++    void workerMain()
++    {
++        t_onWorker = true;
++        _mm_setcsr(g.mxcsr);
++        ps2Vif1TuneWorkerThread();
++        if (const auto bind = ps2HostVu1().bindWorkerThread)
++            bind();
++        const uint64_t statsStart = nowNs();
++        uint64_t lastPrint = statsStart;
++        for (;;)
++        {
++            Job job;
++            // The game often waits for a channel to go idle before it starts the next DMA (loading screens do this
++            // hundreds of times a second), so a job's latency matters: spin briefly for the next job before sleeping.
++            for (int spin = 0; spin < 4000 && g.pending.load(std::memory_order_acquire) == 0; ++spin)
++                _mm_pause();
++            {
++                std::unique_lock<std::mutex> lock(g.mutex);
++                g.cv.wait(lock, [] { return g.stop || !g.queue.empty(); });
++                if (g.queue.empty())
++                    return; // stop requested and nothing left
++                job = std::move(g.queue.front());
++                g.queue.pop_front();
++                g.pending.fetch_sub(1, std::memory_order_release);
++            }
++            if (g.delayUs)
++            {
++                // stress test: a slow worker (busy wait: sleep_for granularity is the 15.6 ms timer tick)
++                const uint64_t until = nowNs() + static_cast<uint64_t>(g.delayUs) * 1000ull;
++                while (nowNs() < until)
++                    _mm_pause();
++            }
++            const uint64_t t0 = g.stats.enabled ? nowNs() : 0u;
++            try
++            {
++                runJob(job);
++            }
++            catch (const std::exception &e)
++            {
++                std::fprintf(stderr, "[vif1-thread] job failed: %s\n", e.what());
++            }
++            catch (...)
++            {
++                std::fprintf(stderr, "[vif1-thread] job failed (unknown exception)\n");
++            }
++            if (g.stats.enabled)
++            {
++                const uint64_t t1 = nowNs();
++                g.stats.workerNs.fetch_add(t1 - t0, std::memory_order_relaxed);
++                if (t1 - lastPrint >= 10'000'000'000ull)
++                {
++                    lastPrint = t1;
++                    printStats((t1 - statsStart) / 1'000'000ull);
++                }
++            }
++            for (auto &buf : job.gif)
++                ps2ChainBufferRecycle(std::move(buf));
++            for (auto &buf : job.vif1)
++                ps2ChainBufferRecycle(std::move(buf));
++            job.gif.clear();
++            job.vif1.clear();
++            const bool completes = job.hadGif || job.hadVif1;
++            if (completes)
++            {
++                {
++                    std::lock_guard<std::mutex> lock(g.doneMutex);
++                    g.done.push_back(Completion{job.hadGif, job.hadVif1});
++                }
++                g.doneCount.fetch_add(1, std::memory_order_release);
++            }
++            {
++                std::lock_guard<std::mutex> lock(g.mutex);
++                g.finished.fetch_add(1, std::memory_order_release);
++            }
++            g.idleCv.notify_all();
++            if (completes && g.runtime)
++                g.runtime->postEeEvent(EeEvent{EeEventType::Dmac, kVif1WorkerEventId, 0u});
++        }
++    }
++
++    void ensureStarted()
++    {
++        if (g.started)
++            return;
++        g.started = true;
++        g.mxcsr = _mm_getcsr(); // the game thread's FTZ/DAZ setting
++        g.thread = std::thread(workerMain);
++        std::atexit([] { ps2Vif1WorkerShutdown(); });
++    }
++
++    void enqueue(Job &&job)
++    {
++        ensureStarted();
++        {
++            std::lock_guard<std::mutex> lock(g.mutex);
++            g.queue.push_back(std::move(job));
++            ++g.enqueued;
++            g.pending.fetch_add(1, std::memory_order_release);
++        }
++        g.cv.notify_one();
++    }
++
++    // EE thread. Applies finished jobs: what the synchronous processPendingTransfers() did after the data was consumed.
++    void applyCompletions()
++    {
++        std::vector<Completion> local;
++        {
++            std::lock_guard<std::mutex> lock(g.doneMutex);
++            local.swap(g.done);
++        }
++        if (local.empty())
++            return;
++        PS2Memory &m = *g.memory;
++        for (const Completion &c : local)
++        {
++            ++g.applied;
++            if (c.hadGif)
++            {
++                raiseDStat(m, 2u);
++                m.queueCompletedDmacCause(2u);
++                if (--g.outstanding[2] <= 0)
++                {
++                    g.outstanding[2] = 0;
++                    m.m_ioRegisters[kGifChannel + 0x00u] &= ~0x100u;
++                    m.m_ioRegisters[kGifChannel + 0x20u] = 0u;
++                }
++            }
++            if (c.hadVif1)
++            {
++                raiseDStat(m, 1u);
++                m.queueCompletedDmacCause(1u);
++                if (--g.outstanding[1] <= 0)
++                {
++                    g.outstanding[1] = 0;
++                    m.m_ioRegisters[kVif1Channel + 0x00u] &= ~0x100u;
++                    m.m_ioRegisters[kVif1Channel + 0x20u] = 0u;
++                }
++            }
++        }
++    }
++
++    // Splits a normal-mode (MADR/QWC) transfer into the chunks the synchronous code processed one by one, copying the
++    // source now: the game may overwrite the buffer after the DMA start.
++    void snapshotNormal(PS2Memory &m, const PS2Memory::PendingTransfer &p, bool gifMode, uint64_t &bytesOut,
++                        std::vector<std::vector<uint8_t>> &out)
++    {
++        if (p.qwc == 0)
++            return;
++        const uint64_t bytes64 = static_cast<uint64_t>(p.qwc) * 16ull;
++        const uint32_t sizeBytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
++        uint32_t srcPhys = 0;
++        try
++        {
++            srcPhys = m.translateAddress(p.srcAddr);
++        }
++        catch (const std::exception &)
++        {
++            return;
++        }
++        const uint8_t *base = p.fromScratchpad ? m.m_scratchpad : m.m_rdram;
++        const uint32_t limit = p.fromScratchpad ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
++        uint32_t left = sizeBytes;
++        while (gifMode ? left >= 16u : left > 0u)
++        {
++            if (srcPhys >= limit)
++                srcPhys = 0;
++            uint32_t chunk = left;
++            if (srcPhys + chunk > limit)
++                chunk = limit - srcPhys;
++            if (chunk == 0)
++                break;
++            out.emplace_back(base + srcPhys, base + srcPhys + chunk);
++            bytesOut += chunk;
++            if (gifMode)
++            {
++                m.m_seenGifCopy = true;
++                m.m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
++            }
++            left -= chunk;
++            srcPhys += chunk;
++        }
++    }
++}
++
++void ps2Vif1WorkerBind(PS2Runtime &runtime, PS2Memory &memory)
++{
++    // Rebinding (a new memory image) stops the previous worker first.
++    ps2Vif1WorkerShutdown();
++    const char *v = std::getenv("PS2X_VIF1_THREAD");
++    g.disabledByEnv = v && *v == '0';
++    const PS2HostVu1 &vu = ps2HostVu1();
++    const bool hostVu = vu.mscal != nullptr && vu.mscnt != nullptr;
++    g.runtime = &runtime;
++    g.memory = &memory;
++    const char *dl = std::getenv("PS2X_VIF1_DELAY_US");
++    g.delayUs = dl ? static_cast<uint32_t>(std::strtoul(dl, nullptr, 10)) : 0u;
++    const char *st = std::getenv("PS2X_VIF1_STATS");
++    g.stats.enabled = st && *st && *st != '0';
++    g.active.store(!g.disabledByEnv && hostVu, std::memory_order_release);
++    std::fprintf(stderr, "[vif1-thread] %s%s\n", g.active.load() ? "threaded VIF1/VU1/GIF" : "synchronous VIF1/VU1/GIF",
++                 g.disabledByEnv ? " (PS2X_VIF1_THREAD=0)" : (hostVu ? "" : " (no host VU1)"));
++}
++
++bool ps2Vif1Active()
++{
++    return g.active.load(std::memory_order_relaxed);
++}
++
++bool ps2Vif1ForceVsyncBarrier()
++{
++    static const bool force = []
++    {
++        const char *v = std::getenv("PS2X_VIF1_VSYNC_SYNC");
++        return v && *v && *v != '0';
++    }();
++    return force;
++}
++
++bool ps2Vif1OnWorkerThread()
++{
++    return t_onWorker;
++}
++
++bool ps2Vif1DispatchAsync(PS2Memory &m)
++{
++    if (!g.active.load(std::memory_order_relaxed) || t_onWorker)
++        return false;
++    if (!m.m_pendingVif0Transfers.empty())
++    {
++        // VIF0 (VU0 memory, EE thread) keeps the synchronous path: it also drains the arbiter, so it needs the worker idle.
++        if (g.stats.enabled)
++            g.stats.syncFallbacks.fetch_add(1, std::memory_order_relaxed);
++        return false;
++    }
++    if (m.m_pendingGifTransfers.empty() && m.m_pendingVif1Transfers.empty())
++        return true;
++
++    const uint64_t t0 = g.stats.enabled ? nowNs() : 0u;
++
++    // GIF_STAT.FQC as the synchronous code reported it (EE-side register).
++    uint32_t observedGifQwc = 0u;
++    for (const auto &transfer : m.m_pendingGifTransfers)
++    {
++        const uint64_t transferQwc = !transfer.chainData.empty() ? (transfer.chainData.size() / 16u) : transfer.qwc;
++        observedGifQwc = static_cast<uint32_t>(std::min<uint64_t>(16u, static_cast<uint64_t>(observedGifQwc) + transferQwc));
++    }
++    if (observedGifQwc != 0u)
++    {
++        constexpr uint32_t kGifStat = 0x10003020u;
++        constexpr uint32_t kGifFqcMask = 0x1F000000u;
++        uint32_t &gifStat = m.m_ioRegisters[kGifStat];
++        gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
++    }
++
++    Job job;
++    uint64_t bytes = 0;
++    job.hadGif = !m.m_pendingGifTransfers.empty();
++    job.hadVif1 = !m.m_pendingVif1Transfers.empty();
++    for (auto &p : m.m_pendingGifTransfers)
++    {
++        if (!p.chainData.empty())
++        {
++            m.m_seenGifCopy = true;
++            m.m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
++            bytes += p.chainData.size();
++            job.gif.push_back(std::move(p.chainData));
++        }
++        else if (p.qwc > 0)
++            snapshotNormal(m, p, true, bytes, job.gif);
++    }
++    for (auto &p : m.m_pendingVif1Transfers)
++    {
++        if (!p.chainData.empty())
++        {
++            bytes += p.chainData.size();
++            job.vif1.push_back(std::move(p.chainData));
++        }
++        else if (p.qwc > 0)
++            snapshotNormal(m, p, false, bytes, job.vif1);
++    }
++    m.m_pendingGifTransfers.clear();
++    m.m_pendingVif1Transfers.clear();
++
++    if (job.hadGif)
++        ++g.outstanding[2];
++    if (job.hadVif1)
++        ++g.outstanding[1];
++    enqueue(std::move(job));
++
++    if (g.stats.enabled)
++    {
++        g.stats.jobs.fetch_add(1, std::memory_order_relaxed);
++        g.stats.jobBytes.fetch_add(bytes, std::memory_order_relaxed);
++        g.stats.dispatchNs.fetch_add(nowNs() - t0, std::memory_order_relaxed);
++    }
++    return true;
++}
++
++void ps2Vif1Barrier(Vif1BarrierReason reason)
++{
++    if (!g.active.load(std::memory_order_relaxed) || t_onWorker || !g.started)
++        return;
++    const size_t ri = static_cast<size_t>(reason);
++    if (g.stats.enabled)
++        g.stats.barriers[ri].fetch_add(1, std::memory_order_relaxed);
++    const uint64_t target = g.enqueued;
++    if (g.finished.load(std::memory_order_acquire) != target)
++    {
++        const uint64_t t0 = g.stats.enabled ? nowNs() : 0u;
++        for (int spin = 0; spin < 2000 && g.finished.load(std::memory_order_acquire) != target; ++spin)
++            _mm_pause();
++        if (g.finished.load(std::memory_order_acquire) != target)
++        {
++            std::unique_lock<std::mutex> lock(g.mutex);
++            g.idleCv.wait(lock, [target] { return g.finished.load(std::memory_order_acquire) == target; });
++        }
++        if (g.stats.enabled)
++        {
++            g.stats.barrierWaits[ri].fetch_add(1, std::memory_order_relaxed);
++            g.stats.barrierNs[ri].fetch_add(nowNs() - t0, std::memory_order_relaxed);
++        }
++    }
++    applyCompletions();
++}
++
++void ps2Vif1PollCompletions()
++{
++    if (!g.active.load(std::memory_order_relaxed) || t_onWorker || !g.started)
++        return;
++    if (g.doneCount.load(std::memory_order_acquire) == g.applied)
++        return;
++    applyCompletions();
++}
++
++bool ps2Vif1ChannelBusy(uint32_t channelBase)
++{
++    if (!g.active.load(std::memory_order_relaxed) || !g.started)
++        return false;
++    const int idx = channelBase == kVif1Channel ? 1 : (channelBase == kGifChannel ? 2 : 0);
++    if (idx == 0)
++        return false;
++    const bool busy = g.outstanding[idx] > 0;
++    if (busy && g.stats.enabled)
++        g.stats.busyReads.fetch_add(1, std::memory_order_relaxed);
++    return busy;
++}
++
++void ps2Vif1ApplyEvent(PS2Runtime &runtime)
++{
++    if (!g.active.load(std::memory_order_relaxed) || !g.memory)
++        return;
++    applyCompletions();
++    runtime.drainCompletedDmacHandlers(g.memory->getRDRAM());
++}
++
++void ps2Vif1SetFbrst(uint32_t fbrst)
++{
++    g.fbrst.store(fbrst, std::memory_order_relaxed);
++}
++
++namespace
++{
++    bool runOnWorker(std::function<void()> fn)
++    {
++        if (!g.active.load(std::memory_order_relaxed))
++            return false;
++        if (t_onWorker)
++        {
++            fn();
++            return true;
++        }
++        Job job;
++        job.call = std::move(fn);
++        enqueue(std::move(job));
++        ps2Vif1Barrier(Vif1BarrierReason::Other);
++        return true;
++    }
++}
++
++bool ps2Vif1StatsEnabled()
++{
++    return g.stats.enabled;
++}
++
++uint64_t ps2Vif1NowNs()
++{
++    return nowNs();
++}
++
++void ps2Vif1StatMpg(bool same)
++{
++    g.stats.mpgs.fetch_add(1, std::memory_order_relaxed);
++    if (same)
++        g.stats.mpgsSame.fetch_add(1, std::memory_order_relaxed);
++}
++
++void ps2Vif1StatAddWalkNs(uint64_t ns)
++{
++    g.stats.walkNs.fetch_add(ns, std::memory_order_relaxed);
++}
++
++namespace
++{
++    struct ChainPool
++    {
++        std::mutex mutex;
++        std::vector<std::vector<uint8_t>> free;
++        std::atomic<size_t> lastBytes[3] = {}; // by channel: 0 VIF0, 1 VIF1, 2 GIF
++    };
++    ChainPool g_chainPool;
++
++    // PS2X_CHAIN_POOL=0: allocate every chain buffer from scratch (the pre-pool behaviour), for A/B measurements.
++    bool chainPoolEnabled()
++    {
++        static const bool on = []
++        {
++            const char *v = std::getenv("PS2X_CHAIN_POOL");
++            return !(v && *v == '0');
++        }();
++        return on;
++    }
++
++    int chainChannelIndex(uint32_t channelBase)
++    {
++        return channelBase == 0x10009000u ? 1 : (channelBase == 0x1000A000u ? 2 : 0);
++    }
++}
++
++std::vector<uint8_t> ps2ChainBufferAcquire(uint32_t channelBase)
++{
++    std::vector<uint8_t> buf;
++    if (!chainPoolEnabled())
++        return buf;
++    {
++        std::lock_guard<std::mutex> lock(g_chainPool.mutex);
++        auto &pool = g_chainPool.free;
++        if (!pool.empty())
++        {
++            size_t best = 0;
++            for (size_t i = 1; i < pool.size(); ++i)
++                if (pool[i].capacity() > pool[best].capacity())
++                    best = i;
++            buf = std::move(pool[best]);
++            pool[best] = std::move(pool.back());
++            pool.pop_back();
++        }
++    }
++    buf.clear();
++    const size_t hint = g_chainPool.lastBytes[chainChannelIndex(channelBase)].load(std::memory_order_relaxed);
++    const size_t want = hint + hint / 8 + 4096;
++    if (buf.capacity() < want)
++        buf.reserve(want);
++    return buf;
++}
++
++void ps2ChainBufferNoteSize(uint32_t channelBase, size_t bytes)
++{
++    g_chainPool.lastBytes[chainChannelIndex(channelBase)].store(bytes, std::memory_order_relaxed);
++}
++
++void ps2ChainBufferRecycle(std::vector<uint8_t> &&buf)
++{
++    const size_t cap = buf.capacity();
++    if (!chainPoolEnabled() || cap < 4096 || cap > (256u << 20))
++        return; // let it go: tiny buffers are cheap, huge ones should not stay resident
++    buf.clear();
++    std::lock_guard<std::mutex> lock(g_chainPool.mutex);
++    if (g_chainPool.free.size() < 8)
++        g_chainPool.free.push_back(std::move(buf));
++}
++
++void ps2Vif1StatAddGifNs(uint64_t ns)
++{
++    g.stats.gifNs.fetch_add(ns, std::memory_order_relaxed);
++}
++
++bool ps2Vif1Mscal(uint32_t startPc, uint32_t top, uint32_t itop)
++{
++    return runOnWorker(
++        [=]
++        {
++            const PS2HostVu1 &hv = ps2HostVu1();
++            const uint64_t t0 = g.stats.enabled ? nowNs() : 0u;
++            hv.mscal(startPc, top, itop, g.fbrst.load(std::memory_order_relaxed), g.memory->getVU1CodeGeneration(),
++                     &g.vpuStat);
++            if (g.stats.enabled)
++                g.stats.vuNs.fetch_add(nowNs() - t0, std::memory_order_relaxed);
++        });
++}
++
++bool ps2Vif1Mscnt(uint32_t top, uint32_t itop)
++{
++    return runOnWorker(
++        [=]
++        {
++            const PS2HostVu1 &hv = ps2HostVu1();
++            const uint64_t t0 = g.stats.enabled ? nowNs() : 0u;
++            hv.mscnt(top, itop, g.fbrst.load(std::memory_order_relaxed), g.memory->getVU1CodeGeneration(), &g.vpuStat);
++            if (g.stats.enabled)
++                g.stats.vuNs.fetch_add(nowNs() - t0, std::memory_order_relaxed);
++        });
++}
++
++void ps2RunAfterQueuedGif(void (*fn)(void *), void *arg)
++{
++    if (!g.active.load(std::memory_order_relaxed) || t_onWorker)
++    {
++        fn(arg);
++        return;
++    }
++    Job job;
++    job.call = [fn, arg] { fn(arg); };
++    enqueue(std::move(job)); // no completion: the EE does not wait
++}
++
++void ps2FlushQueuedGif()
++{
++    if (!g.started || t_onWorker)
++        return;
++    std::unique_lock<std::mutex> lock(g.mutex);
++    const uint64_t target = g.enqueued;
++    g.idleCv.wait(lock, [target] { return g.finished.load(std::memory_order_acquire) >= target; });
++}
++
++void ps2Vif1WorkerShutdown()
++{
++    if (!g.started)
++        return;
++    {
++        std::lock_guard<std::mutex> lock(g.mutex);
++        g.stop = true;
++    }
++    g.cv.notify_all();
++    if (g.thread.joinable() && std::this_thread::get_id() != g.thread.get_id())
++        g.thread.join();
++    g.started = false;
++    g.stop = false;
++    g.queue.clear();
++    g.enqueued = 0;
++    g.finished.store(0);
++    g.done.clear();
++    g.pending.store(0);
++    g.doneCount.store(0);
++    g.applied = 0;
++    g.outstanding[0] = g.outstanding[1] = g.outstanding[2] = 0;
++}
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_worker.h b/ps2xRuntime/src/lib/ps2_vif1_worker.h
+new file mode 100644
+index 0000000..9c60d52
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_vif1_worker.h
+@@ -0,0 +1,88 @@
++#pragma once
++
++#include <cstdint>
++#include <vector>
++
++class PS2Memory;
++class PS2Runtime;
++
++// VIF1 / VU1 / GIF worker thread (PS2X_VIF1_THREAD, MTVU-style).
++//
++// A DMA start on channel 1 (VIF1) or 2 (GIF) used to run synchronously inside the guest's CHCR store: chain walk ->
++// VIF1 unpack / MPG / MSCAL (host VU1) -> XGKICK -> GIF arbiter -> host GS. With the worker, the EE thread still walks
++// the DMA chain (that snapshots the source data, so the game may reuse its buffers as soon as the store returns), then
++// hands the buffers to this thread as one job. The worker owns from then on: VIF1 registers and state, VU1 code/data
++// memory, the host VU1 (all VU1 execution must happen on this thread once it exists), the GIF arbiter and PATH1/2/3
++// ordering. Jobs run in FIFO order, so the GS sees exactly the order the synchronous code produced.
++//
++// EE <-> worker rules (implemented in ps2_memory.cpp / ps2_vif1_interpreter.cpp / EeScheduler.cpp):
++//   * CHCR.STR of D1/D2 reads busy until the worker finished the job; completion (CHCR/QWC/D_STAT, DMAC handlers) is
++//     applied on the EE thread, either lazily by a register read or by the scheduler event kVif1WorkerEventId.
++//   * Anything on the EE thread that touches worker-owned state first waits for the worker to go idle (barrier):
++//     VU1 code/data access, VIF1 register writes, GIF_STAT reads, VIF1 FIFO writes, direct GIF submissions, the public
++//     processPendingTransfers(), and the guest vblank (so a frame's GIF packets are all queued in the host GS before
++//     the vsync marker).
++constexpr uint32_t kVif1WorkerEventId = 0x56494631u; // 'VIF1' (EeEventType::Dmac wake-up)
++
++enum class Vif1BarrierReason : uint8_t
++{
++    Vu1Memory,
++    VifRegister,
++    GifStat,
++    VifFifo,
++    GifSubmit,
++    SyncTransfer,
++    Vsync,
++    Other,
++    Count
++};
++
++// Threaded mode is fixed for the life of the process by ps2Vif1WorkerBind(): PS2X_VIF1_THREAD != 0 and a host VU1
++// (its JIT code is tied to the thread that first runs it, so it must never migrate).
++void ps2Vif1WorkerBind(PS2Runtime &runtime, PS2Memory &memory);
++bool ps2Vif1Active();          // threaded mode is on
++// true: the scheduler waits for the worker at every vblank even if the host's vsync hook orders itself
++// (PS2X_VIF1_VSYNC_SYNC=1; A/B switch).
++bool ps2Vif1ForceVsyncBarrier();
++bool ps2Vif1OnWorkerThread();  // calling thread is the worker
++
++// EE thread: moves the pending GIF/VIF1 transfers into a worker job. Returns false when the caller has to process
++// them synchronously (threaded mode off, or VIF0 transfers pending).
++bool ps2Vif1DispatchAsync(PS2Memory &memory);
++
++// EE thread: waits until the worker is idle and applies finished jobs. Cheap no-op when threaded mode is off, the
++// worker is idle, or the caller is the worker.
++void ps2Vif1Barrier(Vif1BarrierReason reason);
++// EE thread: applies finished jobs without waiting.
++void ps2Vif1PollCompletions();
++// EE thread: after ps2Vif1PollCompletions(), true while a job started on this channel (0x10009000 / 0x1000A000) runs.
++bool ps2Vif1ChannelBusy(uint32_t channelBase);
++// EE thread, scheduler event kVif1WorkerEventId.
++void ps2Vif1ApplyEvent(PS2Runtime &runtime);
++// EE thread: FBRST as the VU1 D/T-bit stop enables see it (sampled by the scheduler each vblank).
++void ps2Vif1SetFbrst(uint32_t fbrst);
++
++// MSCAL / MSCNT of the VIF1 stream: run the host VU1 on the worker thread (directly when already there, else as a
++// blocking call on the worker). Returns false when threaded mode is off (caller uses the runtime callback).
++bool ps2Vif1Mscal(uint32_t startPc, uint32_t top, uint32_t itop);
++bool ps2Vif1Mscnt(uint32_t top, uint32_t itop);
++
++void ps2Vif1WorkerShutdown();
++
++// ps2_vif1_worker_win.cpp: priority / core placement of the worker thread (calling thread).
++void ps2Vif1TuneWorkerThread();
++
++// PS2X_VIF1_STATS=1 accounting for time the worker spends handing GIF packets to the host GS.
++bool ps2Vif1StatsEnabled();
++void ps2Vif1StatAddGifNs(uint64_t ns);
++void ps2Vif1StatAddWalkNs(uint64_t ns); // EE: DMA chain walk + snapshot copy (in the DMA-start store)
++uint64_t ps2Vif1NowNs();
++void ps2Vif1StatMpg(bool sameAsVuMemory); // an MPG upload (same = identical to the code already in VU1 memory)
++
++// DMA chain buffers. A gameplay frame is one ~3 MB VIF1 chain; allocating, growing (vector insert per tag) and freeing
++// such a buffer every frame cost page faults and reallocation copies on the EE thread. The walk takes a buffer from
++// this pool (empty, with the capacity of the previous chain of that channel); whoever consumed it gives it back
++// (the worker after a job, the synchronous path after processing). Thread safe.
++std::vector<uint8_t> ps2ChainBufferAcquire(uint32_t channelBase);
++void ps2ChainBufferNoteSize(uint32_t channelBase, size_t bytes);
++void ps2ChainBufferRecycle(std::vector<uint8_t> &&buf);
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_worker_win.cpp b/ps2xRuntime/src/lib/ps2_vif1_worker_win.cpp
+new file mode 100644
+index 0000000..44f468e
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_vif1_worker_win.cpp
+@@ -0,0 +1,76 @@
++// Host thread tuning for the VIF1 worker thread (kept out of ps2_vif1_worker.cpp: windows.h and the raylib names that
++// ps2_runtime.h drags in do not mix).
++#include <algorithm>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++#ifdef _WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#if !defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0A00
++#undef _WIN32_WINNT
++#define _WIN32_WINNT 0x0A00
++#endif
++#include <windows.h>
++
++// The worker does the render-feeding work of a whole frame, so it must not be throttled:
++//  * priority above normal, execution-speed throttling (EcoQoS) off;
++//  * PS2X_VIF1_CORES=perf additionally restricts it to the CPU sets of the highest efficiency class on hybrid CPUs
++//    (P-cores). Off by default: on an i9-12900K it made no measurable difference (43.9 vs 48.0 in-game frames/s with
++//    and without it, both single runs), so placement is left to the OS.
++void ps2Vif1TuneWorkerThread()
++{
++    HANDLE th = GetCurrentThread();
++    SetThreadPriority(th, THREAD_PRIORITY_ABOVE_NORMAL);
++
++    THREAD_POWER_THROTTLING_STATE throttle = {};
++    throttle.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
++    throttle.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
++    throttle.StateMask = 0; // do not throttle
++    SetThreadInformation(th, ThreadPowerThrottling, &throttle, sizeof(throttle));
++
++    const char *v = std::getenv("PS2X_VIF1_CORES");
++    if (!v || std::strcmp(v, "perf") != 0)
++        return;
++    ULONG len = 0;
++    GetSystemCpuSetInformation(nullptr, 0, &len, GetCurrentProcess(), 0);
++    if (len == 0)
++        return;
++    std::vector<uint8_t> buf(len);
++    if (!GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data()), len, &len,
++                                    GetCurrentProcess(), 0))
++        return;
++    int maxClass = 0, minClass = 255;
++    for (ULONG off = 0; off < len;)
++    {
++        const auto *e = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION *>(buf.data() + off);
++        if (e->Type == CpuSetInformation)
++        {
++            maxClass = std::max<int>(maxClass, e->CpuSet.EfficiencyClass);
++            minClass = std::min<int>(minClass, e->CpuSet.EfficiencyClass);
++        }
++        off += e->Size;
++    }
++    if (maxClass == minClass)
++        return;
++    std::vector<ULONG> ids;
++    for (ULONG off = 0; off < len;)
++    {
++        const auto *e = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION *>(buf.data() + off);
++        if (e->Type == CpuSetInformation && e->CpuSet.EfficiencyClass == maxClass)
++            ids.push_back(e->CpuSet.Id);
++        off += e->Size;
++    }
++    if (!ids.empty())
++        SetThreadSelectedCpuSets(th, ids.data(), static_cast<ULONG>(ids.size()));
++}
++#else
++void ps2Vif1TuneWorkerThread() {}
++#endif

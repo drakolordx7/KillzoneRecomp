@@ -98,8 +98,10 @@ target_compile_options(kzvu_common PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:/W0>)
 # kzvu_prefix.h pre-includes every PCSX2 header these files use and then redirects gifUnit/EmuConfig/vu1Thread to the
 # shims in shim/include/kzvu_shim.h. No file in ext/pcsx2 is modified.
 # ---------------------------------------------------------------------------------------------------------------------
+# microVU.cpp is compiled through shim/unity/KzvuMicroVU.cpp (it #includes the PCSX2 file unmodified and adds read-only
+# accessors for microVU1's program list and code cache, see kzvuVu1CodeStats in kzvu.h).
 set(KZVU_VU_SRCS
-	${P2SRC}/x86/microVU.cpp
+	${KZVU_ROOT}/shim/unity/KzvuMicroVU.cpp
 	${P2SRC}/VUops.cpp
 	${P2SRC}/VUflags.cpp
 	${P2SRC}/VU1microInterp.cpp
@@ -108,6 +110,7 @@ set(KZVU_VU_SRCS
 file(GLOB KZVU_SHIM_SRCS CONFIGURE_DEPENDS "${KZVU_ROOT}/shim/*.cpp")
 add_library(kzvu_vu OBJECT ${KZVU_VU_SRCS} ${KZVU_SHIM_SRCS})
 target_link_libraries(kzvu_vu PRIVATE kzvu_flags)
+target_include_directories(kzvu_vu PRIVATE "${KZVU_ROOT}/include") # kzvu.h, for the diagnostics in shim/unity/KzvuMicroVU.cpp
 set_source_files_properties(${KZVU_VU_SRCS} PROPERTIES COMPILE_OPTIONS "/FI${KZVU_ROOT}/shim/include/kzvu_prefix.h")
 
 # ---------------------------------------------------------------------------------------------------------------------
