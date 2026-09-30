@@ -144,6 +144,7 @@ void kzStartProfiler(double startSeconds, double durationSeconds, const char *pa
             uint64_t total = 0, busy = 0;
             std::unordered_map<std::string, uint64_t> self, incl;
             std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>> callers; // self fn -> chain
+            std::unordered_map<std::string, uint64_t> waits; // wait site (first non-OS frames) -> samples
         };
         std::map<DWORD, Stats> stats;
         for (const ProfSample &s : samples)
@@ -152,7 +153,21 @@ void kzStartProfiler(double startSeconds, double durationSeconds, const char *pa
             ++st.total;
             const std::string &top = name(s.pcs[0]);
             if (isWait(top))
+            {
+                std::string site;
+                int shown = 0;
+                for (int i = 1; i < s.depth && shown < 4; ++i)
+                {
+                    const std::string &n = name(s.pcs[i]);
+                    if (n.rfind("Rtl", 0) == 0 || n.rfind("Nt", 0) == 0 || n.rfind("Zw", 0) == 0 || n.find("Wait") != std::string::npos ||
+                        n.find("Sleep") != std::string::npos || n.rfind("Kernel", 0) == 0 || n.rfind("_Cnd", 0) == 0 || n.rfind("Cnd_", 0) == 0 ||
+                        n.rfind("std::", 0) == 0 || n.rfind("_Primitive", 0) == 0)
+                        continue;
+                    site += (shown++ ? " <- " : "") + n;
+                }
+                ++st.waits[site];
                 continue;
+            }
             ++st.busy;
             ++st.self[top];
             std::string chain;
@@ -207,6 +222,15 @@ void kzStartProfiler(double startSeconds, double durationSeconds, const char *pa
                 }
             }
             dump("inclusive", st.incl, 70);
+            {
+                std::vector<std::pair<uint64_t, std::string>> w;
+                for (auto &[k, c] : st.waits)
+                    w.emplace_back(c, k);
+                std::sort(w.rbegin(), w.rend());
+                std::fprintf(out, "  -- wait sites (share of all samples)\n");
+                for (size_t i = 0; i < std::min<size_t>(8, w.size()); ++i)
+                    std::fprintf(out, "  %5.1f%%  %s\n", 100.0 * static_cast<double>(w[i].first) / static_cast<double>(st.total), w[i].second.c_str());
+            }
         }
         std::fclose(out);
         std::fprintf(stderr, "[kz] profile written: %s\n", outPath.c_str());

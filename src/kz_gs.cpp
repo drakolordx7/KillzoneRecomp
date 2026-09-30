@@ -150,6 +150,8 @@ namespace
         SDL_DestroySurface(surf);
     }
 
+    // GIF packets since the last presented vsync (runVsync skips presenting unchanged frames, see there).
+    std::atomic<uint64_t> g_packetsSinceVsync{0};
     std::atomic<uint64_t> g_pathPackets[4]{};
     // Debug: last A+D writes of interest and primitive count (PACKED/REGLIST parsing, first 64 KB of each packet).
     std::atomic<uint64_t> g_lastFrame1{0}, g_lastFrame2{0}, g_lastPrim{0}, g_primWrites{0}, g_imageTransfers{0}, g_lastBitblt{0};
@@ -277,6 +279,7 @@ namespace
                 inspectGif(data, sizeBytes);
         }
         kzgsGifTransfer(path, data, sizeBytes / 16u);
+        g_packetsSinceVsync.fetch_add(1, std::memory_order_relaxed);
     }
 
     // KZ_GS_DEBUG=1: one line per ~second with display registers, fade level and GIF traffic.
@@ -359,7 +362,20 @@ namespace
             fh.h = 0xcbf29ce484222325ull;
             fh.packets[1] = fh.packets[2] = fh.packets[3] = 0;
         }
-        kzgsVsync(field, true);
+        // At high guest vblank rates most vblanks show a frame the GS already presented (no new GIF packets, same
+        // display registers). Presenting it again costs a full GS vsync and blocks the VIF1 worker whenever the GS has
+        // maxQueuedFrames queued, which is what capped high vblank rates. KZ_GS_PRESENT_ALL=1 presents every vblank.
+        static const bool presentAll = std::getenv("KZ_GS_PRESENT_ALL") && std::getenv("KZ_GS_PRESENT_ALL")[0] == '1';
+        static uint8_t lastDisplayRegs[0xF0] = {};
+        static bool presentedOnce = false;
+        const bool newPackets = g_packetsSinceVsync.exchange(0, std::memory_order_relaxed) != 0;
+        const bool regsChanged = std::memcmp(lastDisplayRegs, s.privRegs, sizeof(lastDisplayRegs)) != 0;
+        if (presentAll || !presentedOnce || newPackets || regsChanged)
+        {
+            std::memcpy(lastDisplayRegs, s.privRegs, sizeof(lastDisplayRegs));
+            presentedOnce = true;
+            kzgsVsync(field, regsChanged || !presentedOnce);
+        }
         s.frames.fetch_add(1, std::memory_order_relaxed);
         debugLine(s);
         if (!s.shotDir.empty())
