@@ -6,6 +6,9 @@
 #include "common/CrashHandler.h"
 #include "common/RedtapeWindows.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <intrin.h>
 #include <string>
 #include <vector>
@@ -165,6 +168,59 @@ static void GifAppend(const u8* p, u32 size)
 	s_gif_buf.insert(s_gif_buf.end(), p, p + size);
 }
 
+// Hands one complete packet to the host callback.
+static __forceinline void GifDeliver(const u8* packet, u32 bytes, u32 start_qw)
+{
+	if (s_xgkick_fn)
+	{
+		// VU code runs with the VU rounding mode (chop, DAZ/FTZ); the host's GIF/GS code gets its own MXCSR back.
+		const FPControlRegister vu_fpcr = FPControlRegister::GetCurrent();
+		FPControlRegister::SetCurrent(s_host_fpcr);
+		s_xgkick_fn(s_xgkick_user, packet, bytes, start_qw);
+		FPControlRegister::SetCurrent(vu_fpcr);
+	}
+	s_gif_packets++;
+}
+
+// Byte length of the data that follows a GIFtag (Gif_Tag::setTag without the register analysis).
+static __forceinline u32 GifTagDataBytes(const u8* p, bool* eop)
+{
+	u64 lo;
+	std::memcpy(&lo, p, 8);
+	*eop = (lo >> 15) & 1;
+	const u32 nloop = static_cast<u32>(lo & 0x7FFF);
+	switch ((lo >> 58) & 3)
+	{
+		case GIF_FLG_PACKED:
+		{
+			const u32 nregs = (static_cast<u32>((lo >> 60) - 1) & 0xf) + 1;
+			return nregs * nloop * 16;
+		}
+		case GIF_FLG_REGLIST:
+		{
+			const u32 nregs = (static_cast<u32>((lo >> 60) - 1) & 0xf) + 1;
+			return ((nregs * nloop + 1) >> 1) * 16;
+		}
+		default:
+			return nloop * 16;
+	}
+}
+
+// XGKICK data is read from the host's callback straight out of VU1 data memory when no partial packet is buffered
+// (KZVU_XGKICK_INPLACE=0 = always copy through s_gif_buf, the previous behaviour).
+static const bool s_xgkick_inplace = []() {
+	const char* v = std::getenv("KZVU_XGKICK_INPLACE");
+	return !(v && *v == '0');
+}();
+
+// KZVU_XGKICK_CHECK=1: every in-place transfer is also walked with Gif_Tag (what GifEmitComplete uses) and the packet
+// boundaries and the unfinished tail are compared; mismatches are counted and the first few printed.
+static const bool s_xgkick_check = []() {
+	const char* v = std::getenv("KZVU_XGKICK_CHECK");
+	return v && *v && *v != '0';
+}();
+static u64 s_xgkick_checked = 0, s_xgkick_mismatch = 0;
+
 // Emits every complete packet (tags up to and including the one with EOP) at the front of the buffer.
 static void GifEmitComplete()
 {
@@ -179,15 +235,7 @@ static void GifEmitComplete()
 		pos = end;
 		if (tag.tag.EOP)
 		{
-			if (s_xgkick_fn)
-			{
-				// VU code runs with the VU rounding mode (chop, DAZ/FTZ); the host's GIF/GS code gets its own MXCSR back.
-				const FPControlRegister vu_fpcr = FPControlRegister::GetCurrent();
-				FPControlRegister::SetCurrent(s_host_fpcr);
-				s_xgkick_fn(s_xgkick_user, &s_gif_buf[packet_start], static_cast<u32>(pos - packet_start), s_gif_start_qw);
-				FPControlRegister::SetCurrent(vu_fpcr);
-			}
-			s_gif_packets++;
+			GifDeliver(&s_gif_buf[packet_start], static_cast<u32>(pos - packet_start), s_gif_start_qw);
 			packet_start = pos;
 		}
 	}
@@ -205,6 +253,61 @@ void KzvuGifPath::CopyGSPacketData(u8* pMem, u32 size, bool aligned)
 
 u32 KzvuGifUnit::TransferGSPacketData(GIF_TRANSFER_TYPE tranType, u8* pMem, u32 size, bool aligned)
 {
+	if (s_xgkick_inplace && s_gif_buf.empty() && size >= 16)
+	{
+		// Nothing buffered: walk the tags where they are, deliver whole packets from VU memory, and buffer only the
+		// unfinished tail (an interpreter chunk, or the first half of a packet that wraps VU memory).
+		const u8* mem = vuRegs[1].Mem;
+		const u32 start_qw = (pMem >= mem && pMem < mem + 0x4000) ? static_cast<u32>(pMem - mem) / 16 : s_gif_start_qw;
+		u32 pos = 0, packet_start = 0;
+		std::vector<std::pair<u32, u32>> mine; // (offset, length) of the packets found, for the check
+		while (pos + 16 <= size)
+		{
+			bool eop;
+			const u32 end = pos + 16 + GifTagDataBytes(pMem + pos, &eop);
+			if (end > size)
+				break;
+			pos = end;
+			if (eop)
+			{
+				if (s_xgkick_check)
+					mine.emplace_back(packet_start, pos - packet_start);
+				GifDeliver(pMem + packet_start, pos - packet_start, (start_qw + packet_start / 16) & 0x3ff);
+				packet_start = pos;
+			}
+		}
+		if (s_xgkick_check)
+		{
+			std::vector<std::pair<u32, u32>> ref;
+			u32 rpos = 0, rstart = 0;
+			while (rpos + 16 <= size)
+			{
+				Gif_Tag tag(pMem + rpos);
+				const u32 rend = rpos + 16 + tag.len;
+				if (rend > size)
+					break;
+				rpos = rend;
+				if (tag.tag.EOP)
+				{
+					ref.emplace_back(rstart, rpos - rstart);
+					rstart = rpos;
+				}
+			}
+			++s_xgkick_checked;
+			if (ref != mine || rstart != packet_start)
+			{
+				if (s_xgkick_mismatch++ < 8)
+					std::fprintf(stderr, "[kzvu] XGKICK check MISMATCH at transfer %llu: size=%u in-place packets=%zu reference=%zu tail %u/%u"
+					                     "\n", static_cast<unsigned long long>(s_xgkick_checked), size, mine.size(), ref.size(), packet_start, rstart);
+			}
+			if ((s_xgkick_checked % 500000) == 0)
+				std::fprintf(stderr, "[kzvu] XGKICK check: %llu transfers, %llu mismatches"
+				                     "\n", static_cast<unsigned long long>(s_xgkick_checked), static_cast<unsigned long long>(s_xgkick_mismatch));
+		}
+		if (packet_start < size)
+			GifAppend(pMem + packet_start, size - packet_start);
+		return size;
+	}
 	GifAppend(pMem, size);
 	GifEmitComplete();
 	return size;

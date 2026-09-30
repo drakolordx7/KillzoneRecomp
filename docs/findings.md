@@ -538,3 +538,73 @@ absolute frame rates are 56-64 and only concurrent pairs compare.
     first stress run (started together with a regen and a movie run), showed the known `[IOP] module arena exhausted` MCSERV.IRX loop
     (276 079 lines, stuck at `sceSifLoadModule`; "Boot flake" above: 1 in 30-40 boots under load, always with several instances
     booting); it is IOP module loading, but 1 of 10 against 0 of 9 is too few runs to rule out a link to this change.
+
+## VIF1 worker hot path (2026-09-30, patch 0022)
+
+The VIF1/VU1/GIF worker needed 9-10 ms per frame (one job per frame) against an 8.33 ms vblank period at 120 Hz. What the game feeds it
+per frame, from `PS2X_DMA_STATS=1` (52-58 frames/s under load, 500-550 chains per 10 s): ~4000 XGKICK packets (average 1.2 KB, ~5 MB),
+~415 DIRECT (1.75 MB of PATH2), ~6200 UNPACK, ~900 MSCAL, ~80 VU1 code changes (MPG: 4000-5000 a second). UNPACK formats by count: V4-32 45 %,
+V2-16 16 %, V3-8 9 %, S-16 and S-8 8 % each, V4-8 7 %, V3-16 and V4-5 5 % each, V4-16 4 %; 15 % are masked, none is in fill mode (WL <= CL),
+and STMOD is never written (mode 0 always).
+
+**Method.** `tools/scripts/vif_run.ps1` / `vif_pairs.ps1` / `vif_metric.py` (new): the task's scene with `PS2X_VIF1_STATS=1`, concurrent pairs of
+the same binary with env switches, run from a snapshot dir (`mkrun.ps1`; the build can relink meanwhile: the exe is linked with
+`/PDBALTPATH:%_PDB%`, set as `-DCMAKE_EXE_LINKER_FLAGS` in the `build\pd` cache, so a run does not hold the build's PDB). Metric: worker ms per
+job (= per frame) over t=150..200 s, next to the vif-counter fps. The worker time is what `[vif1-thread]` reports; it includes waits for
+the GS thread (ring space, frame throttle). `KZ_VU_STATS=1` was itself expensive (it walked all 2048 program lists on every MSCAL: 12 % of the
+worker; now it only reads two counters on the hot path and walks the lists when it prints), so the numbers below are from runs without it
+unless stated.
+
+**Where the time went** (worker profile, `KZ_PROFILE=160,40`; JIT frames break the stack walk, so inclusive shares are approximate).
+- XGKICK -> GS hand-off: a packet was copied VU memory -> kzvu buffer (`std::vector::insert`) -> arbiter queue (heap vector) -> kzgs ring:
+  three copies, an allocation and a free, a sort pass and an atomic notify (`WakeByAddress`) per packet; ~18 % of the worker.
+- **microVU "compile" was not compilation.** `mVUcompileJIT<1>` (17 % inclusive, 12.7 % self) is the routine that JIT code calls for every
+  JR/JALR. microVU treats an indirect jump target as a new program start, so after each micro-memory change every program entry (an MSCAL or a JR
+  target) searches its program list again, comparing every range each candidate was compiled from with the current micro memory. Counted with a
+  diagnostic build (memcmp wrapper): 15 M `memcmp` calls per second, 17 bytes on average, ~270 TSC cycles each (cache misses on the candidates'
+  16 KB code copies), 3.7-4.1 G TSC cycles per 10 s. That stayed the same from t=150 to t=220 s while the code emitted fell from 4.5 MB to
+  0.1-0.4 MB per 10 s. New programs per 10 s, t=130..220: 311, 814, 698, 272, 239, 66, 55, 14, 314, 610: the level-start burst decays
+  within ~60 s to 15-60 per 10 s, and new content (t=210-220 here) starts another. Real compilation is a burst cost, the search was the steady
+  one. (This corrects the "first-use compile cost" reading under "VU1 recompiles" above; the counts there are right.)
+  Two things that did not help: an inline SSE range compare instead of the CRT `memcmp` (same TSC per call, cache-miss bound; worker
+  14.0 / 14.5 -> 14.3 / 14.8 ms in two pairs), and treating JR/JALR as part of the same program (`doJumpAsSameProgram`; memcmp calls
+  unchanged, worker 14.05 -> 14.64 ms). Both were removed again.
+- `vif1UnpackPcsx2` 6 % (the masked UNPACKs went through the per-element loop), `forwardVif1DirectData` 4.6 %, `processVIF1Data` itself ~2 %.
+
+**Changes and measurements.** Same binary, env switches, worker ms per job, concurrent pairs, t=150..200 s; the machine is shared, the first
+pair of each series was the quietest.
+- Hand-off (`PS2X_GIF_DIRECT`, `KZVU_XGKICK_INPLACE`, `KZGS_NOTIFY_ALWAYS`; plus a cheaper `packetWritesGsEvent` and plain load+store
+  counters in `onGifPacket`, no switch): 3 pairs 14.01 / 11.80 / 14.12 -> 12.78 / 10.38 / 12.23 ms (median -13 %), fps 54.9 / 58.7 / 55.6 ->
+  57.9 / 59.8 / 57.9. A packet is now copied once (VU memory -> kzgs ring).
+- Code-state memo (`KZVU_STATE_MEMO`): first version (512 states, full content compare) 2 pairs 12.19 / 12.85 -> 9.74 / 11.98 ms (-20 %, -7 %).
+  Final version (unbounded, 128-bit content key): `memcmp` calls 15 M -> 1.3-2.6 M per 10 s; 85-90 % of the ~50 k code changes per 10 s find
+  their table, 3-10 % are new contents, the rest have been compiled into since (the saved table is dropped). Memo cost 0.45 G TSC cycles per
+  10 s (1.2 G before the AES hash and the single pass over the 2048 slots).
+- Masked UNPACK SSE path (`PS2X_VIF_UNPACK_MASKED_FAST`): 2 pairs (a third one was lost to a rebuild) 8.15 / 9.26 -> 7.98 / 9.03 ms (-2 %).
+- **All together** (`PS2X_GIF_DIRECT=0 KZVU_XGKICK_INPLACE=0 KZGS_NOTIFY_ALWAYS=1 KZVU_STATE_MEMO=0 PS2X_VIF_UNPACK_MASKED_FAST=0` against the
+  defaults, series `g1`, 3 concurrent pairs): worker 7.82 / 12.86 / 10.07 -> 6.20 / 9.82 / 7.74 ms per frame (-21 %, -24 %, -23 %; median
+  10.07 -> 7.74), fps 68.4 / 58.1 / 65.9 -> 70.8 / 59.0 / 67.7 (median 65.9 -> 67.7). Without the stats (`g2`, 2 pairs) fps 67.4 / 72.9 ->
+  72.5 / 70.4: not resolvable, the run-to-run spread is +-10 %. One quiet run of the final build (`p3`): 6.29 ms worker per frame, 74.8 fps.
+
+**What limits fps now.** The worker is no longer the limiter (6.2-7.7 ms per frame, 45 % busy at 75 fps). Threads in the `p3` profile (t=160..200,
+74.8 fps): EE thread 65 % busy (~8.7 ms per frame); GS thread (PCSX2's hardware renderer: `GSState::GIFPackedRegHandler*`, `GSRendererHW::Draw`, D3D11)
+46.7 % busy (~6.2 ms per frame; 57.6 % at 69 fps in another run, ~8.4 ms); worker 45 %. 120 fps needs all three under 8.33 ms. The EE thread
+is over it, and the GS thread is close. The worker's remaining time is thin: `mVUcompileJIT<1>` self 9 % of its busy samples (~0.6 ms per frame:
+the JR/JALR call and its jump-cache lookups), `Push` 6.6 % (~0.4 ms, the ring memcpy of ~5 MB per frame), the spin-wait between jobs 6 %,
+memo 2.7 %, UNPACK/DIRECT ~4 %, and the VU1 code itself as many unresolved JIT addresses of at most ~1.5 % each.
+
+**Correctness evidence.** One 235 s run with `KZVU_XGKICK_CHECK=1 KZVU_STATE_MEMO_VERIFY=1 PS2X_VIF_UNPACK_CHECK=4 PS2X_GIF_SCAN_CHECK=1`
+(`chk1`): 23.0 M XGKICK transfers compared with a second `Gif_Tag` walk (packet boundaries and unfinished tail), 0 differences; 9.6 M UNPACKs
+run both ways (masked SSE path included; VU1 memory and VIF registers compared), 0 differences; every saved and every restored memo entry
+(~500 k code changes) checked with microVU's own range comparison against the content it belongs to, 0 bad (also in an earlier 235 s run);
+the fast A+D scan against the plain loop on every packet, 0 differences (and 3 M random packets in a standalone test, 945 k of them with a
+SIGNAL/FINISH/LABEL write, 0 differences). GIF ordering: the direct emit only happens when the arbiter queue is empty and the packet is
+PATH1/PATH2. There the drain comparator puts it first among anything submitted before the next drain (a PATH3 IMAGE never sorts ahead of PATH1, and a
+PATH2 is drained at its own submit), so the emitted order is the old one; with a PATH3 packet queued (job start) everything queues as before. kzvu
+tests: 1776 checks (575 + the new memo test), 0 failures, also with `KZVU_STATE_MEMO=0` and `KZVU_STATE_MEMO_VERIFY=1`; kzvu0_test 509 checks.
+Frames of the final build (`ipu1` with `KZ_IPU` unset, `v1_b1`, `chk1`): intro movie, menus with the movie backgrounds, loading, level, weapon,
+HUD, explosions, death screen, as in the old build. A byte comparison of the GIF stream between old and new switches (`KZ_GS_HASH=1`, 130 s)
+is not possible: the game's timing makes almost every frame differ between any two runs (308 of 15598 frame hashes equal at the same frame
+number, 597 of ~14.8 k distinct hashes shared).
+Runs note: both runs of one pair and one run of another died when a build re-staged `build\pd\resources` under them (their run dirs used a junction
+to it); `mkrun.ps1` copies it now.

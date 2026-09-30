@@ -569,3 +569,36 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
   - **Left.** ~190 yields/s x ~40 unwound frames = the remaining ~8 k dispatches/s (needs stack switching or fibers to remove); the
     memory slow paths (`ps2CgWr32Slow`/`ps2CgRd32Slow`/`Load32`/`Store32`, ~6 % of the EE thread in the profile: scratchpad and
     MMIO addresses) are not control flow and were not touched.
+
+- `0022-vif-worker-hotpath.patch` (runtime: `gs/ps2_gif_arbiter.cpp`, `ps2_vif1_interpreter.cpp`; the rest is in the main repo:
+  `ext/kzvu` (`shim/KzvuShims.cpp`, `shim/unity/KzvuMicroVU.cpp`, `src/kzvu.cpp`, `include/kzvu.h`, test), `ext/kzgs/src/kzgs.cpp`,
+  `src/kz_gs.cpp`, `src/kz_vu.cpp`, `tools/scripts/vif_*`/`mkrun.ps1`). Makes the VIF1/VU1/GIF worker's per-frame time smaller; no header
+  changed, no regen. Details, profile and every measurement: docs/findings.md "VIF1 worker hot path".
+  - **XGKICK -> GS hand-off** (was ~18 % of the worker; ~4000 packets of 1.2 KB per frame). A packet used to be copied three times (VU1 memory ->
+    kzvu buffer -> arbiter heap vector -> kzgs ring) with an alloc/free, a sort and an atomic notify each. (1) kzvu walks the tags in VU1 memory
+    and hands the callback a pointer into it when no partial packet is buffered (`KZVU_XGKICK_INPLACE=0` = old; `KZVU_XGKICK_CHECK=1` compares
+    with a `Gif_Tag` walk). (2) `GifArbiter::submit` emits a PATH1/PATH2 packet directly (host GS hook, and the built-in GS when it must see it) when
+    nothing is queued (`PS2X_GIF_DIRECT=0` = old): that is where the sorted drain would have put it, and with a PATH3 packet queued (job start)
+    it queues as before, so the order the GS sees is unchanged. `drain()` returns at once on an empty queue. (3) `packetWritesGsEvent` skips
+    a PACKED tag's body when none of its NREG descriptor nibbles is A+D (`PS2X_GIF_SCAN_CHECK=1` compares with the plain loop). (4) kzgs
+    wakes its consumer / a producer waiting for ring space only when the other side announced it sleeps (`KZGS_NOTIFY_ALWAYS=1` = old). (5)
+    `onGifPacket`'s three locked adds became load+store (one feeding thread at a time), `onXgkick` reads the stats flag once.
+  - **VU1 code-state memo** (`ext/kzvu`, `KZVU_STATE_MEMO=0` = old). microVU forgot its current-program table on every micro-memory change (~4000 a
+    second in Killzone), so every program entry (MSCAL, JR/JALR target) searched its program list again: 15 M `memcmp` calls per second, cache-miss
+    bound. That, not compilation, was most of the `mVUcompileJIT<1>` time seen in profiles. The memo remembers the table per micro-memory
+    content and puts it back when the content returns; see `ext/kzvu/README.md` ("JIT invalidation") for the exact rules
+    (`KZVU_STATE_MEMO_VERIFY=1` checks every saved/restored entry).
+  - **Masked UNPACK** (15 % of Killzone's UNPACKs; `PS2X_VIF_UNPACK_MASKED_FAST=0` = old): STMOD 0, not fill mode: one SSE
+    load/convert/select/store per vector with per-write-cycle constants (data / row / column / keep). `PS2X_VIF_UNPACK_CHECK` covers it.
+  - **Measured** (concurrent pairs of one binary, all switches above off vs on, `PS2X_VIF1_STATS=1`, t=150..200 s, worker ms per frame):
+    7.82 / 12.86 / 10.07 -> 6.20 / 9.82 / 7.74 (-21 %, -24 %, -23 %), fps 68.4 / 58.1 / 65.9 -> 70.8 / 59.0 / 67.7. Per change: hand-off
+    14.01 / 11.80 / 14.12 -> 12.78 / 10.38 / 12.23 ms; memo 12.19 / 12.85 -> 9.74 / 11.98 ms (first version); masked UNPACK 8.15 / 9.26 ->
+    7.98 / 9.03 ms. Without the stats the fps change is not resolvable (2 pairs, 67.4 / 72.9 -> 72.5 / 70.4): the EE thread (~8.7 ms per frame) and
+    the GS thread (6-8 ms) limit now, the worker needs 6.3 ms on a quiet machine (74.8 fps run).
+  - **Evidence.** 23 M XGKICK transfers, 9.6 M UNPACKs, all memo entries (~500 k code changes) and every packet's A+D scan compared with the
+    old logic in one 235 s run: 0 differences; kzvu_test 1776 checks (new memo test), kzvu0_test 509, 0 failures. Frames and movies
+    (`KZ_IPU` unset) as before.
+  - **Tried and dropped.** An inline SSE compare in place of the CRT `memcmp` in microVU's program search (no change), JR/JALR as part of the
+    same program (`doJumpAsSameProgram`, no change).
+  - **Left.** The EE thread and the GS thread (the PCSX2 renderer) for 120 fps; in the worker `mVUcompileJIT<1>` (the JR/JALR call itself, ~9 % of its
+    busy time; `doConstProp` might remove some JRs but is untested and off in PCSX2) and the kzgs ring copy of ~5 MB per frame.

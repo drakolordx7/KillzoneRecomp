@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <functional>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -101,6 +102,16 @@ namespace
 	alignas(64) static std::atomic<u64> s_write_pos{0};
 	alignas(64) static std::atomic<u64> s_read_pos{0};
 	alignas(64) static std::atomic<s32> s_queued_frames{0};
+	// Wake-up hand-shake (patch 0022): atomic notify is a WakeByAddress call even when nobody sleeps, and the producer
+	// (VIF1 worker) did it once per GIF packet, the consumer once per command. The sleeper announces itself first, the
+	// waker checks the flag after its (seq_cst) store, so a wake-up is never lost (a sleeper that sees the new value
+	// does not wait, and wait() returns at once when the value already changed). KZGS_NOTIFY_ALWAYS=1 = the old behaviour.
+	alignas(64) static std::atomic<u32> s_consumer_sleeping{0};
+	alignas(64) static std::atomic<u32> s_producer_waiting{0};
+	static const bool s_notify_always = []() {
+		const char* v = std::getenv("KZGS_NOTIFY_ALWAYS");
+		return v && *v && *v != '0';
+	}();
 	static std::mutex s_produce_lock;
 	static u64 s_local_write = 0; // producer-side copy, guarded by s_produce_lock
 
@@ -128,9 +139,14 @@ namespace
 			u64 r = s_read_pos.load(std::memory_order_acquire);
 			while ((RING_SIZE - (s_local_write - r)) < required)
 			{
+				s_producer_waiting.store(1, std::memory_order_seq_cst);
+				r = s_read_pos.load(std::memory_order_seq_cst);
+				if ((RING_SIZE - (s_local_write - r)) >= required)
+					break;
 				s_read_pos.wait(r, std::memory_order_acquire);
 				r = s_read_pos.load(std::memory_order_acquire);
 			}
+			s_producer_waiting.store(0, std::memory_order_relaxed);
 
 			if (need > to_end)
 			{
@@ -154,8 +170,9 @@ namespace
 		hdr->a = a;
 		hdr->b = b;
 		s_local_write += sizeof(CmdHeader) + hdr->size;
-		s_write_pos.store(s_local_write, std::memory_order_release);
-		s_write_pos.notify_one();
+		s_write_pos.store(s_local_write, std::memory_order_seq_cst);
+		if (s_notify_always || s_consumer_sleeping.load(std::memory_order_seq_cst))
+			s_write_pos.notify_one();
 	}
 
 	static void Push(Cmd cmd, u32 a = 0, u32 b = 0, const void* payload = nullptr, u32 payload_bytes = 0)
@@ -336,9 +353,14 @@ namespace
 			u64 w = s_write_pos.load(std::memory_order_acquire);
 			while (w == r)
 			{
+				s_consumer_sleeping.store(1, std::memory_order_seq_cst);
+				w = s_write_pos.load(std::memory_order_seq_cst);
+				if (w != r)
+					break;
 				s_write_pos.wait(w, std::memory_order_acquire);
 				w = s_write_pos.load(std::memory_order_acquire);
 			}
+			s_consumer_sleeping.store(0, std::memory_order_relaxed);
 
 			const CmdHeader hdr = *reinterpret_cast<const CmdHeader*>(s_ring + (r % RING_SIZE));
 			const u8* payload = s_ring + (r % RING_SIZE) + sizeof(CmdHeader);
@@ -427,8 +449,9 @@ namespace
 			}
 
 			r += sizeof(CmdHeader) + hdr.size;
-			s_read_pos.store(r, std::memory_order_release);
-			s_read_pos.notify_all();
+			s_read_pos.store(r, std::memory_order_seq_cst);
+			if (s_notify_always || s_producer_waiting.load(std::memory_order_seq_cst))
+				s_read_pos.notify_all();
 			if (quit)
 				break;
 		}
