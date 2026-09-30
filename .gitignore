@@ -13,3 +13,6 @@ ext/sdl3/
 ext/kzvu/build/
 ext/kzvu/build-*/
 __pycache__/
+ext/kzvu/test/vu0_captures/
+dist/
+0x*
