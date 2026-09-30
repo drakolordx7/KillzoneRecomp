@@ -38,6 +38,8 @@ for name in sys.argv[1:]:
         print(f'{name}: fps={fps:.1f} (no usable [sched-stats] windows)')
         continue
     sl = statistics.mean(sleeps[w])
-    sched_ns = statistics.mean((around[i] * 10.0 - sleeps[i]) * 1e6 / disp[i] for i in range(15, min(20, len(around), len(disp), len(sleeps))))
+    idx = [i for i in range(15, min(20, len(around), len(disp), len(sleeps))) if disp[i] > 0]
+    # PS2X_SCHED_STATS=3 (pacing sleep only) reports dispatch=0: no per-dispatch figures then
+    sched = f'{statistics.mean((around[i] * 10.0 - sleeps[i]) * 1e6 / disp[i] for i in idx):.0f} ns/dispatch' if idx else 'n/a (=3)'
     print(f'{name}: fps={fps:.1f}  sleep={sl:.0f} ms/s  busy/frame={(1000 - sl) / fps:.2f} ms  '
-          f'dispatch/s={statistics.mean(disp[w]):.0f}  sched={sched_ns:.0f} ns/dispatch')
+          f'dispatch/s={statistics.mean(disp[w]):.0f}  sched={sched}')
