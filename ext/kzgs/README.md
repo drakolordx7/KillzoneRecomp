@@ -75,7 +75,8 @@ void kzgsReset();                                     // full GS reset
 void kzgsResize(int width, int height);
 void kzgsUpdateConfig(const KzgsConfig& cfg);         // any setting, including a renderer switch
 void kzgsSync();                                      // wait until the GS thread has drained the queue
-bool kzgsReadback(std::vector<uint8_t>& rgba, int& w, int& h);  // last output frame, RGBA8, internal resolution
+bool kzgsReadback(std::vector<uint8_t>& rgba, int& w, int& h,
+                  int presentWidth = 0, int presentHeight = 0);  // last output frame, RGBA8; internal resolution, or as presented in a window of that size
 void kzgsSetLogCallback(KzgsLogFn fn);
 ```
 
@@ -216,6 +217,14 @@ ext/kzgs/build/kzgs_replay.exe work/trace_full2.bin work/kzdbg/out --every 100 [
 - `--pcrtc` prints PCSX2's display-circuit state: display and framebuffer rects, offsets and magnification.
 - `--vram` reads the texture cache back into local memory. It then prints nonzero bytes per 256 KB of VRAM and
   writes each requested CT32 buffer (FBP:FBW) as a PNG.
+- `--targets` prints the texture cache's render targets (TBP, size, valid/drawn rects) and writes each as a PNG.
+- `--thumbs FILE --nopng` writes one 64x56 RGB thumbnail per sampled frame to a binary file, to compare two runs
+  (renderers, settings) frame by frame without storing every PNG. `--from N` only samples frames >= N.
+- `--present WxH [--aspect 16:9|4:3|stretch] [--crop l,t,r,b]` also writes `present_<frame>.png`, the frame scaled and
+  aspect-corrected as presented in a window of that size. `--adapter NAME`, `--hpo N`, `--native N`, `--fxaa`,
+  `--antiblur 0|1`, `--interlace N` set the matching `KzgsConfig` fields.
+- `--sleep MS [--sleep-from N]` waits between vsyncs, so the GS thread has idle time as in the game (a replay without
+  pacing keeps the GS thread saturated and hides pacing-dependent renderer bugs).
 - `--dump-draws F:N` turns on PCSX2's own per-draw dumps (context registers, vertices, transfers) for N draws
   starting at frame F.
 - `--tex TBP:TBW:PSM:W:H[:CBP]` decodes a texture from GS local memory into color and alpha PNGs. PSM can be

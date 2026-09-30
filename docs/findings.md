@@ -838,3 +838,73 @@ name, no keyboard input in menus. All four reproduced headless and fixed.
   additions appended). No D-pad id is read during gameplay (`KZ_PAD_LOG`, each direction held 2 s).
 - Test hooks: `KZ_MC_ROOT=<dir>` memory card folder; `KZ_INPUT_SCRIPT` items `t:type=text`, `t:textenter|textback|
   textcancel`, `b<t>:...` (dropped once the name is entered) and `v<t>:...` (seconds after the name is entered).
+
+## Display edge artifacts and doubled menus (2026-09-30, play-test report)
+
+Report: "a pixelly line along the top and left edge" and "menus look doubled up and a bit bugged", 16:9, auto upscale.
+Both were reproduced with headless runs (hidden window of the monitor's size, `KZ_WINDOW_SIZE=2560x1440`) and traced
+with `kzgs_replay` on recorded GS traces. The existing `gs_*.png` captures read the merged output at internal
+resolution, which is not the presented image. `KZ_SHOT_PRESENT=1` now also writes `gp_*.png`: the frame scaled and
+aspect-corrected to the window (`kzgsReadback(.., presentW, presentH)`). Both file names carry the GS frame number.
+Other automation switches: `KZ_UPSCALE=n`, `KZ_RENDERER=d3d11|d3d12|vulkan`, `KZ_CROP=l,t,r,b`, `KZ_VS_EXPAND=0|1`,
+`KZGS_GS_OPTS=Name=0|1,..`; `run_headless.ps1 -ExeDir -EnvSet "A=1|B=2"`.
+
+### 1. Dotted line on the top and left edge
+
+- **Reproduced.** Live run, 2560x1440 window (auto upscale 4x, FXAA on), mission-failed screen, `gs_049_t250s.png`
+  (2048x1792): columns x=0 and x=1 differ from the background colour in 1791 and 1788 of 1792 rows (column 2 in 104),
+  and rows 7..9 are garbage across the width; rows 0..6 are the black band. The garbage is multicoloured 1 px dots.
+  In gameplay the same strips are a brighter 1-px rim instead of noise (the stale content happens to be similar).
+  Crops: `work/fix_proof/edge_FAILED_screen_BEFORE_garbage_2560x1440.png`.
+- **Geometry.** PCSX2's display circuit (`kzgs_replay --pcrtc`): `displayRect (0,2,512,450)` (the game programs DY=52), so
+  the merged 512x448 output has 2 black lines on top, and game frame row 0 / column 0 sit at merged line 2 / column 0.
+  At 4x the bad strip is 2 px wide (x 0..1) and 2 lines high (merged rows 8..9): half a native pixel.
+- **Root cause (measured).** `halfPixelOffset=4 (Native)`, the Killzone GameIndex setting kzgs applies. Replay of a
+  gameplay frame at 4x, first rows after the black band, mean level: Native `39 39 31 31 31`, Off/Normal/SpecialAggressive
+  `31 31 31 31 32`; `nativeScaling` 0..4 changes nothing; at 1x there is no rim at all. So Native leaves the top/left half
+  native pixel of an upscaled frame holding whatever the target held before (stale VRAM); which pass does not cover it was
+  not traced to a draw. The other hpo values are not a fix: post effects (glow) move by half a pixel, which is why the
+  GameIndex entry exists.
+- **Fix.** Presentation crop, which is PCSX2's own `Crop` option and does not touch rendering: 4 columns each side and
+  3 top / 4 bottom lines (`toKzgs`). Top 3 = the 2 black lines + game row 0; left 4 covers column 0. The total is 8 x 7,
+  i.e. the 512:448 aspect, so the picture keeps its shape; a smaller crop such as 1,3,0,0 changes the aspect slightly
+  and PCSX2 then letterboxes 3 px bars on a 16:9 window (seen in the replay), which would have been a new line.
+  Measured on the presented image (replay, FXAA, 16:9): before the first rows are `0 0 0 0 0 0 21 37 33 31` (2560x1440,
+  2x) or `0 x9 15` (3840x2160, 4x) and the left columns `63 63 63 64`/`62 63 63 63`; after `31 31 31 ...` and
+  `64 64 64 ...` from pixel 0, at 2x/3x/4x (1440p) and 4x/5x/6x (2160p), no bars.
+  Live before/after (gameplay): `work/fix_proof/edge_gameplay_top_left_before_after_2560x1440.png`,
+  `work/fix_proof/edge_gameplay_top_left_after_3840x2160.png`.
+- Cost: 1.6 % of each dimension (2 of the 7 lines were the black band); a CRT's overscan hides far more, the HUD boxes lose a few pixels.
+
+### 2. Doubled / bugged menus
+
+- **Reproduced.** Front-end menus (Game > Campaign/Battlefields, profile list, level/character select), live capture at 4x:
+  frames where the text is doubled 1-2 lines apart, the picture is dimmer and white dashes appear, next to clean frames.
+  The same frames appear at 1x, so it is not an upscaling effect. Replaying the recorded menu trace
+  (`KZ_GS_TRACE`, 6000 frames) through PCSX2's software renderer gives the correct picture and is deterministic
+  (0 of 41 frames differ between two runs).
+- **Root cause (measured): PCSX2's D3D11 renderer on NVIDIA with vertex-shader sprite expansion.** Same trace, frames 4400-4440,
+  compared with the software renderer, RTX 3080: D3D11 3 to 7 wrong frames in each of 4 runs (the wrong window moves between
+  runs); D3D12 and Vulkan 0 of 41 in 2+2 runs; D3D11 on the Intel UHD 770 0 of 41. The menu's glow composite is drawn as
+  SPRITE strips, the primitive type the vertex-shader expansion handles (a plausible link, not shown draw by draw). With it off, D3D11 had 0 wrong frames
+  in 8 paced runs (2/4/8/16 ms between vsyncs, 16 frames each) and 3 of 3 at 20 ms, while the default D3D11 was wrong in
+  7 of 8 and 3 of 3. Other switches did not help (`DisableFramebufferFetch`, `UserHacks_DisablePartialInvalidation`,
+  `UserHacks_DisableRenderFixes`, `UserHacks_DisableDepthSupport`); `UserHacks_DisableSafeFeatures` did but is broader.
+  At 4x with FXAA (the shipped settings) D3D11 with VS expand was wrong in 1 of 3 runs and differed from D3D12 by a mean
+  1.3 (per channel, 0..255) even in the "clean" runs; with it off it equals D3D12 exactly (0.0 in 3 of 3).
+  The failure only shows while the GS thread has idle time between frames (a replay that keeps it saturated, or
+  captures taken every frame from frame 1, did not show it), which is why it is intermittent in play.
+  Proof montage (rows: D3D11 default, D3D11 fixed, D3D12; columns: 3 frames of the same trace, 4x FXAA):
+  `work/fix_proof/menu_d3d11_default_vs_fixed_vs_d3d12_4x.png`.
+- **Not shown / caveats.** The mechanism inside the NVIDIA driver is not proven. Every readback changes GS timing, so a
+  live capture cannot see the bug directly: after the readback was changed to a download texture (below) six live runs (1x/2x/4x D3D11, 4x D3D12, 1x D3D12,
+  1x Vulkan, about 50 captures each, compared with the software renderer on the matching trace frame) showed no wrong frame, and the wrong-frame windows last only a few frames at menu
+  transitions. The evidence is the paced GS trace replay, which uses the same code and GPU as the game.
+  Also measured: `GSSaveSnapshotToMemory` (the old readback) allocates and recycles a pooled render target and made
+  ~25 % of later live frames wrong even with VS expand off (13 of 46 captures), so the earlier screenshots were partly
+  measuring their own capture. `kzgsReadback` now copies the output through a download texture (no pooled target).
+- **Fix.** `toKzgs`: D3D11 renders with `vertexShaderExpand = false`. No measurable cost (300 gameplay frames at 4x replay in
+  ~1.0 s with and without). D3D12/Vulkan keep it.
+- Checked and unrelated: PCRTC anti-blur is active (both circuits read the same lines, `fbRect (0,0,512,448)` and
+  `(0,0,512,447)`), turning deinterlacing off gives a bit-identical bad frame, FXAA is not the cause (wrong frames also without it), and the
+  present-skip logic in `kz_gs.cpp` is not involved (the replay calls `kzgsVsync` for every recorded vsync and still shows it).
