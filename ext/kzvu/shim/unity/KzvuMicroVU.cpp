@@ -153,6 +153,10 @@ namespace
 	// feeds one lane, every lane has its own start value, the lanes are folded with extra rounds). States are only compared
 	// by this key, without keeping the content: not a cryptographic hash, but a chance of ~2^-128 per pair of different
 	// contents for non-adversarial data (KZVU_STATE_MEMO_VERIFY=1 also compares the content).
+#if defined(__clang__)
+	// MSVC accepts _mm_aesenc_si128 without any /arch flag; clang wants the target feature on the function.
+	__attribute__((target("aes")))
+#endif
 	MemoKey memoHash(const u8* p)
 	{
 		const __m128i* q = reinterpret_cast<const __m128i*>(p);

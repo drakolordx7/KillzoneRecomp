@@ -6,8 +6,8 @@ $out = "$wd\work\$Name"; Remove-Item -Recurse -Force $out -ErrorAction SilentlyC
 $env:KZ_FPS = '120'
 if ($Ipu) { Remove-Item env:KZ_IPU -ErrorAction SilentlyContinue } else { $env:KZ_IPU = 'off' }
 $env:KZ_INPUT_SCRIPT = '60:start:0.3;80:cross:0.3;90:cross:0.3;100:cross:0.3;110:cross:0.3;120:cross:0.3;130:cross:0.3;140:cross:0.3;150:cross:0.3;160:cross:0.3'
-$env:KZ_PROFILE = $(if ($Profile) { '160,40' } else { '' })
-$env:KZ_PROFILE_OUT = $(if ($Profile) { "$out\profile.txt" } else { '' })
+# An empty KZ_PROFILE still counts as set (the game starts its 20 s sampling profiler at t=0), so remove the variable.
+if ($Profile) { $env:KZ_PROFILE = '160,40'; $env:KZ_PROFILE_OUT = "$out\profile.txt" } else { Remove-Item env:KZ_PROFILE, env:KZ_PROFILE_OUT -ErrorAction SilentlyContinue }
 $env:PS2X_VIF1_STATS = $(if ($NoStats) { '' } else { '1' })
 $env:_NT_SYMBOL_PATH = "$wd\build\$Config"   # the PDB sits next to the exe (linked with /PDBALTPATH:%_PDB%)
 $env:PS2X_HEADLESS = '1'; $env:PS2X_HEADLESS_INTERVAL = '10'; $env:PS2X_HEADLESS_SECONDS = "$Seconds"

@@ -6,6 +6,10 @@
 
 #include "ps2_runtime.h"
 #include "kz_sampler.h"
+
+#ifdef KZ_PGO_GEN
+extern "C" int __llvm_profile_write_file(void);
+#endif
 #include "kz_config.h"
 #include "kz_input.h"
 #include "kz_iso.h"
@@ -378,6 +382,9 @@ int main(int argc, char *argv[])
 
         std::cout.flush();
         std::cerr.flush();
+#ifdef KZ_PGO_GEN
+        __llvm_profile_write_file(); // std::_Exit skips the profile runtime's atexit writer (KZ_CLANG_PGO_GEN builds)
+#endif
         std::_Exit(0);
     }
     catch (const std::exception &e)
