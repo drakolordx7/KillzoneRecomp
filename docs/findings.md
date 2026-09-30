@@ -856,6 +856,11 @@ Other automation switches: `KZ_UPSCALE=n`, `KZ_RENDERER=d3d11|d3d12|vulkan`, `KZ
   and rows 7..9 are garbage across the width; rows 0..6 are the black band. The garbage is multicoloured 1 px dots.
   In gameplay the same strips are a brighter 1-px rim instead of noise (the stale content happens to be similar).
   Crops: `work/fix_proof/edge_FAILED_screen_BEFORE_garbage_2560x1440.png`.
+  Same scene, same frame number (f36532, t=304 s) in two live runs, old settings (`KZ_CROP=0,0,0,0 KZ_VS_EXPAND=1`) and
+  the fix, presented 2560x1440: pixels differing from the background colour in the top 14 rows: before
+  `2100 x6, 2060, 2097, 134, 0 ...` (rows 0..5 are the black band, 6..8 the dotted line), after 0 in all 14 rows; left 14
+  columns before `995 994 977 65 0 ...`, after 0. Crops: `work/fix_proof/edge_FAILED_screen_top_before_after_2560x1440.png`,
+  `work/fix_proof/edge_FAILED_screen_left_before_after_2560x1440.png`.
 - **Geometry.** PCSX2's display circuit (`kzgs_replay --pcrtc`): `displayRect (0,2,512,450)` (the game programs DY=52), so
   the merged 512x448 output has 2 black lines on top, and game frame row 0 / column 0 sit at merged line 2 / column 0.
   At 4x the bad strip is 2 px wide (x 0..1) and 2 lines high (merged rows 8..9): half a native pixel.
