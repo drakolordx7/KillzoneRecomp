@@ -192,3 +192,71 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
   PS2Recomp DQ8 fork (PR #254). Together with release-grade compiler flags for RelWithDebInfo (top-level
   CMakeLists.txt: /Ob3 /GS- /arch:AVX2 /Qspectre- /Gy /Gw, /INCREMENTAL:NO /OPT:REF,ICF): Killzone in-game
   18.6 -> 29.4 frames/s at 60 Hz vblank (headless, same scene).
+
+- `0015-iop-thread.patch`: the IOP emulator and SPU2 mixing run on their own host thread (`PS2X_IOP_THREAD`, default 1;
+  `PS2X_IOP_THREAD=0` keeps the synchronous path of patches 0011-0013, run from `EeScheduler::accountCycles`).
+  Touches only `.cpp` files and headers that generated code does not include (no full rebuild). Design:
+  - **Time.** `PS2Runtime::advanceIopEeCycles` no longer runs the IOP. It sums the EE cycles `accountCycles` reports
+    (already clamped to wall time) and publishes the total with one atomic store per 2048 EE cycles
+    (`IopSubsystem::publishEeCycles`). The IOP thread (started by the first publish; `_beginthreadex`, 4 MB stack,
+    FTZ/DAZ set like the EE thread) consumes the difference, IOP time = EE/8 as in `IopEmulator::runEeCycles`, so it
+    never runs ahead of the published EE clock. It runs in chunks of 4096 IOP cycles (~110 us) with a lock, hands the
+    lock to any EE-side caller that queued for it (`execWaiters`; `std::mutex` is not fair), and sleeps ~100 us
+    (high-resolution waitable timer) whenever less than 2048 IOP cycles are pending.
+  - **EE -> IOP.** `IopSubsystem::enableThread(true)` puts every public entry point behind one recursive lock
+    (`Impl::ExecGuard`): `reset`, `loadModule`, `loadModuleBuffer`, `stopModule`, `runEeCycles`, `selectRpcAbi`,
+    `canBindRpc`, `handleRpc`, `onSifTransfer`, `allocate/free/read/write/zeroMemory`, `debugSnapshot`
+    (`isMemoryRange` only does arithmetic). Recursive because handleRpc -> HLE service -> host -> `readIopMemory`
+    re-enters. A synchronous RPC therefore still runs the RPC server function inline on the EE thread while it holds
+    the lock (including the outside-thread `WaitSema` / `WaitEventFlag` scheduler runs of patches 0006/0013, which
+    advance IOP time on the EE thread; that time is not paid back, exactly as before). Lock order is always
+    `PS2IopHostAdapter::m_callMutex` -> IOP lock; the IOP thread takes only the IOP lock.
+  - **IOP -> EE.** The IOP emulator reaches the EE only through `IopHost`. Everything the IOP thread does there:
+    `readGuest`/`writeGuest`/`zeroGuest` (SIF DMA `sceSifSetDma`, the extra data of `sceSifSendCmd`,
+    `sceSifGetOtherData`) touch EE RAM directly (a plain memcpy, like the real SIF DMA engine; the adapter ignores the
+    EE thread's call scope on the IOP thread); host file reads and `log` were already thread-safe; `sendSifCommand` no
+    longer calls `dispatchSifCommand` (guest heap allocation + `EeScheduler::queueInvocation`, EE-thread only). It
+    queues the packet in `PS2IopHostAdapter` and posts one `EeEventType::Dmac` event with id `kIopPostedWorkEventId`
+    (`ps2_iop_post.h`); `EeScheduler::processEvent` calls `ps2IopDrainPosted` on the EE thread, which dispatches the
+    queue in order. The IOP never raises EE interrupts or completes RPCs itself (RPC results and end callbacks stay
+    on the EE thread inside `handleRpc`), so there is nothing else to post.
+  - **SPU2.** `iop_host_spu2.h` hooks and `kz_audio.cpp` state now run on the IOP thread (or on the EE thread while it
+    holds the lock); calls are serialised, the SDL audio thread only reads the atomic ring. `kz_audio`'s wall-clock
+    pacing is unchanged.
+  - **Debug.** `PS2X_IOP_THREAD_STATS=1` prints `[iop-thread]` lines every 5 s: IOP thread busy %, published-consumed lag,
+    IOP time lead over EE/8, EE lock calls/wait, and EE-side drain counts.
+
+- `0017-codegen-register-locals.patch` (recompiler + new header `ps2xRuntime/include/ps2_cg.h`; needs `build_ps2recomp.bat`,
+  a regen with `PS2X_CODEGEN=locals`, and a full rebuild). An alternative code generator; the classic output is unchanged
+  when `PS2X_CODEGEN` is unset (verified byte for byte against `generated/`). `tools/scripts/regen.py` takes
+  `KZ_GEN_DIR` / `KZ_GEN_TMP` / `KZ_MERGED` / `KZ_RECOMP_EXE` / `KZ_RECOMP_LOG` so the output can go elsewhere, e.g.
+  `PS2X_CODEGEN=locals KZ_GEN_DIR=D:/KillzoneRecomp/work/generated_cg python tools/scripts/regen.py`.
+  `PS2X_CODEGEN_FUNCS=<file>` (one hex function start per line) restricts it to those functions; the rest stay classic
+  (both kinds share translation units, all new macros are `L_`/`ps2Cg` prefixed).
+  - **Guest GPRs are C++ locals.** Every function loads the low 64 bits of the registers it touches (`gprN`; `gprhN`
+    for registers used by 128-bit ops: LQ/SQ/MMI) from `ctx->r[]` at entry (also after a resume `switch`), and writes the
+    modified ones back (`PS2_FLUSH`) before anything that can observe `ctx`: calls, syscalls and stubs, returns, yields,
+    exits through an external branch. `PS2_RELOAD` follows calls and stubs. The C++ optimizer removes reloads of dead
+    registers. The generator emits classic macro text first, then `rewriteForLocals` (function_emitter.cpp) rewrites it
+    (`GPR_U32(ctx, 4)` -> `L_GPR_U32(4)`, writes to $zero -> `PS2_DISCARD`) and records the register sets. MOVZ/MOVN move
+    only the low 64 bits in this mode (as the EE does). Memory slow paths (MMIO Load/Store) and `drainCompletedDmacHandlers`
+    do not read GPRs, so plain loads and stores need no sync.
+  - **`ctx->pc` is no longer stored per instruction.** It is set where somebody reads it: before statements that call
+    into the runtime (`runtime->`, `ps2_stubs::`, `ps2_syscalls::`), before calls, at returns and yields, and when a
+    jump targets a delay slot address (the resume-from-delay-slot check reads it). The `in_delay_slot`/`branch_pc` stores
+    are only emitted for delay slots that call the runtime.
+  - **Direct calls with an inline budget** (`ps2CgCall`). JAL/JALR read the function table directly (hooks installed with
+    `replaceFunction` still apply) and keep `dispatchGuestBranch`'s unwind protocol: `g_ps2GuestUnwinding`, the return pc
+    check and the `ctx->pc == callee entry` rule (slow path `ps2CgAfterCallSlow`). Branch history, `hasFunction`,
+    `lookupFunction` and the per-call `checkpointDue` are gone from the fast path. Calls and loop back edges subtract 8 and 32
+    from `g_ps2EeBudget`; when it runs out the accumulated charge is passed to `eeCheckpointDue` (`ps2CgBudgetSlow`).
+    Refill is 256 cycles (`PS2X_EE_BUDGET` overrides; `PS2X_STRESS_YIELD` forces 1 so every check is a scheduler
+    checkpoint). 1024 hung the movie player (KZ_IPU on): the IOP file read never completed, 3 of 3 runs, while 64, 256 and
+    512 booted to the menu (3 of 3 at 256 after the final build). The control build is fine with `PS2X_IOP_BATCH` up to 4096,
+    so that is a coarse-EE-charge interaction with the IOP, not a guest-code bug.
+  - **Memory access**: `L_READ*`/`L_WRITE*` are inline functions with one range compare (`addr <= 32 MB - size`) and a
+    typed access; everything else takes the old special-address path out of line.
+  - `-DPS2_CG_CLASSIC_CHECKPOINTS` builds the runtime side with the old per-call/per-back-edge scheduler charge (measurement
+    variant: locals without the direct-call/budget part).
+  - Compile cost: the locals output is smaller (FUN_00153d28, the largest function: 1.4 MB object vs 2.7 MB, 20 s vs 42 s to compile), and the
+    executable is half the size (102 MB vs 211 MB).

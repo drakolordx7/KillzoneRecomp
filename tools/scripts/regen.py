@@ -11,10 +11,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 CFG = ROOT / "config" / "killzone.toml"
 ANALYZER_TOML = ROOT / "work" / "analyzer.toml"
-MERGED = ROOT / "work" / "killzone.merged.toml"
-TMP = ROOT / "work" / "gen_tmp"
-GEN = ROOT / "generated"
-RECOMP = ROOT / "build" / "ps2recomp" / "ps2xRecomp" / "ps2_recomp.exe"
+# KZ_GEN_DIR / KZ_GEN_TMP / KZ_MERGED / KZ_RECOMP_EXE redirect the run (used for alternative code generators, e.g.
+# PS2X_CODEGEN=locals into work/generated_cg) without touching generated/.
+MERGED = Path(os.environ.get("KZ_MERGED", ROOT / "work" / "killzone.merged.toml"))
+TMP = Path(os.environ.get("KZ_GEN_TMP", ROOT / "work" / "gen_tmp"))
+GEN = Path(os.environ.get("KZ_GEN_DIR", ROOT / "generated"))
+RECOMP = Path(os.environ.get("KZ_RECOMP_EXE", ROOT / "build" / "ps2recomp" / "ps2xRecomp" / "ps2_recomp.exe"))
 ANALYZER = ROOT / "build" / "ps2recomp" / "ps2xAnalyzer" / "ps2_analyzer.exe"
 
 
@@ -57,7 +59,7 @@ def main() -> int:
     MERGED.write_text(merged_config())
     if TMP.exists():
         shutil.rmtree(TMP)
-    log = ROOT / "work" / "recomp.log"
+    log = Path(os.environ.get("KZ_RECOMP_LOG", ROOT / "work" / "recomp.log"))
     with log.open("w") as f:
         r = subprocess.run([str(RECOMP), str(MERGED)], stdout=f, stderr=subprocess.STDOUT)
     if r.returncode != 0:

@@ -1,0 +1,1005 @@
+diff --git a/ps2xRecomp/include/ps2recomp/code_generator.h b/ps2xRecomp/include/ps2recomp/code_generator.h
+index 1bdf0f6..ec78bed 100644
+--- a/ps2xRecomp/include/ps2recomp/code_generator.h
++++ b/ps2xRecomp/include/ps2recomp/code_generator.h
+@@ -72,6 +72,19 @@ namespace ps2recomp
+         RecompilerReporter *m_reporter = nullptr;
+         std::string m_currentFunctionName;
+ 
++        // Register-locals code generation (runtime side: ps2_cg.h). PS2X_CODEGEN=locals enables it for every
++        // function; PS2X_CODEGEN_FUNCS=<file> (one hex start address per line) restricts it to those functions.
++        bool m_localsEnabled = false;
++        bool m_localsRestricted = false;
++        std::unordered_set<uint32_t> m_localsFunctions;
++        bool m_localsMode = false; // the function being emitted uses locals
++        std::unordered_set<uint32_t> m_curDelaySlotAddrs; // delay slot addresses of the current function
++        bool usesLocals(uint32_t functionStart) const;
++        // Text classification for locals mode: does the emitted statement need ctx->pc / a full GPR sync?
++        static bool codeNeedsPc(const std::string &code);
++        static bool codeNeedsSync(const std::string &code);
++        std::string wrapSync(const std::string &code) const;
++
+         std::string translateInstruction(const Instruction &inst);
+         std::string translateInstruction(const Instruction &inst, const MemoryAccessHint &memoryHint);
+         std::string emitUnhandledInstruction(const Instruction &inst, const std::string &message);
+diff --git a/ps2xRecomp/src/lib/code_generator.cpp b/ps2xRecomp/src/lib/code_generator.cpp
+index 68b0984..b13bca7 100644
+--- a/ps2xRecomp/src/lib/code_generator.cpp
++++ b/ps2xRecomp/src/lib/code_generator.cpp
+@@ -19,6 +19,8 @@
+ #include "ps2_runtime_calls.h"
+ 
+ #include <fmt/format.h>
++#include <cstdlib>
++#include <fstream>
+ #include <sstream>
+ #include <algorithm>
+ #include <cstring>
+@@ -103,6 +105,52 @@ namespace ps2recomp
+         {
+             m_symbols.emplace(symbol.address, symbol);
+         }
++
++        if (const char *mode = std::getenv("PS2X_CODEGEN"))
++        {
++            m_localsEnabled = std::string(mode) == "locals";
++        }
++        if (const char *funcs = std::getenv("PS2X_CODEGEN_FUNCS"))
++        {
++            std::ifstream in(funcs);
++            std::string line;
++            while (std::getline(in, line))
++            {
++                if (line.empty() || line[0] == '#')
++                    continue;
++                m_localsFunctions.insert(static_cast<uint32_t>(std::strtoul(line.c_str(), nullptr, 16)));
++            }
++            m_localsRestricted = true;
++        }
++    }
++
++    bool CodeGenerator::usesLocals(uint32_t functionStart) const
++    {
++        if (!m_localsEnabled)
++            return false;
++        return !m_localsRestricted || m_localsFunctions.contains(functionStart);
++    }
++
++    bool CodeGenerator::codeNeedsPc(const std::string &code)
++    {
++        return code.find("runtime->") != std::string::npos ||
++               code.find("ps2_syscalls::") != std::string::npos ||
++               code.find("ps2_stubs::") != std::string::npos;
++    }
++
++    bool CodeGenerator::codeNeedsSync(const std::string &code)
++    {
++        return code.find("ps2_syscalls::") != std::string::npos ||
++               code.find("ps2_stubs::") != std::string::npos ||
++               code.find("handleSyscall") != std::string::npos ||
++               code.find("handleBreak") != std::string::npos;
++    }
++
++    std::string CodeGenerator::wrapSync(const std::string &code) const
++    {
++        if (!m_localsMode || !codeNeedsSync(code))
++            return code;
++        return "PS2_FLUSH();\n" + code + "\nPS2_RELOAD();";
+     }
+ 
+     void CodeGenerator::setRenamedFunctions(const std::unordered_map<uint32_t, std::string> &renames)
+diff --git a/ps2xRecomp/src/lib/control_flow_emitter.cpp b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+index 4bf8dc5..fd9795a 100644
+--- a/ps2xRecomp/src/lib/control_flow_emitter.cpp
++++ b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+@@ -131,11 +131,18 @@ namespace ps2recomp
+             return;
+         }
+ 
+-        m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, delayPc());
+-        m_ss << fmt::format("{}ctx->in_delay_slot = true;\n", indent);
+-        m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
++        const bool locals = m_gen.m_localsMode;
++        const std::string rawCode = delaySlotCode();
++        // Locals mode only publishes the delay slot state when the slot can call into the runtime.
++        const bool publishState = !locals || CodeGenerator::codeNeedsPc(rawCode);
++        if (publishState)
++        {
++            m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, delayPc());
++            m_ss << fmt::format("{}ctx->in_delay_slot = true;\n", indent);
++            m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
++        }
+ 
+-        const std::string code = delaySlotCode();
++        const std::string code = locals ? m_gen.wrapSync(rawCode) : rawCode;
+         std::istringstream lines(code);
+         std::string line;
+         while (std::getline(lines, line))
+@@ -146,7 +153,10 @@ namespace ps2recomp
+             }
+         }
+ 
+-        m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
++        if (publishState)
++        {
++            m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
++        }
+     }
+ 
+     void ControlFlowEmitter::emitResumeFromDelaySlotEntry()
+@@ -174,6 +184,25 @@ namespace ps2recomp
+ 
+     void ControlFlowEmitter::emitInternalTarget(uint32_t target, uint32_t sourcePc, std::string_view indent)
+     {
++        if (m_gen.m_localsMode)
++        {
++            // ctx->pc is only maintained where somebody reads it: a jump to a delay slot address relies on it (see
++            // emitResumeFromDelaySlotEntry), and a yield must publish the resume address.
++            if (m_gen.m_curDelaySlotAddrs.contains(target))
++            {
++                m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, target);
++            }
++            if (target <= sourcePc && !isCallLikeEdge())
++            {
++                m_ss << fmt::format("{}if (PS2_BACKEDGE_DUE()) [[unlikely]] {{\n", indent);
++                m_ss << fmt::format("{}    ctx->pc = 0x{:X}u;\n", indent, target);
++                m_ss << fmt::format("{}    PS2_FLUSH();\n", indent);
++                m_ss << fmt::format("{}    if (ps2CgBudgetSlow(runtime)) {{ return; }}\n", indent);
++                m_ss << fmt::format("{}}}\n", indent);
++            }
++            m_ss << fmt::format("{}goto label_{:x};\n", indent, target);
++            return;
++        }
+         m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, target);
+         if (target <= sourcePc && !isCallLikeEdge())
+         {
+@@ -220,6 +249,10 @@ namespace ps2recomp
+             return false;
+         }
+ 
++        if (m_gen.m_localsMode)
++        {
++            m_ss << indent << "PS2_FLUSH();\n";
++        }
+         m_ss << indent << functionName << "(rdram, ctx, runtime); return;\n";
+         return true;
+     }
+@@ -227,6 +260,17 @@ namespace ps2recomp
+     void ControlFlowEmitter::emitExternalJumpDispatch(uint32_t target, StaticBranchKind kind, std::string_view indent)
+     {
+         const bool isCall = kind == StaticBranchKind::Call;
++        if (m_gen.m_localsMode)
++        {
++            m_ss << indent << "PS2_FLUSH();\n";
++            if (isCall)
++            {
++                m_ss << fmt::format("{}if (!ps2CgCall(rdram, ctx, runtime, 0x{:X}u, 0x{:X}u, 0x{:X}u, false)) {{ return; }}\n",
++                                    indent, target, branchPc(), fallthroughPc());
++                m_ss << indent << "PS2_RELOAD();\n";
++                return;
++            }
++        }
+         emitRuntimeBranchDispatch(fmt::format("0x{:X}u", target),
+                                   branchPc(),
+                                   isCall ? fallthroughPc() : 0u,
+@@ -238,6 +282,15 @@ namespace ps2recomp
+ 
+     void ControlFlowEmitter::emitExternalRegisterCallDispatch(std::string_view jumpTargetExpression, std::string_view indent)
+     {
++        if (m_gen.m_localsMode)
++        {
++            m_ss << indent << "PS2_FLUSH();\n";
++            m_ss << indent << "ctx->pc = " << jumpTargetExpression << ";\n";
++            m_ss << fmt::format("{}if (!ps2CgCall(rdram, ctx, runtime, {}, 0x{:X}u, 0x{:X}u, true)) {{ return; }}\n",
++                                indent, jumpTargetExpression, branchPc(), fallthroughPc());
++            m_ss << indent << "PS2_RELOAD();\n";
++            return;
++        }
+         emitRuntimeBranchDispatch(jumpTargetExpression,
+                                   branchPc(),
+                                   fallthroughPc(),
+@@ -254,6 +307,12 @@ namespace ps2recomp
+     {
+         const bool isReturn = kind == RegisterBranchKind::Jump && rsReg == 31u;
+ 
++        if (m_gen.m_localsMode)
++        {
++            m_ss << indent << "PS2_FLUSH();\n";
++            m_ss << indent << "ctx->pc = " << jumpTargetExpression << ";\n";
++        }
++
+         if (isReturn)
+         {
+             m_ss << indent << "#if defined(PS2X_STRICT_RETURN_DIAGNOSTICS) && PS2X_STRICT_RETURN_DIAGNOSTICS\n";
+@@ -295,6 +354,10 @@ namespace ps2recomp
+         const bool isSyscall = !resolvedSyscallName.empty();
+         const std::string_view handlerName = isSyscall ? resolvedSyscallName : resolvedStubName;
+ 
++        if (m_gen.m_localsMode)
++        {
++            m_ss << indent << "PS2_FLUSH();\n";
++        }
+         m_ss << indent << "{\n";
+         if (kind == StaticBranchKind::Call)
+         {
+@@ -315,6 +378,10 @@ namespace ps2recomp
+         else
+         {
+             m_ss << fmt::format("{}if (ctx->pc != 0x{:X}u) {{ return; }}\n", indent, fallthroughPc());
++            if (m_gen.m_localsMode)
++            {
++                m_ss << indent << "PS2_RELOAD();\n";
++            }
+         }
+ 
+         return true;
+@@ -366,13 +433,21 @@ namespace ps2recomp
+         }
+ 
+         emitDelaySlot("        ");
+-        m_ss << "        ctx->pc = jumpTarget;\n";
++        if (!m_gen.m_localsMode)
++        {
++            m_ss << "        ctx->pc = jumpTarget;\n";
++        }
+ 
+         if (!sortedInternalTargets.empty())
+         {
+             m_ss << "        switch (jumpTarget) {\n";
+             for (uint32_t target : sortedInternalTargets)
+             {
++                if (m_gen.m_localsMode && m_gen.m_curDelaySlotAddrs.contains(target))
++                {
++                    m_ss << fmt::format("            case 0x{:X}u: ctx->pc = 0x{:X}u; goto label_{:x};\n", target, target, target);
++                    continue;
++                }
+                 m_ss << fmt::format("            case 0x{:X}u: goto label_{:x};\n", target, target);
+             }
+             m_ss << "            default: break;\n";
+@@ -501,6 +576,10 @@ namespace ps2recomp
+             }
+             else
+             {
++                if (m_gen.m_localsMode)
++                {
++                    m_ss << "            PS2_FLUSH();\n";
++                }
+                 m_ss << fmt::format("            ctx->pc = 0x{:X}u;\n", target);
+                 m_ss << "            return;\n";
+             }
+@@ -522,6 +601,10 @@ namespace ps2recomp
+             }
+             else
+             {
++                if (m_gen.m_localsMode)
++                {
++                    m_ss << "            PS2_FLUSH();\n";
++                }
+                 m_ss << fmt::format("            ctx->pc = 0x{:X}u;\n", target);
+                 m_ss << "            return;\n";
+             }
+@@ -533,7 +616,18 @@ namespace ps2recomp
+ 
+     void ControlFlowEmitter::emitFallbackInstruction()
+     {
+-        m_ss << "    " << m_gen.translateInstruction(m_branchInst) << "\n";
++        {
++            std::string code = m_gen.translateInstruction(m_branchInst);
++            if (m_gen.m_localsMode)
++            {
++                if (CodeGenerator::codeNeedsPc(code))
++                {
++                    m_ss << fmt::format("    ctx->pc = 0x{:X}u;\n", branchPc());
++                }
++                code = m_gen.wrapSync(code);
++            }
++            m_ss << "    " << code << "\n";
++        }
+         emitDelaySlot("    ");
+     }
+ 
+@@ -547,6 +641,10 @@ namespace ps2recomp
+ 
+     void ControlFlowEmitter::emitFinalFallthrough()
+     {
++        if (m_gen.m_localsMode)
++        {
++            return; // FunctionEmitter publishes the pc where the function ends
++        }
+         m_ss << fmt::format("    ctx->pc = 0x{:X}u;\n", fallthroughPc());
+     }
+ 
+@@ -554,7 +652,10 @@ namespace ps2recomp
+     {
+         (void)m_function;
+         emitResumeFromDelaySlotEntry();
+-        m_ss << fmt::format("    ctx->pc = 0x{:X}u;\n", branchPc());
++        if (!m_gen.m_localsMode)
++        {
++            m_ss << fmt::format("    ctx->pc = 0x{:X}u;\n", branchPc());
++        }
+ 
+         if (m_branchInst.opcode == OPCODE_J || m_branchInst.opcode == OPCODE_JAL)
+         {
+diff --git a/ps2xRecomp/src/lib/cop0_translator.cpp b/ps2xRecomp/src/lib/cop0_translator.cpp
+index 1823a39..2ef9db2 100644
+--- a/ps2xRecomp/src/lib/cop0_translator.cpp
++++ b/ps2xRecomp/src/lib/cop0_translator.cpp
+@@ -140,7 +140,7 @@ namespace ps2recomp
+             case COP0_CO_TLBP:
+                 return fmt::format("runtime->handleTLBP(rdram, ctx);");
+             case COP0_CO_ERET:
+-                return fmt::format(
++                return std::string(m_codeGenerator.m_localsMode ? "PS2_FLUSH();\n" : "") + fmt::format(
+                     "if (ctx->cop0_status & 0x4) {{ \n" // Check ERL bit (bit 2)
+                     "    ctx->pc = ctx->cop0_errorepc; \n"
+                     "    ctx->cop0_status &= ~0x4; \n" // Clear ERL bit
+diff --git a/ps2xRecomp/src/lib/function_emitter.cpp b/ps2xRecomp/src/lib/function_emitter.cpp
+index 3192e90..a3633f9 100644
+--- a/ps2xRecomp/src/lib/function_emitter.cpp
++++ b/ps2xRecomp/src/lib/function_emitter.cpp
+@@ -7,6 +7,9 @@
+ #include "ps2recomp/types.h"
+ 
+ #include <algorithm>
++#include <cctype>
++#include <fmt/format.h>
++#include <set>
+ #include <sstream>
+ #include <stdexcept>
+ #include <unordered_set>
+@@ -15,6 +18,169 @@ namespace ps2recomp
+ {
+     namespace
+     {
++
++        // ---- register-locals rewrite ---------------------------------------------------------------------------
++        struct LocalsUsage
++        {
++            std::set<int> used;    // GPRs read or written (low 64 bits)
++            std::set<int> written; // GPRs written (flushed back to ctx)
++            std::set<int> hiUsed;  // GPRs used by 128-bit ops (upper 64 bits kept as well)
++            std::set<int> hiWritten;
++        };
++
++        bool isIdentStart(char c) { return std::isalpha(static_cast<unsigned char>(c)) || c == '_'; }
++        bool isIdentChar(char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; }
++
++        // Rewrites the GPR / memory macros of a function body to their locals-mode forms and records which
++        // registers are touched:
++        //   GPR_U32(ctx, 4)           -> L_GPR_U32(4)
++        //   SET_GPR_S32(ctx, 4, v)    -> L_SET_GPR_S32(4, v)          (reg 0: PS2_DISCARD(v))
++        //   READ32(a) / WRITE32(a,v)  -> L_READ32(a) / L_WRITE32(a,v)
++        std::string rewriteForLocals(const std::string &in, LocalsUsage &use, const std::string &functionName)
++        {
++            static const std::unordered_set<std::string> kGet = {"GPR_U32", "GPR_S32", "GPR_U64", "GPR_S64", "GPR_VEC"};
++            static const std::unordered_set<std::string> kSet = {"SET_GPR_U32", "SET_GPR_S32", "SET_GPR_ZE32",
++                                                                 "SET_GPR_U64", "SET_GPR_S64", "SET_GPR_VEC"};
++            static const std::unordered_set<std::string> kMem = {"READ8", "READ16", "READ32", "READ64", "READ128",
++                                                                 "WRITE8", "WRITE16", "WRITE32", "WRITE64", "WRITE128"};
++            std::string out;
++            out.reserve(in.size() + in.size() / 8);
++            const size_t n = in.size();
++            size_t i = 0;
++            auto skipSpaces = [&](size_t &k)
++            {
++                while (k < n && (in[k] == ' ' || in[k] == '\t'))
++                    ++k;
++            };
++            auto fail = [&](const std::string &what, size_t at)
++            {
++                throw std::runtime_error("locals codegen: " + what + " in " + functionName + " near: " +
++                                         in.substr(at, 60));
++            };
++            while (i < n)
++            {
++                const char c = in[i];
++                if (!isIdentStart(c))
++                {
++                    out.push_back(c);
++                    ++i;
++                    continue;
++                }
++                size_t j = i;
++                while (j < n && isIdentChar(in[j]))
++                    ++j;
++                const std::string ident = in.substr(i, j - i);
++                const bool get = kGet.contains(ident);
++                const bool set = kSet.contains(ident);
++                if (get || set)
++                {
++                    size_t k = j;
++                    skipSpaces(k);
++                    if (k >= n || in[k] != '(')
++                        fail("expected '(' after " + ident, i);
++                    ++k;
++                    skipSpaces(k);
++                    if (in.compare(k, 3, "ctx") != 0)
++                        fail("expected ctx in " + ident, i);
++                    k += 3;
++                    skipSpaces(k);
++                    if (k >= n || in[k] != ',')
++                        fail("expected ',' in " + ident, i);
++                    ++k;
++                    skipSpaces(k);
++                    size_t d = k;
++                    while (d < n && std::isdigit(static_cast<unsigned char>(in[d])))
++                        ++d;
++                    if (d == k)
++                        fail("non-literal register in " + ident, i);
++                    const int reg = std::atoi(in.substr(k, d - k).c_str());
++                    if (reg < 0 || reg > 31)
++                        fail("register out of range", i);
++                    k = d;
++                    const bool vec = ident.size() >= 3 && ident.compare(ident.size() - 3, 3, "VEC") == 0;
++                    if (set)
++                    {
++                        skipSpaces(k);
++                        if (k >= n || in[k] != ',')
++                            fail("expected value in " + ident, i);
++                        ++k;
++                        skipSpaces(k);
++                        if (reg == 0)
++                        {
++                            out += "PS2_DISCARD(";
++                        }
++                        else
++                        {
++                            out += "L_" + ident + "(" + std::to_string(reg) + ", ";
++                            use.used.insert(reg);
++                            use.written.insert(reg);
++                            if (vec)
++                            {
++                                use.hiUsed.insert(reg);
++                                use.hiWritten.insert(reg);
++                            }
++                        }
++                    }
++                    else
++                    {
++                        out += "L_" + ident + "(" + std::to_string(reg);
++                        use.used.insert(reg);
++                        if (vec && reg != 0)
++                            use.hiUsed.insert(reg);
++                    }
++                    i = k;
++                    continue;
++                }
++                if (kMem.contains(ident))
++                {
++                    out += "L_" + ident;
++                    i = j;
++                    continue;
++                }
++                out += ident;
++                i = j;
++            }
++            if (out.find("ctx->r[") != std::string::npos)
++                fail("direct ctx->r[] access", out.find("ctx->r["));
++            return out;
++        }
++
++        std::string localsPrologue(const LocalsUsage &use)
++        {
++            std::string p;
++            if (use.used.contains(0))
++            {
++                p += "    constexpr uint64_t gpr0 = 0; constexpr uint64_t gprh0 = 0; (void)gpr0; (void)gprh0;\n";
++            }
++            for (int r : use.used)
++            {
++                if (r == 0)
++                    continue;
++                p += fmt::format("    uint64_t gpr{} = PS2_CG_LO(ctx, {});\n", r, r);
++                if (use.hiUsed.contains(r))
++                    p += fmt::format("    uint64_t gprh{} = PS2_CG_HI(ctx, {});\n", r, r);
++            }
++            p += "#define PS2_FLUSH() do { \\\n";
++            for (int r : use.written)
++            {
++                p += fmt::format("        PS2_CG_LO(ctx, {}) = gpr{}; \\\n", r, r);
++                if (use.hiWritten.contains(r))
++                    p += fmt::format("        PS2_CG_HI(ctx, {}) = gprh{}; \\\n", r, r);
++            }
++            p += "    } while (0)\n";
++            p += "#define PS2_RELOAD() do { \\\n";
++            for (int r : use.used)
++            {
++                if (r == 0)
++                    continue;
++                p += fmt::format("        gpr{} = PS2_CG_LO(ctx, {}); \\\n", r, r);
++                if (use.hiUsed.contains(r))
++                    p += fmt::format("        gprh{} = PS2_CG_HI(ctx, {}); \\\n", r, r);
++            }
++            p += "    } while (0)\n";
++            return p;
++        }
++
+         Instruction makeSyntheticDelaySlot(uint32_t address)
+         {
+             Instruction inst{};
+@@ -40,6 +206,22 @@ namespace ps2recomp
+         std::stringstream ss;
+         cg.m_currentFunctionName = function.name;
+ 
++        // Register-locals mode (PS2X_CODEGEN=locals): see ps2_cg.h. The function body is generated with the classic
++        // macros first, then rewritten to use C++ locals for the guest GPRs.
++        const bool locals = cg.usesLocals(function.start);
++        cg.m_localsMode = locals;
++        cg.m_curDelaySlotAddrs.clear();
++        if (locals)
++        {
++            for (size_t i = 0; i + 1 < instructions.size(); ++i)
++            {
++                if (instructions[i].hasDelaySlot && instructions[i + 1].address == instructions[i].address + 4u)
++                {
++                    cg.m_curDelaySlotAddrs.insert(instructions[i].address + 4u);
++                }
++            }
++        }
++
+         if (useHeaders)
+         {
+             ss << "#include <stdexcept>\n";
+@@ -49,6 +231,10 @@ namespace ps2recomp
+             ss << "#include <ps2_recompiled_stubs.h>\n\n";
+             ss << "#include \"ps2_syscalls.h\"\n";
+             ss << "#include \"ps2_stubs.h\"\n\n";
++            if (locals)
++            {
++                ss << "#include \"ps2_cg.h\"\n\n";
++            }
+             ss << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
+             ss << "#include \"ps2_log.h\"\n";
+             ss << "#endif\n\n";
+@@ -88,20 +274,28 @@ namespace ps2recomp
+         ss << "    PS_LOG_ENTRY(\"" << sanitizedName << "\");\n";
+         ss << "#endif\n";
+         ss << "\n";
++
++        // Resume switch (goes after the locals are loaded in locals mode).
++        std::stringstream switchText;
+         if (!resumeTargets.empty())
+         {
+-            ss << "    switch (ctx->pc) {\n";
++            switchText << "    switch (ctx->pc) {\n";
+             for (uint32_t target : resumeTargets)
+             {
+-                ss << "        case 0x" << std::hex << target << "u: goto label_" << target << ";\n"
+-                   << std::dec;
++                switchText << "        case 0x" << std::hex << target << "u: goto label_" << target << ";\n"
++                           << std::dec;
+             }
+-            ss << "        default: break;\n";
+-            ss << "    }\n\n";
++            switchText << "        default: break;\n";
++            switchText << "    }\n\n";
++        }
++
++        std::stringstream body;
++        if (!locals)
++        {
++            body << "    ctx->pc = 0x" << std::hex << function.start << "u;\n"
++                 << std::dec;
++            body << "\n";
+         }
+-        ss << "    ctx->pc = 0x" << std::hex << function.start << "u;\n"
+-           << std::dec;
+-        ss << "\n";
+ 
+         bool lastInstructionWasControlFlow = false;
+ 
+@@ -113,18 +307,18 @@ namespace ps2recomp
+             if (internalTargets.contains(inst.address))
+             {
+                 constantRegisters.clear();
+-                ss << "label_" << std::hex << inst.address << std::dec << ":\n";
++                body << "label_" << std::hex << inst.address << std::dec << ":\n";
+             }
+ 
+             if (cg.m_emitInstructionComments)
+             {
+-                ss << "    // 0x" << std::hex << inst.address << ": 0x" << inst.raw << std::dec;
++                body << "    // 0x" << std::hex << inst.address << ": 0x" << inst.raw << std::dec;
+                 std::string disassembly = R5900Decoder::disassembleInstruction(inst);
+                 if (!disassembly.empty())
+                 {
+-                    ss << "  " << disassembly;
++                    body << "  " << disassembly;
+                 }
+-                ss << "\n";
++                body << "\n";
+             }
+ 
+             try
+@@ -149,7 +343,7 @@ namespace ps2recomp
+ 
+                     if (hasDecodedDelaySlot && internalTargets.contains(delaySlot->address))
+                     {
+-                        ss << "label_" << std::hex << delaySlot->address << std::dec << ":\n";
++                        body << "label_" << std::hex << delaySlot->address << std::dec << ":\n";
+                     }
+ 
+                     if (gifDmaKickPlan.valid &&
+@@ -157,7 +351,7 @@ namespace ps2recomp
+                         gifDmaKickPlan.branchIndex == i &&
+                         hasDecodedDelaySlot)
+                     {
+-                        ss << cg.handleBranchDelaySlots(
++                        body << cg.handleBranchDelaySlots(
+                             inst,
+                             *delaySlot,
+                             function,
+@@ -167,7 +361,7 @@ namespace ps2recomp
+                     }
+                     else
+                     {
+-                        ss << cg.handleBranchDelaySlots(inst, *delaySlot, function, analysisResult);
++                        body << cg.handleBranchDelaySlots(inst, *delaySlot, function, analysisResult);
+                     }
+ 
+                     if (hasDecodedDelaySlot)
+@@ -186,13 +380,13 @@ namespace ps2recomp
+                     if (gifDmaKickPlan.suppresses(i))
+                     {
+                         const size_t slot = gifDmaKickPlan.slotFor(i);
+-                        emitGifDmaCapture(ss, gifDmaKickPlan, slot, "    ");
++                        emitGifDmaCapture(body, gifDmaKickPlan, slot, "    ");
+ 
+                         if (gifDmaKickPlan.completesAt(i))
+                         {
+-                            ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
+-                               << std::dec;
+-                            ss << "    " << gifDmaKickCall(gifDmaKickPlan) << "\n";
++                            body << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
++                                 << std::dec;
++                            body << "    " << gifDmaKickCall(gifDmaKickPlan) << "\n";
+                             gifDmaKickPlan = {};
+                         }
+ 
+@@ -200,15 +394,23 @@ namespace ps2recomp
+                         continue;
+                     }
+ 
+-                    ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
+-                       << std::dec;
+                     const MemoryAccessHint memoryHint = resolveMemoryAccessHint(inst, constantRegisters);
+-                    ss << "    " << cg.translateInstruction(inst, memoryHint);
++                    std::string code = cg.translateInstruction(inst, memoryHint);
++                    if (!locals || CodeGenerator::codeNeedsPc(code))
++                    {
++                        body << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
++                             << std::dec;
++                    }
++                    if (locals)
++                    {
++                        code = cg.wrapSync(code);
++                    }
++                    body << "    " << code;
+                     if (inst.isMmio)
+                     {
+-                        ss << " // MMIO: 0x" << std::hex << inst.mmioAddress << std::dec;
++                        body << " // MMIO: 0x" << std::hex << inst.mmioAddress << std::dec;
+                     }
+-                    ss << "\n";
++                    body << "\n";
+ 
+                     updateConstantRegisters(inst, constantRegisters);
+                 }
+@@ -226,13 +428,33 @@ namespace ps2recomp
+             }
+         }
+ 
+-        // Fallthrough with no terminating branch: publish the next PC so the EE dispatcher does not re-enter this function.
+-        if (!instructions.empty() && !lastInstructionWasControlFlow)
++        if (!locals)
++        {
++            // Fallthrough with no terminating branch: publish the next PC so the EE dispatcher does not re-enter this function.
++            if (!instructions.empty() && !lastInstructionWasControlFlow)
++            {
++                body << "    ctx->pc = 0x" << std::hex << function.end << "u;\n"
++                     << std::dec;
++            }
++            ss << switchText.str() << body.str();
++            ss << "}\n";
++            return ss.str();
++        }
++
++        // Locals mode: falling off the end publishes the next pc and writes the registers back.
++        if (!instructions.empty())
+         {
+-            ss << "    ctx->pc = 0x" << std::hex << function.end << "u;\n"
+-               << std::dec;
++            body << "    PS2_FLUSH();\n";
++            body << "    ctx->pc = 0x" << std::hex << function.end << "u;\n"
++                 << std::dec;
+         }
+ 
++        LocalsUsage use;
++        std::string rewritten = rewriteForLocals(body.str(), use, function.name);
++        ss << localsPrologue(use);
++        ss << "\n"
++           << switchText.str() << rewritten;
++        ss << "#undef PS2_FLUSH\n#undef PS2_RELOAD\n";
+         ss << "}\n";
+         return ss.str();
+     }
+diff --git a/ps2xRecomp/src/lib/special_translator.cpp b/ps2xRecomp/src/lib/special_translator.cpp
+index b01a937..cc93b33 100644
+--- a/ps2xRecomp/src/lib/special_translator.cpp
++++ b/ps2xRecomp/src/lib/special_translator.cpp
+@@ -121,8 +121,12 @@ namespace ps2recomp
+         case SPECIAL_SLTU:
+             return fmt::format("SET_GPR_U64(ctx, {}, ((uint64_t)GPR_U64(ctx, {}) < (uint64_t)GPR_U64(ctx, {})) ? 1 : 0);", inst.rd, inst.rs, inst.rt);
+         case SPECIAL_MOVZ:
++            if (m_codeGenerator.m_localsMode)
++                return fmt::format("if (GPR_U64(ctx, {}) == 0) SET_GPR_U64(ctx, {}, GPR_U64(ctx, {}));", inst.rt, inst.rd, inst.rs);
+             return fmt::format("if (GPR_U64(ctx, {}) == 0) SET_GPR_VEC(ctx, {}, GPR_VEC(ctx, {}));", inst.rt, inst.rd, inst.rs);
+         case SPECIAL_MOVN:
++            if (m_codeGenerator.m_localsMode)
++                return fmt::format("if (GPR_U64(ctx, {}) != 0) SET_GPR_U64(ctx, {}, GPR_U64(ctx, {}));", inst.rt, inst.rd, inst.rs);
+             return fmt::format("if (GPR_U64(ctx, {}) != 0) SET_GPR_VEC(ctx, {}, GPR_VEC(ctx, {}));", inst.rt, inst.rd, inst.rs);
+         case SPECIAL_MFSA:
+             return fmt::format("SET_GPR_U32(ctx, {}, ctx->sa);", inst.rd);
+diff --git a/ps2xRuntime/include/ps2_cg.h b/ps2xRuntime/include/ps2_cg.h
+new file mode 100644
+index 0000000..19f30f1
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_cg.h
+@@ -0,0 +1,256 @@
++#ifndef PS2_CG_H
++#define PS2_CG_H
++// Support header for the "register locals" code generator mode (PS2X_CODEGEN=locals, ps2xRecomp).
++//
++// Generated functions in this mode keep the low 64 bits of every guest GPR they touch in C++ locals (gprN; gprhN
++// holds the upper 64 bits for registers used by 128-bit ops). The locals are loaded from ctx->r[] at function
++// entry (and resume), written back (PS2_FLUSH) before anything that can observe ctx (calls, syscalls, stubs,
++// returns, yields), and reloaded (PS2_RELOAD) after calls and stubs.
++//
++// Everything is prefixed L_/ps2Cg so classic-mode and locals-mode functions can share a translation unit.
++// This header is header-only on purpose: no runtime library changes.
++
++#include "ps2_runtime_macros.h"
++#include "ps2_runtime.h"
++
++#include <cstdint>
++#include <cstdlib>
++
++#if defined(_MSC_VER)
++#define PS2CG_NOINLINE __declspec(noinline)
++#define PS2CG_FORCEINLINE __forceinline
++#else
++#define PS2CG_NOINLINE __attribute__((noinline))
++#define PS2CG_FORCEINLINE inline __attribute__((always_inline))
++#endif
++
++extern bool g_ps2GuestUnwinding;
++
++// ---- GPR locals --------------------------------------------------------------------------------------------------
++// Reg 0 reads are the constants gpr0/gprh0 declared by the function prologue; writes to reg 0 are rewritten to
++// PS2_DISCARD by the recompiler.
++#define L_GPR_U32(n) (static_cast<uint32_t>(gpr##n))
++#define L_GPR_S32(n) (static_cast<int32_t>(gpr##n))
++#define L_GPR_U64(n) (static_cast<uint64_t>(gpr##n))
++#define L_GPR_S64(n) (static_cast<int64_t>(gpr##n))
++#define L_GPR_VEC(n) _mm_set_epi64x(static_cast<long long>(gprh##n), static_cast<long long>(gpr##n))
++
++#define L_SET_GPR_U32(n, v) do { gpr##n = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(v))); } while (0)
++#define L_SET_GPR_S32(n, v) L_SET_GPR_U32(n, v)
++#define L_SET_GPR_ZE32(n, v) do { gpr##n = static_cast<uint64_t>(static_cast<uint32_t>(v)); } while (0)
++#define L_SET_GPR_U64(n, v) do { gpr##n = static_cast<uint64_t>(static_cast<int64_t>(v)); } while (0)
++#define L_SET_GPR_S64(n, v) L_SET_GPR_U64(n, v)
++#define L_SET_GPR_VEC(n, v)                                                    \
++    do                                                                         \
++    {                                                                          \
++        const __m128i _lv = (v);                                               \
++        gpr##n = static_cast<uint64_t>(_mm_cvtsi128_si64(_lv));                \
++        gprh##n = static_cast<uint64_t>(_mm_extract_epi64(_lv, 1));            \
++    } while (0)
++#define PS2_DISCARD(v) ((void)(v))
++
++// ctx <-> local transfers. ctx->r[n] is a __m128i; the halves are accessed as two uint64_t.
++#define PS2_CG_LO(ctx, n) (reinterpret_cast<uint64_t *>(&(ctx)->r[n])[0])
++#define PS2_CG_HI(ctx, n) (reinterpret_cast<uint64_t *>(&(ctx)->r[n])[1])
++
++// ---- guest memory ------------------------------------------------------------------------------------------------
++// RAM window [0, 32 MB) is never special, so it is one compare and one typed access. Everything else (mirrors,
++// kseg0/1, MMIO, scratchpad, VU memory) takes the old path in an out-of-line function.
++PS2CG_NOINLINE inline uint8_t ps2CgRd8Slow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t a)
++{
++    return PS2Runtime::isSpecialAddress(a) ? rt->Load8(rdram, ctx, a) : Ps2FastRead8(rdram, a);
++}
++PS2CG_NOINLINE inline uint16_t ps2CgRd16Slow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t a)
++{
++    return PS2Runtime::isSpecialAddress(a) ? rt->Load16(rdram, ctx, a) : Ps2FastRead16(rdram, a);
++}
++PS2CG_NOINLINE inline uint32_t ps2CgRd32Slow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t a)
++{
++    return PS2Runtime::isSpecialAddress(a) ? rt->Load32(rdram, ctx, a) : Ps2FastRead32(rdram, a);
++}
++PS2CG_NOINLINE inline uint64_t ps2CgRd64Slow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t a)
++{
++    return PS2Runtime::isSpecialAddress(a) ? rt->Load64(rdram, ctx, a) : Ps2FastRead64(rdram, a);
++}
++PS2CG_NOINLINE inline __m128i ps2CgRd128Slow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t a)
++{
++    return PS2Runtime::isSpecialAddress(a) ? rt->Load128(rdram, ctx, a) : Ps2FastRead128(rdram, a);
++}
++PS2CG_NOINLINE inline void ps2CgWr8Slow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t a, uint8_t v)
++{
++    if (PS2Runtime::isSpecialAddress(a)) rt->Store8(rdram, ctx, a, v); else Ps2FastWrite8(rdram, a, v);
++}
++PS2CG_NOINLINE inline void ps2CgWr16Slow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t a, uint16_t v)
++{
++    if (PS2Runtime::isSpecialAddress(a)) rt->Store16(rdram, ctx, a, v); else Ps2FastWrite16(rdram, a, v);
++}
++PS2CG_NOINLINE inline void ps2CgWr32Slow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t a, uint32_t v)
++{
++    if (PS2Runtime::isSpecialAddress(a)) rt->Store32(rdram, ctx, a, v); else Ps2FastWrite32(rdram, a, v);
++}
++PS2CG_NOINLINE inline void ps2CgWr64Slow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t a, uint64_t v)
++{
++    if (PS2Runtime::isSpecialAddress(a)) rt->Store64(rdram, ctx, a, v); else Ps2FastWrite64(rdram, a, v);
++}
++PS2CG_NOINLINE inline void ps2CgWr128Slow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t a, __m128i v)
++{
++    if (PS2Runtime::isSpecialAddress(a)) rt->Store128(rdram, ctx, a, v); else Ps2FastWrite128(rdram, a, v);
++}
++
++#define PS2CG_RD(NAME, TYPE, BYTES)                                                                                  \
++    PS2CG_FORCEINLINE TYPE ps2Cg##NAME(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t a)                 \
++    {                                                                                                                \
++        if (a <= PS2_RAM_SIZE - (BYTES)) [[likely]]                                                                  \
++        {                                                                                                            \
++            return *reinterpret_cast<const TYPE *>(rdram + a);                                                       \
++        }                                                                                                            \
++        return ps2Cg##NAME##Slow(rdram, ctx, rt, a);                                                                 \
++    }
++PS2CG_RD(Rd8, uint8_t, 1u)
++PS2CG_RD(Rd16, uint16_t, 2u)
++PS2CG_RD(Rd32, uint32_t, 4u)
++PS2CG_RD(Rd64, uint64_t, 8u)
++#undef PS2CG_RD
++
++PS2CG_FORCEINLINE __m128i ps2CgRd128(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t a)
++{
++    if (a <= PS2_RAM_SIZE - 16u) [[likely]]
++    {
++        return _mm_loadu_si128(reinterpret_cast<const __m128i *>(rdram + a));
++    }
++    return ps2CgRd128Slow(rdram, ctx, rt, a);
++}
++
++#define PS2CG_WR(NAME, TYPE, BYTES)                                                                                  \
++    PS2CG_FORCEINLINE void ps2Cg##NAME(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t a, TYPE v)         \
++    {                                                                                                                \
++        if (a <= PS2_RAM_SIZE - (BYTES)) [[likely]]                                                                  \
++        {                                                                                                            \
++            *reinterpret_cast<TYPE *>(rdram + a) = v;                                                                \
++            return;                                                                                                  \
++        }                                                                                                            \
++        ps2Cg##NAME##Slow(rdram, ctx, rt, a, v);                                                                     \
++    }
++PS2CG_WR(Wr8, uint8_t, 1u)
++PS2CG_WR(Wr16, uint16_t, 2u)
++PS2CG_WR(Wr32, uint32_t, 4u)
++PS2CG_WR(Wr64, uint64_t, 8u)
++#undef PS2CG_WR
++
++PS2CG_FORCEINLINE void ps2CgWr128(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t a, __m128i v)
++{
++    if (a <= PS2_RAM_SIZE - 16u) [[likely]]
++    {
++        _mm_storeu_si128(reinterpret_cast<__m128i *>(rdram + a), v);
++        return;
++    }
++    ps2CgWr128Slow(rdram, ctx, rt, a, v);
++}
++
++#define L_READ8(addr) ps2CgRd8(rdram, ctx, runtime, static_cast<uint32_t>(addr))
++#define L_READ16(addr) ps2CgRd16(rdram, ctx, runtime, static_cast<uint32_t>(addr))
++#define L_READ32(addr) ps2CgRd32(rdram, ctx, runtime, static_cast<uint32_t>(addr))
++#define L_READ64(addr) ps2CgRd64(rdram, ctx, runtime, static_cast<uint32_t>(addr))
++#define L_READ128(addr) ps2CgRd128(rdram, ctx, runtime, static_cast<uint32_t>(addr))
++#define L_WRITE8(addr, val) ps2CgWr8(rdram, ctx, runtime, static_cast<uint32_t>(addr), static_cast<uint8_t>(val))
++#define L_WRITE16(addr, val) ps2CgWr16(rdram, ctx, runtime, static_cast<uint32_t>(addr), static_cast<uint16_t>(val))
++#define L_WRITE32(addr, val) ps2CgWr32(rdram, ctx, runtime, static_cast<uint32_t>(addr), static_cast<uint32_t>(val))
++#define L_WRITE64(addr, val) ps2CgWr64(rdram, ctx, runtime, static_cast<uint32_t>(addr), static_cast<uint64_t>(val))
++#define L_WRITE128(addr, val) ps2CgWr128(rdram, ctx, runtime, static_cast<uint32_t>(addr), (val))
++
++// ---- EE checkpoint budget and calls ------------------------------------------------------------------------------
++// The old code charged EeScheduler::checkpointDue on every guest call (8 cycles) and loop back edge (32 cycles).
++// Locals mode subtracts the same charge from a plain counter and only calls the scheduler when it runs out; the
++// accumulated charge is then passed on in one go. Events posted to the scheduler are noticed at that point, i.e.
++// within a few microseconds of guest time. The refill (256 cycles = 32 calls) is a compromise: 1024 was as fast but
++// made the movie player hang (the IOP file-read completion never arrives when the IOP is advanced in >=1024-cycle
++// slices with KZ_IPU on; 64..512 boot fine), so the IOP is still advanced in small slices. PS2X_EE_BUDGET overrides the refill (cycles); PS2X_STRESS_YIELD forces
++// a scheduler checkpoint on every check so the yield/resume stress test still exercises every call and back edge.
++inline int32_t g_ps2EeBudget = 256;
++
++inline int32_t ps2CgBudgetRefill()
++{
++    static const int32_t refill = []() -> int32_t
++    {
++        const char *stress = std::getenv("PS2X_STRESS_YIELD");
++        if (stress && std::strtoul(stress, nullptr, 10) != 0ul)
++            return 1;
++        const char *v = std::getenv("PS2X_EE_BUDGET");
++        if (v && std::strtol(v, nullptr, 10) > 0)
++            return static_cast<int32_t>(std::strtol(v, nullptr, 10));
++        return 256;
++    }();
++    return refill;
++}
++
++// Called when the budget went negative. Returns true when the guest must yield (g_ps2GuestUnwinding is set).
++PS2CG_NOINLINE inline bool ps2CgBudgetSlow(PS2Runtime *rt)
++{
++#ifdef PS2_CG_CLASSIC_CHECKPOINTS
++    return rt->eeCheckpointDue(); // measurement variant: charge the scheduler on every back edge like the old code
++#endif
++    const int32_t refill = ps2CgBudgetRefill();
++    const int32_t consumed = refill - g_ps2EeBudget;
++    g_ps2EeBudget = refill;
++    return rt->eeCheckpointDue(static_cast<uint32_t>(consumed > 0 ? consumed : 1));
++}
++
++// Old dispatchGuestBranch epilogue (callee returned): decides whether execution continues in the caller.
++PS2CG_NOINLINE inline bool ps2CgAfterCallSlow(PS2Runtime *rt, R5900Context *ctx, uint32_t target, uint32_t fall)
++{
++    if (rt->isStopRequested() || ctx->pc == 0u || g_ps2GuestUnwinding)
++        return false;
++    if (ctx->pc == target)
++        ctx->pc = fall;
++    if (ctx->pc != fall)
++    {
++        g_ps2GuestUnwinding = true; // non-local return (longjmp, tail jump): the scheduler continues at ctx->pc
++        return false;
++    }
++    return true;
++}
++
++PS2CG_NOINLINE inline bool ps2CgCallSlow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t target,
++                                         uint32_t src, uint32_t fall, bool indirect)
++{
++    return rt->dispatchGuestBranch(rdram, ctx, target, src, fall,
++                                   indirect ? PS2Runtime::GuestBranchKind::IndirectCall
++                                            : PS2Runtime::GuestBranchKind::DirectCall,
++                                   indirect ? "JALR" : "JAL");
++}
++
++// JAL / JALR. ctx->pc == target and every modified GPR are already in ctx. Returns false when the caller must
++// return at once (yield, unwinding callee, missing function handled by dispatchGuestBranch).
++PS2CG_FORCEINLINE bool ps2CgCall(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t target, uint32_t src,
++                                 uint32_t fall, bool indirect)
++{
++#ifdef PS2_CG_CLASSIC_CHECKPOINTS
++    return ps2CgCallSlow(rdram, ctx, rt, target, src, fall, indirect); // measurement variant: old dispatch path
++#else
++    if ((g_ps2EeBudget -= 8) < 0) [[unlikely]]
++    {
++        if (ps2CgBudgetSlow(rt))
++            return false;
++    }
++    const uint32_t slot = (target - g_ps2RecompiledFunctionTableBase) >> 2;
++    if (((target & 3u) != 0u) | (slot >= g_ps2RecompiledFunctionTableSlotCount)) [[unlikely]]
++        return ps2CgCallSlow(rdram, ctx, rt, target, src, fall, indirect);
++    const PS2Runtime::RecompiledFunction fn = g_ps2RecompiledFunctionTable[slot];
++    if (fn == nullptr) [[unlikely]]
++        return ps2CgCallSlow(rdram, ctx, rt, target, src, fall, indirect);
++    fn(rdram, ctx, rt);
++    if (!g_ps2GuestUnwinding && ctx->pc == fall) [[likely]]
++        return true;
++    return ps2CgAfterCallSlow(rt, ctx, target, fall);
++#endif
++}
++
++// Loop back edge: charge the budget, and when it runs out flush and let the scheduler decide. Evaluates to true
++// when the function has to return (ctx->pc must already be the loop target).
++#ifdef PS2_CG_CLASSIC_CHECKPOINTS
++#define PS2_BACKEDGE_DUE() (true)
++#else
++#define PS2_BACKEDGE_DUE() ((g_ps2EeBudget -= 32) < 0)
++#endif
++
++#endif // PS2_CG_H
