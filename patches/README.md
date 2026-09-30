@@ -552,15 +552,19 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
     (a function with many resume labels no longer walks the switch on every call).
   - **Debug.** `PS2X_SCHED_STATS=1|2` also prints, per 10 s, the dispatches by reason (scheduler / yield / return-resume / jump), the tail
     jumps followed by call sites and the scheduler, the recursive returns kept local and missing tail targets (0 in every run).
-    `=2` adds per-reason (previous entry -> pc) pair histograms.
+    `=2` adds per-reason (previous entry -> pc) pair histograms. `=3` keeps only the pacing-sleep total and the 10 s report (nothing
+    per loop iteration or dispatch): the mode to use when comparing builds with different dispatch counts.
   - **Measured** (headless, `KZ_FPS=120`, scripted input, t=150..200; machine shared with other builds and game instances, so
-    concurrent pairs, `PS2X_SCHED_STATS=1` in both). Baseline `build\RelWithDebInfo` vs this patch, 3 pairs: fps 56.1 / 60.9 / 59.9
-    vs 58.3 / 61.1 / 59.3 (median 59.9 vs 59.3: unchanged, the game sits on the 60 fps step of a 120 Hz vblank, see
-    docs/findings.md "EE thread frame budget"); EE host time per displayed frame (1000 ms - pacing sleep) / fps: 15.05 / 12.75 /
-    13.11 ms vs 12.84 / 12.08 / 12.62 ms (per pair -2.21 / -0.67 / -0.49 ms, median -0.67 ms = -5 %, mean -1.1 ms). A fourth pair with
-    the sampling profiler on: 12.27 vs 11.14 ms; `EeScheduler::run` self time 6.1 % of the EE thread before, not among the top 28
-    self-time entries after.
-    Intermediate build (call-site trampolines + local returns only, no scheduler follow, no folding): 214 k dispatches/s.
+    concurrent pairs). Two build dirs from the same runtime sources, `dsp0` = the generated code of `generated/` (patch 0017 output)
+    and `dsp2` = this patch's output, `PS2X_SCHED_STATS=3` in both (new: only the vblank pacing sleep is accumulated, nothing per
+    dispatch). 4 pairs, fps base / new: 73.6 / 73.8, 75.1 / 73.8, 71.6 / 71.8, 69.8 / 70.0 (median 72.6 / 72.8: unchanged, the game is
+    on a vblank step, see docs/findings.md "EE thread frame budget"); EE host time per displayed frame (1000 ms - pacing sleep) / fps:
+    10.38 / 9.85 / 10.83 / 11.45 ms before, 10.06 / 9.56 / 10.24 / 11.14 ms after: -0.32 / -0.29 / -0.59 / -0.31 ms (median -0.31 ms,
+    mean -0.38 ms, -3 %). Profile of the EE thread without stats (KZ_PROFILE=160,40, one pair): `EeScheduler::run` self time 3.6 % -> 0.1 %.
+    Not used: a first set of pairs against `build\RelWithDebInfo` with `PS2X_SCHED_STATS=1` (-0.67 ms median). That binary predates
+    patches 0020/0021 (both in the runtime of `dsp0`/`dsp2`), and `=1` reads the host clock and does rdtsc/counter work on every
+    dispatch (`RtlQueryPerformanceCounter` 2.9 % + `schedStatsReport` 1.5 % of the EE thread in the profile), which taxes exactly the
+    build with 1 M dispatches per second.
   - **Correctness evidence.** See docs/findings.md "Guest control flow without the scheduler".
   - **Left.** ~190 yields/s x ~40 unwound frames = the remaining ~8 k dispatches/s (needs stack switching or fibers to remove); the
     memory slow paths (`ps2CgWr32Slow`/`ps2CgRd32Slow`/`Load32`/`Store32`, ~6 % of the EE thread in the profile: scratchpad and

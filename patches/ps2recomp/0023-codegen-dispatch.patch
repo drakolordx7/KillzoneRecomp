@@ -449,7 +449,14 @@ diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Ke
  #include "ps2_cg.h" // g_ps2EeBudget: the guest code's checkpoint budget (the dispatch loop charges through it as well)
  
  #include <algorithm>
-@@ -64,6 +65,16 @@
+@@ -61,9 +62,23 @@
+     {
+         bool on = false;
+         bool hist = false; // PS2X_SCHED_STATS=2: also per-pc histograms (a hash map update per dispatch: skews the time split)
++        // False for PS2X_SCHED_STATS=3: only the vblank pacing sleep is accumulated and reported every 10 s (nothing per loop
++        // iteration or dispatch; =1 reads the host clock and does rdtsc/counter work on every dispatch, i.e. ~40 ns x 1 M/s in a
++        // build that dispatches 1 M times per second, which inflates exactly the thing an A/B of dispatch counts measures).
++        bool perDispatch = false;
          uint64_t checkpoints = 0, checkpointCycles = 0;
          uint64_t yieldPending = 0, yieldDeadline = 0, yieldSlice = 0, yieldStress = 0;
          std::unordered_map<uint32_t, uint64_t> pcHist, exitHist;
@@ -466,7 +473,15 @@ diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Ke
          // rdtsc time split: inside guest functions vs the scheduler loop around them, for dispatches in the guest's
          // vsync/flag wait loop (FUN_0014fd90 and its entry fragments, 0x14fd90..0x15008c) and everywhere else.
          // Guest clock: cycles charged by the checkpoint estimate vs cycles added by the wall-clock floor, and host time
-@@ -106,6 +117,27 @@
+@@ -80,6 +95,7 @@
+         const char *v = std::getenv("PS2X_SCHED_STATS");
+         g_schedStats.on = v && *v && *v != '0';
+         g_schedStats.hist = v && *v == '2';
++        g_schedStats.perDispatch = g_schedStats.on && *v != '3';
+         return true;
+     }();
+     void schedStatsReport()
+@@ -106,6 +122,27 @@
                  std::fprintf(stderr, " %06x:%.0f", v[i].second, v[i].first * k);
              std::fprintf(stderr, "\n");
          };
@@ -494,7 +509,35 @@ diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Ke
          top(st.pcHist, "dispatch pcs", k);
          top(st.exitHist, "exit pcs (ctx->pc after return)", k);
          std::fprintf(stderr, "[sched-stats]   transfers(exceptions)=%.0f/s\n", st.transfers * k);
-@@ -535,6 +567,35 @@
+@@ -124,10 +161,11 @@
+                          "scheduler around other dispatches %.1f%% (rdtsc, run() only; %.0f Mtsc/s)\n",
+                          st.tscInGuestSpin * t, st.tscInGuestOther * t, st.tscLoopSpin * t, st.tscLoopOther * t, total * k / 1e6);
+         }
+-        const bool hist = st.hist;
++        const bool hist = st.hist, perDispatch = st.perDispatch;
+         st = SchedStats{};
+         st.on = true;
+         st.hist = hist;
++        st.perDispatch = perDispatch;
+     }
+ }
+ 
+@@ -349,7 +387,7 @@
+ 
+     while (!m_stopRequested.load(std::memory_order_acquire))
+     {
+-        if (g_schedStats.on)
++        if (g_schedStats.perDispatch)
+         {
+             ++g_schedStats.loopIters;
+             schedStatsReport();
+@@ -530,11 +568,40 @@
+         {
+             uint64_t statT0 = 0;
+             bool statSpin = false;
+-            if (g_schedStats.on)
++            if (g_schedStats.perDispatch)
+             {
                  ++g_schedStats.dispatches;
                  if (g_schedStats.hist)
                      ++g_schedStats.pcHist[context.pc];
@@ -530,14 +573,15 @@ diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Ke
                  statSpin = context.pc >= 0x14fd90u && context.pc < 0x15008cu;
                  statT0 = __rdtsc();
                  if (g_schedStats.tscPrevExit != 0u)
-@@ -545,9 +606,14 @@
+@@ -545,9 +612,14 @@
              schedTrace('E', running->id, running->invocations.size(), context);
              g_ps2GuestUnwinding = false;
              function(m_rdram, &context, &m_runtime);
 +            ps2DspSchedulerFollow(m_rdram, &context, &m_runtime);
 +            context.pc &= ~PS2_TAIL_MARK; // a tail jump the guest's call sites did not follow (ps2_cg_dsp.h): dispatch its target
              schedTrace('X', running->id, running->invocations.size(), context);
-             if (g_schedStats.on)
+-            if (g_schedStats.on)
++            if (g_schedStats.perDispatch)
              {
 +                g_schedStats.lastExitPc = context.pc;
 +                g_schedStats.lastThread = running->id;
@@ -545,6 +589,15 @@ diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Ke
                  if (g_schedStats.hist)
                      ++g_schedStats.exitHist[context.pc];
                  g_schedStats.tscPrevExit = __rdtsc();
+@@ -2166,6 +2238,8 @@
+                 {
+                     g_schedStats.pacingSleepTsc += __rdtsc() - statSleep0;
+                     ++g_schedStats.pacingSleeps;
++                    if (!g_schedStats.perDispatch)
++                        schedStatsReport(); // =3: the report is driven from the (100-200/s) pacing sleeps
+                 }
+                 if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
+                 {
 diff --git a/ps2xRuntime/include/ps2_cg_dsp.h b/ps2xRuntime/include/ps2_cg_dsp.h
 new file mode 100644
 --- /dev/null
