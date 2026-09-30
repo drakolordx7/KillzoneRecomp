@@ -22,6 +22,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 
 namespace
@@ -85,6 +86,7 @@ namespace
 		std::vector<uint8_t>* rgba;
 		int* width;
 		int* height;
+		int present_w = 0, present_h = 0; // >0: the image as presented in a window of this size (aspect-corrected, scaled)
 		bool ok = false;
 	};
 
@@ -256,9 +258,41 @@ namespace
 			std::clamp(cfg.halfPixelOffset, 0, static_cast<int>(GSHalfPixelOffset::MaxCount) - 1));
 		o.UserHacks_NativeScaling = static_cast<GSNativeScaling>(
 			std::clamp(cfg.nativeScaling, 0, static_cast<int>(GSNativeScaling::MaxCount) - 1));
+		o.DisableVertexShaderExpand = !cfg.vertexShaderExpand;
+		o.PCRTCAntiBlur = cfg.pcrtcAntiBlur;
+		o.InterlaceMode = static_cast<GSInterlaceMode>(std::clamp(cfg.interlaceMode, 0, static_cast<int>(GSInterlaceMode::Count) - 1));
+		for (int i = 0; i < 4; i++)
+			o.Crop[i] = std::max(cfg.crop[i], 0);
 		o.Adapter = cfg.useWarp ? std::string("Microsoft Basic Render Driver") : cfg.adapter;
 		o.DisableShaderCache = cfg.disableShaderCache;
 		o.UseDebugDevice = cfg.debugDevice;
+
+		// Debug aid: KZGS_GS_OPTS="Name=0|1,..." flips PCSX2 GSOptions flags without a rebuild (used to bisect renderer bugs).
+		if (const char* dbg = std::getenv("KZGS_GS_OPTS"))
+		{
+			const std::string list(dbg);
+			size_t pos = 0;
+			while (pos < list.size())
+			{
+				size_t comma = list.find(',', pos);
+				if (comma == std::string::npos)
+					comma = list.size();
+				const std::string item = list.substr(pos, comma - pos);
+				pos = comma + 1;
+				const size_t eq = item.find('=');
+				if (eq == std::string::npos)
+					continue;
+				const std::string name = item.substr(0, eq);
+				const bool v = std::atoi(item.c_str() + eq + 1) != 0;
+#define KZGS_OPT(n) if (name == #n) o.n = v;
+				KZGS_OPT(DisableVertexShaderExpand) KZGS_OPT(DisableFramebufferFetch) KZGS_OPT(UserHacks_DisablePartialInvalidation)
+				KZGS_OPT(UserHacks_DisableSafeFeatures) KZGS_OPT(UserHacks_DisableRenderFixes) KZGS_OPT(UserHacks_DisableDepthSupport)
+				KZGS_OPT(UserHacks_NativePaletteDraw) KZGS_OPT(UserHacks_EstimateTextureRegion) KZGS_OPT(UserHacks_AlignSpriteX)
+				KZGS_OPT(UserHacks_MergePPSprite) KZGS_OPT(UserHacks_DrawBuffering) KZGS_OPT(UserHacks_CPUFBConversion) KZGS_OPT(PCRTCAntiBlur)
+				KZGS_OPT(DisableInterlaceOffset) KZGS_OPT(SkipDuplicateFrames) KZGS_OPT(UserHacks_ReadTCOnClose)
+#undef KZGS_OPT
+			}
+		}
 
 		// No OSD: kzgs does not render PCSX2's overlays.
 		o.OsdMessagesPos = OsdOverlayPos::None;
@@ -341,11 +375,38 @@ namespace
 		}
 	}
 
+	// Copies the current output texture 1:1 through a CPU download texture. Unlike GSSaveSnapshotToMemory it neither
+	// creates nor recycles a render target, so taking a capture does not change the texture pool (and with it what later
+	// frames render when a pass reuses a pooled texture that was not fully overwritten).
+	static bool ReadbackCurrent(std::vector<u32>& pixels, u32& w, u32& h)
+	{
+		GSTexture* const current = g_gs_device ? g_gs_device->GetCurrent() : nullptr;
+		if (!current || current->GetFormat() != GSTexture::Format::Color)
+			return false;
+		w = static_cast<u32>(current->GetWidth());
+		h = static_cast<u32>(current->GetHeight());
+		std::unique_ptr<GSDownloadTexture> dl(g_gs_device->CreateDownloadTexture(w, h, GSTexture::Format::Color));
+		if (!dl)
+			return false;
+		const GSVector4i rc(0, 0, static_cast<int>(w), static_cast<int>(h));
+		dl->CopyFromTexture(rc, current, rc, 0);
+		dl->Flush();
+		if (!dl->Map(rc))
+			return false;
+		pixels.resize(static_cast<size_t>(w) * h);
+		StringUtil::StrideMemCpy(pixels.data(), w * sizeof(u32), dl->GetMapPointer(), dl->GetMapPitch(), w * sizeof(u32), h);
+		dl->Unmap();
+		return true;
+	}
+
 	static void DoReadback(ReadbackRequest* req)
 	{
 		u32 w = 0, h = 0;
 		std::vector<u32> pixels;
-		req->ok = GSSaveSnapshotToMemory(0, 0, false, false, &w, &h, &pixels) && w > 0 && h > 0;
+		if (req->present_w > 0 && req->present_h > 0)
+			req->ok = GSSaveSnapshotToMemory(static_cast<u32>(req->present_w), static_cast<u32>(req->present_h), true, false, &w, &h, &pixels) && w > 0 && h > 0;
+		else
+			req->ok = ReadbackCurrent(pixels, w, h) && w > 0 && h > 0;
 		if (req->ok)
 		{
 			req->rgba->resize(static_cast<size_t>(w) * h * 4);
@@ -668,7 +729,7 @@ void kzgsSync()
 	sp.Wait();
 }
 
-bool kzgsReadback(std::vector<uint8_t>& rgba, int& width, int& height)
+bool kzgsReadback(std::vector<uint8_t>& rgba, int& width, int& height, int presentWidth, int presentHeight)
 {
 	if (!s_open.load(std::memory_order_relaxed))
 		return false;
@@ -676,6 +737,8 @@ bool kzgsReadback(std::vector<uint8_t>& rgba, int& width, int& height)
 	req.rgba = &rgba;
 	req.width = &width;
 	req.height = &height;
+	req.present_w = presentWidth;
+	req.present_h = presentHeight;
 	PushPtr(Cmd::Readback, &req);
 	req.sync.Wait();
 	return req.ok;
