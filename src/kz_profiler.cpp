@@ -35,7 +35,23 @@ namespace
         DWORD64 pcs[32];
     };
 
+    int unwindThreadUnsafe(HANDLE thread, DWORD64 *pcs, int maxFrames);
+
+    // The target thread is suspended at an arbitrary instruction (e.g. mid-prologue), so its stack may not be walkable;
+    // RtlVirtualUnwind can then fault. Keep what was collected instead of crashing the game.
     int unwindThread(HANDLE thread, DWORD64 *pcs, int maxFrames)
+    {
+        __try
+        {
+            return unwindThreadUnsafe(thread, pcs, maxFrames);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
+    }
+
+    int unwindThreadUnsafe(HANDLE thread, DWORD64 *pcs, int maxFrames)
     {
         CONTEXT ctx = {};
         ctx.ContextFlags = CONTEXT_FULL;
