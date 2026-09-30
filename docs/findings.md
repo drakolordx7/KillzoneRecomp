@@ -317,3 +317,76 @@ machine (the least loaded run of the final binary measured 73 fps with the sampl
   patch-0019 switches on (2) and off (1), always when several instances were booting at once. Log signature: a
   `load-emulated id=N path=...MCSERV.IRX` line repeating in stdout, hundreds of thousands of `module arena exhausted`
   lines in stderr. IOP module loading is not part of this patch.
+
+## IOP RPC offload (2026-09-30, patch 0021)
+
+The EE thread used to run the IOP's RPC server functions inline (`SifCallRpc` -> `handleIopRpc` -> `IopEmulator::handleRpc` ->
+`callFunction` -> interpreter). Design and switches: patches/README.md, 0021. Measurements:
+
+**What the game calls** (`PS2X_IOP_RPC_STATS=1`, before the patch, headless gameplay scene at 120 Hz vblank, 235 s, 40 326 calls
+in the run; wall time on the EE thread; `insns` counts every IOP instruction executed during the call, including other IOP
+threads that run while the server function waits on a semaphore or event flag). Gameplay window t=150..200 s (differences of the
+cumulative tables):
+
+| sid / function | mode | calls | wall in window | avg per call | insns per call |
+|---|---|---|---|---|---|
+| 0x06662012 fn 0x600 (sound driver, per-vblank command list, send 16-64 B, no end function) | nowait | 3 219 | 3 422 ms (6.8 % of the window) | 1 063 us | ~46 500 |
+| 0x66662012 (PFILE_R) fn 0x400 | nowait | 3 219 | 34 ms | 11 us | ~215 |
+| 0x66662012 fn 0x320 (read request) | nowait | 0 in the window, 623 in the run (load time) | | 16 us | 200 |
+| all of `SifCallRpc` on the EE thread | | 6 438 | 3 752 ms (7.5 %) | 627 us (incl. the two above) | |
+
+Blocking calls are 32 in the whole run (sid 0x06662012 fn 0x110 once, 5-8 ms at boot; sid 0x66662012 fn 0x100, 0x200 and 0x210 once
+each; fn 0x600 28 times at 4 us): ~7 ms in total, so only nowait calls matter. Waiting for the IOP lock was 67 ms of 21.6 s: the cost is
+interpretation (IOP thread profile, gameplay: `executeInstruction` 27 %, SPU2 mix 13 %, `IopMemory::read32` 13 %, `runCpu` 13 %,
+`IopImportRegistry::decode` 6 %, `takeDmaStart` 5 %). The sound RPC also advances IOP time by ~1.2 ms per call (46 k instructions at
+36.9 MHz), which is where the "IOP lead" of ~30 s per 235 s in `PS2X_IOP_THREAD_STATS` comes from (patches 0013/0015). Whole run:
+24.9 s of the EE thread in `SifCallRpc`, 22.0 s of it inside `handleRpc`.
+
+**After** (nowait calls to emulated servers queued to the IOP thread): EE-thread time in `SifCallRpc` 0.32 s per 235 s (8 us per
+call). Without the `selectRpcAbi` change (it took the IOP lock on every call, and the IOP thread now holds it for ~1 ms per sound
+command) the EE waited 3.2 s in the lock, 1 233 waits > 1 ms. EE-side IOP lock acquisitions per run: 80 584 -> 75. Offloaded calls wait
+0.7 ms on average in the queue (max 40 ms, on a machine with 10 other game instances). IOP thread busy 7-10 % -> 17-19 % of wall.
+
+**Frame cost, same-time pairs.** The machine was shared with 4-12 other game instances (50-85 % CPU load) for every run, so absolute
+rates moved between 35 and 65 fps and only runs made at the same time compare. Two copies of one binary (offload default, and
+`PS2X_IOP_RPC_ASYNC=0`) started together, roles swapped between pairs; CPU time per frame of the game process's threads between t=150 s
+and t=200 s (`Process.Threads`, divided by the frames of that window; the EE thread is `GameThread`):
+
+| pair | load | EE thread offload / inline | IOP thread offload / inline | fps offload / inline |
+|---|---|---|---|---|
+| 1 | 57 % | 11.18 / 11.67 ms | 3.04 / 1.93 ms | 59.1 / 60.0 |
+| 2 | 64 % | 10.63 / 12.29 ms | 2.82 / 1.89 ms | 61.9 / 59.7 |
+| 3 | 60 % | 12.29 / 12.16 ms | 3.17 / 1.84 ms | 54.5 / 57.5 |
+| 4 | 85 % | 12.91 / 14.99 ms | 4.22 / 3.28 ms | 36.9 / 34.2 |
+
+(Pairs 1 and 2 were logged before thread names were captured: their EE column is the busiest thread of the process, which is the game thread in the pairs with names; their IOP column is the fourth busiest.) The IOP thread gains 0.9-1.3 ms per frame,
+the work that left the EE thread; the EE thread's own difference is -0.5, -1.7, +0.1, -2.1 ms (mean -1.0, noise about +-1). The frame
+rate does not change measurably: at ~60 fps the frames are quantised by the 120 Hz vblank, and this machine state never let the EE
+thread reach 8.3 ms per frame. Frame rates of the older interleaved runs, for the record (the baseline binary was built before other
+agents' changes to `ps2_memory.cpp`/`ps2_runtime.cpp` that the later builds include, so these mix their work in and are not a clean A/B):
+baseline binary 44.5 / 38.1 / 44.0, 45.0 / 48.1 / 59.3, 59.7 / 64.3 / 57.4 (median 48.1); offload builds 51.0 / 20.2 / 55.1,
+42.3 / 61.2 / 65.4, 63.6 / 58.3 / 60.9 (median 58.3); the newest binary with `PS2X_IOP_RPC_ASYNC=0`: 64.4 / 57.8 / 64.0.
+
+**Checks.** 35 headless boots of 50-60 s (12 with the flag set, 12 default, 8 at `KZ_FPS=120`, 3 with movies on; one baseline with
+movies on), three instances at a time on a loaded machine: `dma=` advanced in every 5 s interval of all of them, no `TIMED OUT` from the
+outside-thread semaphore wait. Movies: the intro plays in both builds (work/vid_base, work/vid_async montages). Audio, `KZ_AUDIO_WAV`,
+gameplay scene, first 235 s, two runs each of baseline and offload (a baseline and an offload run at the same time, twice):
+
+| segment | baseline vs offload | baseline vs baseline |
+|---|---|---|
+| 0-20 s | silent in all runs | silent |
+| 20-130 s (menu music) RMS / peak | within 0.1-0.3 dB / 0.0-0.7 dB; correlation 1.000 (0.997 at 80-90 s, 0.62-0.64 in the 90-100 s segment, where a menu button press lands differently) at a constant offset that differs per pair of runs | the same figures |
+| 130-235 s (gameplay) | correlation 0.03-0.3 | correlation 0.04-0.27: two baseline runs differ as much |
+| overall RMS | -14.8 / -14.8 (baseline), -14.6 / -14.8 dBFS (offload) | |
+| silent gaps > 20 ms inside sound | 2 in each of the four runs | |
+| `kz_audio` underruns | 0 (headless drops the SDL output; real-time factor 1.00-1.02x in both) | |
+
+The gameplay segments are not deterministic between any two runs (scripted input, wall-clock events), which is why the baseline pair
+correlates as badly as the baseline/offload pair; the menu segments are deterministic and match.
+
+**Not changed / left.** (1) The 46 k-instruction sound command still costs ~1 ms of one core per call, now on the IOP thread; the
+hot spots are the interpreter (`takeDmaStart`/`schedulePendingDma` after every instruction, `IopMemory::read32` not inlined, import
+decode per instruction) and the SPU2 register hooks; speeding those up would shrink the IOP thread's share (not attempted, not
+measured). (2) Blocking calls (32 per run) and HLE-served RPCs stay inline. (3) A game that calls a nowait RPC and reads the reply
+before the completion (`sceSifCheckStatRpc`, end function, semaphore) now sees the reply up to ~1 ms late, as on hardware; no
+symptom of that was seen in Killzone (menus, loading, movies, gameplay, sound).

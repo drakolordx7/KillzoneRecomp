@@ -1,0 +1,844 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+index 01ba723..cb552a1 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -3,6 +3,8 @@
+ #include "ps2x/iop/iop_host.h"
+ #include "ps2x/iop/iop_types.h"
+ 
++#include <cstdint>
++#include <functional>
+ #include <memory>
+ #include <string>
+ #include <string_view>
+@@ -34,6 +36,27 @@ namespace ps2x::iop
+         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
+         [[nodiscard]] bool canBindRpc(uint32_t sid) const noexcept;
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
++
++        // ---- Offloaded (nowait) RPC calls, threaded mode only ---------------------------------------------------------
++        // A nowait call to an emulated IOP RPC server does not have to run its server function on the calling
++        // thread: the IOP runs it asynchronously on real hardware. canOffloadRpc(sid) is true when the IOP thread is
++        // running and an emulated (physical IRX) server is registered for sid (cheap after the first positive answer;
++        // negative answers are never cached). submitRpc() then queues the call: the IOP thread runs the server function
++        // in FIFO order (between its time slices, holding the IOP lock, outside any IOP thread exactly like the inline
++        // path), writes the reply into the guest receive buffer, and calls `done` on the thread that ran it, still with
++        // the lock held (the host is expected to post the completion to the EE). `send` is a snapshot of the send
++        // buffer taken at call time (the DMA of the real SIF). A blocking handleRpc() (and reset/module operations)
++        // first runs everything queued before it, so calls stay ordered.
++        struct AsyncRpc
++        {
++            RpcRequest request;
++            std::vector<uint8_t> send;
++            std::function<void(RpcResult)> done;
++            uint64_t submitNs = 0; // PS2X_IOP_RPC_STATS: submit time (queue latency)
++        };
++        [[nodiscard]] bool canOffloadRpc(uint32_t sid);
++        [[nodiscard]] bool submitRpc(AsyncRpc call);
++
+         void onSifTransfer(const SifTransfer &transfer);
+ 
+         // Physical IOP RAM access shared by the emulator, SIF DMA, and HLE services. Addresses are IOP addresses.
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index eee8df9..5c9cb8c 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -963,10 +963,10 @@ namespace ps2x::iop::detail
+             m_impl->runCycles(iopCycles);
+     }
+ 
+-    RpcResult IopEmulator::handleRpc(const RpcRequest &request)
++    RpcResult IopEmulator::handleRpc(const RpcRequest &request, const std::vector<uint8_t> *sendPayload)
+     {
+         m_impl->idleUntil = 0;
+-        return m_impl->rpc.handleRpc(request, *m_impl);
++        return m_impl->rpc.handleRpc(request, *m_impl, sendPayload);
+     }
+ 
+     bool IopEmulator::hasRpcServer(uint32_t sid) const noexcept
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index fba01fe..801db9b 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -25,7 +25,7 @@ namespace ps2x::iop::detail
+         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize);
+         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
+         void runEeCycles(uint64_t eeCycles) noexcept;
+-        [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
++        [[nodiscard]] RpcResult handleRpc(const RpcRequest &request, const std::vector<uint8_t> *sendPayload = nullptr);
+         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
+         void onSifTransfer(const SifTransfer &transfer);
+ 
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index e1ce501..c225541 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -301,7 +301,8 @@ namespace ps2x::iop::detail
+         }
+     }
+ 
+-    RpcResult IopRpcBridge::handleRpc(const RpcRequest &request, IopGuestExecutor &executor)
++    RpcResult IopRpcBridge::handleRpc(const RpcRequest &request, IopGuestExecutor &executor,
++                                      const std::vector<uint8_t> *sendPayload)
+     {
+         RpcResult result{};
+         const auto serverIt = m_servers.find(request.sid);
+@@ -312,7 +313,10 @@ namespace ps2x::iop::detail
+         if (iopSyncTraceLevel() >= 2)
+         {
+             uint32_t words[16] = {};
+-            (void)m_host.readGuest(request.send.address, words, std::min<uint32_t>(request.send.size, sizeof(words)));
++            if (sendPayload)
++                std::memcpy(words, sendPayload->data(), std::min<size_t>(sendPayload->size(), sizeof(words)));
++            else
++                (void)m_host.readGuest(request.send.address, words, std::min<uint32_t>(request.send.size, sizeof(words)));
+             std::fprintf(stderr, "[iop-sync] Rpc sid=0x%x fn=0x%x mode=%u send=%u:", request.sid, request.function,
+                          request.mode, request.send.size);
+             for (uint32_t i = 0; i < std::min<uint32_t>(16u, (request.send.size + 3u) / 4u); ++i)
+@@ -322,7 +326,12 @@ namespace ps2x::iop::detail
+         if (request.send.size != 0u && server.buffer != 0u)
+         {
+             const uint32_t copySize = std::min<uint32_t>(request.send.size, IopMemory::RamSize - std::min(server.buffer, IopMemory::RamSize));
+-            if (copySize != 0u)
++            if (copySize != 0u && sendPayload)
++            {
++                (void)m_memory.writeRam(server.buffer, sendPayload->data(),
++                                        std::min<size_t>(copySize, sendPayload->size()));
++            }
++            else if (copySize != 0u)
+             {
+                 std::vector<uint8_t> payload(copySize);
+                 if (m_host.readGuest(request.send.address, payload.data(), payload.size()))
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.h b/ps2xIOP/src/emulator/services/iop_rpc.h
+index 37b21af..0aff22e 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.h
++++ b/ps2xIOP/src/emulator/services/iop_rpc.h
+@@ -5,6 +5,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <unordered_map>
++#include <vector>
+ 
+ namespace ps2x::iop
+ {
+@@ -48,7 +49,10 @@ namespace ps2x::iop::detail
+         void reset();
+         [[nodiscard]] bool dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] bool dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu);
+-        [[nodiscard]] RpcResult handleRpc(const RpcRequest &request, IopGuestExecutor &executor);
++        // sendPayload: a snapshot of the send buffer taken by the caller (offloaded nowait calls); null = read it from
++        // guest memory now.
++        [[nodiscard]] RpcResult handleRpc(const RpcRequest &request, IopGuestExecutor &executor,
++                                          const std::vector<uint8_t> *sendPayload = nullptr);
+         void onSifTransfer(const SifTransfer &transfer);
+         void removeServersInRange(uint32_t base, uint32_t size);
+ 
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index 613fc77..fe5482f 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -9,14 +9,17 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <deque>
+ #include <cstdio>
+ #include <cstdlib>
++#include <map>
+ #include <mutex>
+ #include <sstream>
+ #include <thread>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <utility>
++#include <vector>
+ 
+ #if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+ #include <xmmintrin.h>
+@@ -74,6 +77,8 @@ namespace ps2x::iop
+               emulator(hostRef)
+         {
+             statsEnabled = envFlag("PS2X_IOP_THREAD_STATS", false);
++            rpcStats.enabled = envFlag("PS2X_IOP_RPC_STATS", false);
++            rpcAsyncEnabled = envFlag("PS2X_IOP_RPC_ASYNC", true);
+             coreServices.emplace_back(detail::createMcservService(host));
+             coreServices.emplace_back(detail::createDbcmanService(host));
+             coreServices.emplace_back(detail::createLibSdService(host));
+@@ -279,7 +284,15 @@ namespace ps2x::iop
+                 const uint64_t backlog = target - consumedLocal;
+                 if (backlog < kMinBacklogEeCycles)
+                 {
+-                    idleWait(timer);
++                    if (rpcPending.load(std::memory_order_acquire) != 0u)
++                    {
++                        std::lock_guard<std::recursive_mutex> lock(execMutex);
++                        runQueuedRpcs();
++                    }
++                    else
++                    {
++                        idleWait(timer);
++                    }
+                     continue;
+                 }
+                 uint64_t maxLag = maxLagCycles.load(std::memory_order_relaxed);
+@@ -293,6 +306,7 @@ namespace ps2x::iop
+                         std::lock_guard<std::recursive_mutex> lock(execMutex);
+                         const uint64_t t0 = nowNs();
+                         emulator.runEeCycles(chunk);
++                        runQueuedRpcs();
+                         const uint64_t dt = nowNs() - t0;
+                         runNs.fetch_add(dt, std::memory_order_relaxed);
+                         statRunNs += dt;
+@@ -347,6 +361,150 @@ namespace ps2x::iop
+ #endif
+         }
+ 
++        // PS2X_IOP_RPC_STATS=1: per (sid, function, nowait, end function) call counts and costs, printed every 10 s.
++        struct RpcStats
++        {
++            struct Row
++            {
++                uint64_t calls = 0, waitNs = 0, runNs = 0, maxRunNs = 0, instructions = 0, sendBytes = 0, unhandled = 0;
++                uint64_t async = 0;
++            };
++            bool enabled = false;
++            std::mutex mutex;
++            std::map<uint64_t, Row> rows;
++            uint64_t lastPrintNs = 0;
++            uint64_t startNs = 0;
++            uint64_t queueNs = 0, maxQueueNs = 0, queued = 0; // offloaded calls: submit -> start of server function
++            static uint64_t key(const RpcRequest &r)
++            {
++                return (static_cast<uint64_t>(r.sid) << 32) | (static_cast<uint64_t>(r.function & 0xFFFFu) << 2) |
++                       ((r.mode & 1u) << 1) | (r.endFunction != 0u ? 1u : 0u);
++            }
++            void record(const RpcRequest &r, bool handled, uint64_t waitNs, uint64_t runNs, uint64_t instructions,
++                        bool async)
++            {
++                std::lock_guard<std::mutex> lock(mutex);
++                Row &row = rows[key(r)];
++                if (row.calls == 0)
++                    ids[key(r)] = {r.sid, r.function, r.mode, r.endFunction != 0u};
++                ++row.calls;
++                row.async += async ? 1 : 0;
++                row.waitNs += waitNs;
++                row.runNs += runNs;
++                row.maxRunNs = std::max(row.maxRunNs, runNs);
++                row.instructions += instructions;
++                row.sendBytes += r.send.size;
++                row.unhandled += handled ? 0 : 1;
++                const uint64_t now = nowNs();
++                if (startNs == 0)
++                    startNs = lastPrintNs = now;
++                if (now - lastPrintNs >= 10000000000ull)
++                {
++                    print(now);
++                    lastPrintNs = now;
++                }
++            }
++            struct Id
++            {
++                uint32_t sid, function, mode;
++                bool end;
++            };
++            std::map<uint64_t, Id> ids;
++            void print(uint64_t now)
++            {
++                std::fprintf(stderr, "[iop-rpc] t=%.0fs cumulative (calls, async, wait ms, run ms, avg run us, max run us, avg insns, avg send B, unhandled)\n",
++                             static_cast<double>(now - startNs) / 1e9);
++                std::vector<std::pair<uint64_t, uint64_t>> order;
++                for (const auto &[k, row] : rows)
++                    order.emplace_back(row.runNs + row.waitNs, k);
++                std::sort(order.rbegin(), order.rend());
++                uint64_t totalWait = 0, totalRun = 0, totalCalls = 0;
++                for (const auto &[k, row] : rows)
++                {
++                    totalWait += row.waitNs;
++                    totalRun += row.runNs;
++                    totalCalls += row.calls;
++                }
++                std::fprintf(stderr, "[iop-rpc]   total calls %llu wait %.1f ms run %.1f ms; offloaded %llu, queue latency avg %.1f us max %.1f us\n",
++                             static_cast<unsigned long long>(totalCalls), totalWait / 1e6, totalRun / 1e6,
++                             static_cast<unsigned long long>(queued),
++                             queued ? static_cast<double>(queueNs) / 1e3 / static_cast<double>(queued) : 0.0,
++                             static_cast<double>(maxQueueNs) / 1e3);
++                int shown = 0;
++                for (const auto &[cost, k] : order)
++                {
++                    if (++shown > 14)
++                        break;
++                    const Row &row = rows[k];
++                    const Id &id = ids[k];
++                    std::fprintf(stderr,
++                                 "[iop-rpc]   sid=%08x fn=%04x %s%s calls=%llu async=%llu wait=%.1fms run=%.1fms avg=%.1fus max=%.1fus insns=%.0f send=%.0fB unh=%llu\n",
++                                 id.sid, id.function, (id.mode & 1u) ? "nowait" : "block", id.end ? "+end" : "",
++                                 static_cast<unsigned long long>(row.calls), static_cast<unsigned long long>(row.async),
++                                 row.waitNs / 1e6, row.runNs / 1e6, row.runNs / 1e3 / static_cast<double>(row.calls),
++                                 row.maxRunNs / 1e3, static_cast<double>(row.instructions) / static_cast<double>(row.calls),
++                                 static_cast<double>(row.sendBytes) / static_cast<double>(row.calls),
++                                 static_cast<unsigned long long>(row.unhandled));
++                }
++            }
++        };
++        RpcStats rpcStats;
++
++        // ---- offloaded nowait RPC calls (see IopSubsystem::submitRpc) ------------------------------------------------
++        std::mutex rpcQueueMutex;
++        std::deque<IopSubsystem::AsyncRpc> rpcQueue;
++        std::atomic<uint32_t> rpcPending{0};
++        std::mutex offloadMutex;
++        std::unordered_set<uint32_t> offloadSids; // sids known to have an emulated server (positive answers only)
++        bool rpcAsyncEnabled = true;
++
++        void clearOffloadCache()
++        {
++            std::lock_guard<std::mutex> lock(offloadMutex);
++            offloadSids.clear();
++        }
++
++        // Runs every queued call, oldest first. Caller holds execMutex (IOP thread, or an EE-side entry point that
++        // must stay ordered behind the queue). A `done` that throws would lose the completion; it must not.
++        void runQueuedRpcs()
++        {
++            while (rpcPending.load(std::memory_order_acquire) != 0u)
++            {
++                IopSubsystem::AsyncRpc call;
++                {
++                    std::lock_guard<std::mutex> lock(rpcQueueMutex);
++                    if (rpcQueue.empty())
++                        return;
++                    call = std::move(rpcQueue.front());
++                    rpcQueue.pop_front();
++                    rpcPending.fetch_sub(1u, std::memory_order_release);
++                }
++                RpcResult result{};
++                const uint64_t t0 = rpcStats.enabled ? nowNs() : 0u;
++                const uint64_t ins0 = rpcStats.enabled ? emulator.instructions() : 0u;
++                if (rpcStats.enabled && call.submitNs != 0u)
++                {
++                    std::lock_guard<std::mutex> statLock(rpcStats.mutex);
++                    const uint64_t latency = t0 - call.submitNs;
++                    rpcStats.queueNs += latency;
++                    rpcStats.maxQueueNs = std::max(rpcStats.maxQueueNs, latency);
++                    ++rpcStats.queued;
++                }
++                try
++                {
++                    result = emulator.handleRpc(call.request, &call.send);
++                }
++                catch (...)
++                {
++                    result = RpcResult{};
++                }
++                if (rpcStats.enabled)
++                    rpcStats.record(call.request, result.handled, 0u, nowNs() - t0, emulator.instructions() - ins0, true);
++                if (call.done)
++                    call.done(std::move(result));
++            }
++        }
++
+         mutable std::recursive_mutex execMutex;
+         std::atomic<int> execWaiters{0};
+         std::atomic<bool> threaded{false};
+@@ -390,6 +548,8 @@ namespace ps2x::iop
+     void IopSubsystem::reset()
+     {
+         const Impl::ExecGuard guard(*m_impl);
++        m_impl->runQueuedRpcs();
++        m_impl->clearOffloadCache();
+         m_impl->moduleManager.reset();
+         m_impl->loadOutcomes.clear();
+         m_impl->loggedLoadPaths.clear();
+@@ -408,6 +568,8 @@ namespace ps2x::iop
+     ModuleLoadResult IopSubsystem::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
+     {
+         const Impl::ExecGuard guard(*m_impl);
++        m_impl->runQueuedRpcs();
++        m_impl->clearOffloadCache();
+         const ParsedPs2Path parsed = parsePs2Path(path);
+         if (!parsed)
+             return {true, -1, -1};
+@@ -440,12 +602,16 @@ namespace ps2x::iop
+     ModuleLoadResult IopSubsystem::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
+     {
+         const Impl::ExecGuard guard(*m_impl);
++        m_impl->runQueuedRpcs();
++        m_impl->clearOffloadCache();
+         return m_impl->emulator.loadModuleBuffer(guestAddress, arguments, argumentSize);
+     }
+ 
+     bool IopSubsystem::stopModule(int32_t moduleId, int32_t *result)
+     {
+         const Impl::ExecGuard guard(*m_impl);
++        m_impl->runQueuedRpcs();
++        m_impl->clearOffloadCache();
+         if (m_impl->moduleManager.stopHle(moduleId, result))
+         {
+             m_impl->rebuildRoutes();
+@@ -466,7 +632,9 @@ namespace ps2x::iop
+ 
+     RpcAbi IopSubsystem::selectRpcAbi(const RpcAbiRequest &request) const
+     {
+-        const Impl::ExecGuard guard(*m_impl);
++        // No IOP lock: this runs on every SifCallRpc, and with offloaded RPCs the IOP thread can hold the lock for
++        // milliseconds. It only reads the (constant) service list and which HLE modules are loaded; the latter changes
++        // only in the EE-side module operations, which run on the calling (EE) thread.
+         for (const auto &service : m_impl->coreServices)
+         {
+             if (service && m_impl->serviceActive(*service))
+@@ -493,11 +661,20 @@ namespace ps2x::iop
+ 
+     RpcResult IopSubsystem::handleRpc(const RpcRequest &request)
+     {
++        const uint64_t statT0 = m_impl->rpcStats.enabled ? nowNs() : 0u;
+         const Impl::ExecGuard guard(*m_impl);
++        const uint64_t statT1 = m_impl->rpcStats.enabled ? nowNs() : 0u;
++        m_impl->runQueuedRpcs();
++        const uint64_t statIns0 = m_impl->rpcStats.enabled ? m_impl->emulator.instructions() : 0u;
+         const auto route = m_impl->routes.find(request.sid);
+         detail::IopService *hle = route != m_impl->routes.end() ? route->second : nullptr;
+ 
+         RpcResult emulated = m_impl->emulator.handleRpc(request);
++        if (m_impl->rpcStats.enabled)
++        {
++            m_impl->rpcStats.record(request, emulated.handled, statT1 - statT0, nowNs() - statT1,
++                                    m_impl->emulator.instructions() - statIns0, false);
++        }
+         if (emulated.handled || !hle)
+         {
+             return emulated;
+@@ -505,6 +682,38 @@ namespace ps2x::iop
+         return hle->handleRpc(request);
+     }
+ 
++    bool IopSubsystem::canOffloadRpc(uint32_t sid)
++    {
++        if (!m_impl->rpcAsyncEnabled || !m_impl->threadStarted.load(std::memory_order_acquire) ||
++            !m_impl->threaded.load(std::memory_order_acquire) || t_onIopThread)
++            return false;
++        {
++            std::lock_guard<std::mutex> lock(m_impl->offloadMutex);
++            if (m_impl->offloadSids.count(sid) != 0u)
++                return true;
++        }
++        // First call (or no emulated server yet): ask the emulator under the IOP lock. Module operations clear the
++        // cache under the same lock, so a positive answer cannot outlive its module.
++        const Impl::ExecGuard guard(*m_impl);
++        if (!m_impl->emulator.hasRpcServer(sid))
++            return false;
++        std::lock_guard<std::mutex> lock(m_impl->offloadMutex);
++        m_impl->offloadSids.insert(sid);
++        return true;
++    }
++
++    bool IopSubsystem::submitRpc(AsyncRpc call)
++    {
++        if (!m_impl->rpcAsyncEnabled || !m_impl->threadStarted.load(std::memory_order_acquire))
++            return false;
++        if (m_impl->rpcStats.enabled)
++            call.submitNs = nowNs();
++        std::lock_guard<std::mutex> lock(m_impl->rpcQueueMutex);
++        m_impl->rpcQueue.push_back(std::move(call));
++        m_impl->rpcPending.fetch_add(1u, std::memory_order_release);
++        return true;
++    }
++
+     void IopSubsystem::onSifTransfer(const SifTransfer &transfer)
+     {
+         const Impl::ExecGuard guard(*m_impl);
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index e22deaa..3047f0b 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -1,6 +1,10 @@
+ #include "Common.h"
+ #include "RPC.h"
+ #include "../../ps2_iop_transport.h"
++#include "../../ps2_iop_async.h"
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ 
+ namespace ps2_syscalls
+ {
+@@ -339,8 +343,179 @@ namespace ps2_syscalls
+         setReturnS32(ctx, 0);
+     }
+ 
++    namespace
++    {
++        // PS2X_IOP_RPC_STATS=1: wall time the EE thread spends in SifCallRpc (all of it: argument decoding, the IOP
++        // call, the debug events, the end-function hand-off), printed with the [iop-rpc] table every 10 s.
++        struct SifCallRpcTimer
++        {
++            static bool enabled()
++            {
++                static const bool value = []() {
++                    const char *v = std::getenv("PS2X_IOP_RPC_STATS");
++                    return v && *v && v[0] != '0';
++                }();
++                return value;
++            }
++            static inline uint64_t calls = 0, nowaitCalls = 0, totalNs = 0, iopNs = 0, lastPrint = 0, busyCalls = 0;
++            static uint64_t now()
++            {
++                return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                                 std::chrono::steady_clock::now().time_since_epoch())
++                                                 .count());
++            }
++            uint64_t t0 = 0;
++            bool nowait = false;
++            SifCallRpcTimer() : t0(enabled() ? now() : 0u) {}
++            ~SifCallRpcTimer()
++            {
++                if (!t0)
++                    return;
++                const uint64_t t = now();
++                ++calls;
++                nowaitCalls += nowait ? 1 : 0;
++                totalNs += t - t0;
++                if (lastPrint == 0)
++                    lastPrint = t;
++                if (t - lastPrint >= 10000000000ull)
++                {
++                    lastPrint = t;
++                    std::fprintf(stderr, "[iop-rpc] EE SifCallRpc: calls=%llu nowait=%llu total=%.1fms (of which IOP handleRpc %.1fms) avg=%.1fus, calls on a still-busy client %llu\n",
++                                 static_cast<unsigned long long>(calls), static_cast<unsigned long long>(nowaitCalls),
++                                 totalNs / 1e6, iopNs / 1e6, totalNs / 1e3 / static_cast<double>(calls),
++                                 static_cast<unsigned long long>(busyCalls));
++                }
++            }
++        };
++    }
++
++    namespace
++    {
++        // A nowait call whose server function runs on the IOP thread (ps2_iop_async.h). Everything the EE needs to
++        // finish it later, from the posted-work queue: the same steps as the inline path of SifCallRpc (completion
++        // semaphores, reply fix-ups, end function, client state), in the same order.
++        struct OffloadedRpc
++        {
++            uint32_t clientPtr = 0, serverPtr = 0, sid = 0, rpcNum = 0, mode = 0;
++            uint32_t sendBuf = 0, sendSize = 0, receiveBuffer = 0, receiveSize = 0;
++            uint32_t endFunction = 0, endParameter = 0, completionSemaphore = 0, gp = 0;
++            uint32_t callerPc = 0, callerRa = 0;
++        };
++
++        void finishOffloadedRpc(PS2Runtime *runtime, uint8_t *rdram, const OffloadedRpc &call,
++                                const ps2x::iop::RpcResult &iopResult)
++        {
++            if (iopResult.signalNowaitCompletion)
++            {
++                (void)signalRpcCompletionSema(runtime, call.completionSemaphore);
++            }
++            if (iopResult.signalCompletion)
++            {
++                (void)signalRpcCompletionSema(runtime, call.completionSemaphore);
++            }
++
++            const bool handled = iopResult.handled;
++            const uint32_t resultPointer = iopResult.resultAddress;
++            bool copiedFallback = false;
++            bool zeroedFallback = false;
++            if (call.receiveBuffer != 0u && call.receiveSize != 0u)
++            {
++                if (handled && resultPointer != 0u && resultPointer != call.receiveBuffer)
++                {
++                    rpcCopyToRdram(rdram, call.receiveBuffer, resultPointer, call.receiveSize);
++                }
++                else if (!handled && call.sendBuf != 0u && call.sendSize != 0u && call.sendBuf != call.receiveBuffer)
++                {
++                    rpcCopyToRdram(rdram, call.receiveBuffer, call.sendBuf, std::min(call.sendSize, call.receiveSize));
++                    copiedFallback = true;
++                }
++                else if (!handled)
++                {
++                    rpcZeroRdram(rdram, call.receiveBuffer, call.receiveSize);
++                    zeroedFallback = true;
++                }
++            }
++
++            auto completeClient = [=](bool callbackCompleted)
++            {
++                {
++                    std::lock_guard<std::mutex> lock(g_rpc_mutex);
++                    g_rpc_clients[call.clientPtr].busy = false;
++                }
++                SifRpcDebugEvent event = makeRpcDebugEvent("CallRpc", nullptr, runtime);
++                event.pc = call.callerPc;
++                event.ra = call.callerRa;
++                event.clientPtr = call.clientPtr;
++                event.serverPtr = call.serverPtr;
++                event.sid = call.sid;
++                event.rpcNum = call.rpcNum;
++                event.mode = call.mode;
++                event.sendBuf = call.sendBuf;
++                event.sendSize = call.sendSize;
++                event.recvBuf = call.receiveBuffer;
++                event.recvSize = call.receiveSize;
++                event.resultPtr = resultPointer;
++                event.endFunc = call.endFunction;
++                event.endParam = call.endParameter;
++                event.semaId = call.completionSemaphore;
++                event.flags =
++                    kSifRpcDebugFlagNowait |
++                    (iopResult.handled ? kSifRpcDebugFlagHandledByHle : 0u) |
++                    (callbackCompleted ? kSifRpcDebugFlagCallback : 0u) |
++                    (!handled ? kSifRpcDebugFlagUnhandled : 0u) |
++                    (copiedFallback ? kSifRpcDebugFlagFallbackCopy : 0u) |
++                    (zeroedFallback ? kSifRpcDebugFlagFallbackZero : 0u);
++                fillRpcDebugPreview(rdram, call.sendBuf, call.sendSize, event.sendPreview, event.sendPreviewSize);
++                fillRpcDebugPreview(rdram, call.receiveBuffer, call.receiveSize, event.recvPreview, event.recvPreviewSize);
++                event.result = 0;
++#if PS2X_ENABLE_IOP_RPC_TRACE
++                if ((event.flags & kSifRpcDebugFlagUnhandled) != 0u)
++                {
++                    logUnhandledRpcTrace(event);
++                }
++#endif
++                pushSifRpcDebugEvent(event);
++            };
++
++            if (call.endFunction == 0u || iopResult.callbackPolicy == ps2x::iop::CallbackPolicy::Suppress)
++            {
++                completeClient(call.endFunction != 0u);
++                return;
++            }
++
++            uint32_t callbackFunction = call.endFunction;
++            if (!runtime->hasFunction(callbackFunction) && callbackFunction >= 0x10000u &&
++                runtime->hasFunction(callbackFunction - 0x10000u))
++            {
++                callbackFunction -= 0x10000u;
++            }
++            if (!runtime->hasFunction(callbackFunction))
++            {
++                (void)signalRpcCompletionSema(runtime, call.completionSemaphore);
++                completeClient(false);
++                return;
++            }
++
++            // On hardware the end function runs from the SIF interrupt once the IOP's reply arrives, not inside
++            // sceSifCallRpc: queue it like any other interrupt-time callback (the scheduler gives it a stack).
++            GuestInvocation callback{};
++            callback.kind = GuestInvocationKind::RpcCallback;
++            callback.context.pc = callbackFunction;
++            SET_GPR_U32(&callback.context, 4, call.endParameter);
++            SET_GPR_U32(&callback.context, 28, call.gp);
++            SET_GPR_U32(&callback.context, 29, 0u);
++            SET_GPR_U32(&callback.context, 31, 0u);
++            callback.onComplete = [completeClient](const R5900Context &, R5900Context &)
++            {
++                completeClient(true);
++            };
++            runtime->eeScheduler().queueInvocation(std::move(callback));
++        }
++    }
++
+     void SifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        SifCallRpcTimer callTimer;
+         std::lock_guard<std::recursive_mutex> rpcCallLock(g_sif_call_rpc_mutex);
+ 
+         const uint32_t clientPtr = getRegU32(ctx, 4);
+@@ -487,6 +662,8 @@ namespace ps2_syscalls
+         {
+             std::lock_guard<std::mutex> lock(g_rpc_mutex);
+             auto &state = g_rpc_clients[clientPtr];
++            if (state.busy)
++                ++SifCallRpcTimer::busyCalls; // PS2X_IOP_RPC_STATS: a call on a client whose previous call has not completed
+             state.busy = true;
+             state.last_rpc = rpcNum;
+             sid = state.sid;
+@@ -543,7 +720,39 @@ namespace ps2_syscalls
+             request.endFunction = endFunction;
+             request.endParameter = endParameter;
+ 
++            callTimer.nowait = (mode & kSifRpcModeNowait) != 0u;
++            if (callTimer.nowait)
++            {
++                // Threaded IOP: the IOP runs the server function asynchronously, like the real one. Only calls to
++                // emulated (physical IRX) servers qualify; ps2IopRpcSubmit() declines everything else.
++                OffloadedRpc offloaded;
++                offloaded.clientPtr = clientPtr;
++                offloaded.serverPtr = serverPtr;
++                offloaded.sid = sid;
++                offloaded.rpcNum = rpcNum;
++                offloaded.mode = mode;
++                offloaded.sendBuf = sendBuf;
++                offloaded.sendSize = sendSize;
++                offloaded.receiveBuffer = receiveBuffer;
++                offloaded.receiveSize = receiveSize;
++                offloaded.endFunction = endFunction;
++                offloaded.endParameter = endParameter;
++                offloaded.completionSemaphore = completionSemaphore;
++                offloaded.gp = getRegU32(ctx, 28);
++                offloaded.callerPc = ctx->pc;
++                offloaded.callerRa = getRegU32(ctx, 31);
++                if (ps2IopRpcSubmit(request,
++                                    [runtime, rdram, offloaded](const ps2x::iop::RpcResult &result)
++                                    { finishOffloadedRpc(runtime, rdram, offloaded, result); }))
++                {
++                    setReturnS32(ctx, 0);
++                    return;
++                }
++            }
++            const uint64_t iopT0 = callTimer.t0 ? SifCallRpcTimer::now() : 0u;
+             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
++            if (callTimer.t0)
++                SifCallRpcTimer::iopNs += SifCallRpcTimer::now() - iopT0;
+ 
+             if (iopResult.signalNowaitCompletion &&
+                 (mode & kSifRpcModeNowait) != 0u)
+diff --git a/ps2xRuntime/src/lib/ps2_iop_async.h b/ps2xRuntime/src/lib/ps2_iop_async.h
+new file mode 100644
+index 0000000..e0163fb
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_iop_async.h
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include "ps2x/iop/iop_types.h"
++
++#include <functional>
++
++namespace ps2x::iop
++{
++    class IopSubsystem;
++}
++
++// Offloading of nowait SIF RPC calls to the IOP thread (threaded IOP mode, PS2X_IOP_RPC_ASYNC). The runtime installs
++// its subsystem once; SifCallRpc asks ps2IopRpcSubmit() to queue a nowait call. On success the IOP thread runs the
++// server function later, writes the reply into the guest receive buffer, and `eeDone` runs on the EE thread (from the
++// posted-work queue, ordered with the IOP's SIF commands) with the result. On false nothing was queued and the caller
++// runs the call inline as before.
++void ps2IopRpcInstall(ps2x::iop::IopSubsystem *subsystem);
++[[nodiscard]] bool ps2IopRpcSubmit(const ps2x::iop::RpcRequest &request,
++                                   std::function<void(const ps2x::iop::RpcResult &)> eeDone);
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 40ac44a..6cec1de 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -1,5 +1,6 @@
+ #include "ps2_iop_host.h"
+ #include "ps2_iop_post.h"
++#include "ps2_iop_async.h"
+ 
+ #include "ps2_runtime.h"
+ #include "ps2x/iop/iop_subsystem.h"
+@@ -26,6 +27,51 @@ namespace
+ {
+     // The adapter whose posted-work queue EeScheduler drains (ps2_iop_post.h). One runtime per process.
+     std::atomic<PS2IopHostAdapter *> g_postAdapter{nullptr};
++    std::atomic<ps2x::iop::IopSubsystem *> g_asyncSubsystem{nullptr};
++}
++
++void ps2IopRpcInstall(ps2x::iop::IopSubsystem *subsystem)
++{
++    g_asyncSubsystem.store(subsystem, std::memory_order_release);
++}
++
++bool ps2IopRpcSubmit(const ps2x::iop::RpcRequest &request, std::function<void(const ps2x::iop::RpcResult &)> eeDone)
++{
++    ps2x::iop::IopSubsystem *const subsystem = g_asyncSubsystem.load(std::memory_order_acquire);
++    PS2IopHostAdapter *const adapter = g_postAdapter.load(std::memory_order_acquire);
++    if (!subsystem || !adapter || !eeDone)
++        return false;
++    if (!subsystem->canOffloadRpc(request.sid))
++        return false;
++    ps2x::iop::IopSubsystem::AsyncRpc call;
++    call.request = request;
++    call.send.resize(request.send.size);
++    if (request.send.size != 0u && !adapter->readGuest(request.send.address, call.send.data(), call.send.size()))
++        return false;
++    call.done = [adapter, eeDone = std::move(eeDone)](ps2x::iop::RpcResult result)
++    {
++        adapter->postWork([eeDone, result]() { eeDone(result); });
++    };
++    return subsystem->submitRpc(std::move(call));
++}
++
++void PS2IopHostAdapter::postWork(std::function<void()> work)
++{
++    bool wake = false;
++    {
++        std::lock_guard<std::mutex> lock(m_postMutex);
++        PostedSifCommand posted;
++        posted.work = std::move(work);
++        m_posted.push_back(std::move(posted));
++        if (!m_postWakeQueued)
++        {
++            m_postWakeQueued = true;
++            wake = true;
++        }
++    }
++    m_postedTotal.fetch_add(1, std::memory_order_relaxed);
++    if (wake)
++        m_runtime.postEeEvent(EeEvent{EeEventType::Dmac, kIopPostedWorkEventId, 0u});
+ }
+ 
+ void PS2IopHostAdapter::setPostSifCommands(bool enable)
+@@ -594,8 +640,13 @@ void PS2IopHostAdapter::drainPosted()
+         }
+     }
+     uint8_t *const rdram = m_runtime.memory().getRDRAM();
+-    for (const PostedSifCommand &command : batch)
++    for (PostedSifCommand &command : batch)
+     {
++        if (command.work)
++        {
++            command.work();
++            continue;
++        }
+         (void)ps2_stubs::dispatchSifCommand(rdram,
+                                             &m_runtime,
+                                             command.commandId,
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index f0010bb..70c8d9b 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -5,6 +5,7 @@
+ #include <atomic>
+ #include <cstdint>
+ #include <cstdio>
++#include <functional>
+ #include <mutex>
+ #include <unordered_map>
+ #include <vector>
+@@ -92,6 +93,8 @@ public:
+     // the queue in order. See ps2_iop_post.h.
+     void setPostSifCommands(bool enable);
+     void drainPosted();
++    // IOP thread: queue `work` to run on the EE thread, in order with the posted SIF commands.
++    void postWork(std::function<void()> work);
+     [[nodiscard]] uint64_t postedCount() const { return m_postedTotal.load(std::memory_order_relaxed); }
+ 
+ private:
+@@ -103,6 +106,7 @@ private:
+     {
+         uint32_t commandId = 0;
+         std::vector<uint8_t> packet;
++        std::function<void()> work; // set: run this instead of dispatching a SIF command
+     };
+ 
+     PS2Runtime &m_runtime;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index de1ce39..695edde 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -12,6 +12,7 @@
+ #include "Kernel/Stubs/MPEG.h"
+ #include "ps2_host_backend.h"
+ #include "ps2_iop_host.h"
++#include "ps2_iop_async.h"
+ #include "runtime/ps2_host_gs.h"
+ #include "runtime/ps2_host_vu.h"
+ #include "runtime/ps2_host_vu0.h"
+@@ -603,6 +604,7 @@ PS2Runtime::PS2Runtime()
+     {
+         m_iopHost->setPostSifCommands(true);
+         m_iopSubsystem->enableThread(true);
++        ps2IopRpcInstall(m_iopSubsystem.get());
+         g_iopThreaded = true;
+     }
+ 
