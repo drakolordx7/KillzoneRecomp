@@ -1,0 +1,130 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..db8f958 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -8,6 +13,57 @@
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
++#include <cstdio>
++
++extern bool g_ps2GuestUnwinding; // ps2_runtime.cpp
++
++namespace
++{
++    // Number of events in m_events, readable without the lock: processPendingEvents runs on nearly every scheduler
++    // iteration and used to lock twice, allocate a deque and read the host clock even with nothing to do.
++    std::atomic<uint32_t> g_queuedEvents{0};
++}
++
++namespace
++{
++    // currentThread() runs on every EE checkpoint (accountCycles -> currentContext); cache the hash lookup.
++    // unordered_map node addresses are stable; the cache is dropped whenever a thread is erased.
++    const EeScheduler *g_cachedScheduler = nullptr;
++    int g_cachedThreadId = -1;
++    GuestThread *g_cachedThread = nullptr;
++    void dropThreadCache() { g_cachedScheduler = nullptr; }
++}
++
++
++// Scheduler-level trace ring: every guest entry (thread/invocation, pc, ra, sp) and what it came back with.
++// Printed when the scheduler hits a pc with no recompiled function.
++namespace
++{
++    struct SchedTrace
++    {
++        char what; // 'E' enter, 'X' exit, 'I' invocation pushed, 'D' invocation done
++        int thread;
++        uint32_t depth, pc, ra, sp;
++    };
++    SchedTrace g_schedTrace[256];
++    uint32_t g_schedTracePos = 0;
++    inline void schedTrace(char what, int thread, size_t depth, const R5900Context &c)
++    {
++        g_schedTrace[g_schedTracePos++ & 255u] = SchedTrace{what, thread, static_cast<uint32_t>(depth), c.pc,
++                                                            getRegU32(&c, 31), getRegU32(&c, 29)};
++    }
++    void dumpSchedTrace()
++    {
++        std::fprintf(stderr, "[sched-trace] oldest first:\n");
++        for (uint32_t i = 0; i < 256u; ++i)
++        {
++            const SchedTrace &t = g_schedTrace[(g_schedTracePos + i) & 255u];
++            if (!t.what)
++                continue;
++            std::fprintf(stderr, "  %c th=%d d=%u pc=0x%x ra=0x%x sp=0x%x\n", t.what, t.thread, t.depth, t.pc, t.ra, t.sp);
++        }
++    }
++}
+ 
+ namespace
+ {
+@@ -119,6 +183,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     {
+         std::lock_guard lock(m_eventMutex);
+         m_events.clear();
++        g_queuedEvents.store(0u, std::memory_order_release);
+         m_deadlines.clear();
+         m_pendingInvocations.clear();
+     }
+@@ -349,6 +426,7 @@ void EeScheduler::postEvent(EeEvent event)
+     {
+         std::lock_guard lock(m_eventMutex);
+         m_events.push_back(event);
++        g_queuedEvents.fetch_add(1u, std::memory_order_release);
+         m_checkpointPending.store(true, std::memory_order_release);
+     }
+     m_eventCv.notify_one();
+@@ -1753,28 +1884,42 @@ void EeScheduler::processPendingEvents()
+             dispatchIrq(false, 9u + timer);
+         }
+     }
+-    std::deque<EeEvent> pending;
++    if (g_queuedEvents.load(std::memory_order_acquire) != 0u)
+     {
+-        std::lock_guard lock(m_eventMutex);
+-        pending.swap(m_events);
+-    }
+-    for (const EeEvent &event : pending)
+-    {
+-        processEvent(event);
++        std::deque<EeEvent> pending;
++        {
++            std::lock_guard lock(m_eventMutex);
++            pending.swap(m_events);
++            g_queuedEvents.store(0u, std::memory_order_release);
++        }
++        for (const EeEvent &event : pending)
++        {
++            processEvent(event);
++        }
+     }
+ 
+     {
+-        std::lock_guard lock(m_eventMutex);
++        // Lock-free: an event posted concurrently re-sets m_checkpointPending after pushing (postEvent), and the
++        // re-check below catches one posted between our read and our store.
+         const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+         const bool cycleEventDue = nextEventCycle != 0u && m_eeCycle >= nextEventCycle;
+-        const bool pendingWork = !m_events.empty() || cycleEventDue || m_stopRequested.load(std::memory_order_acquire);
++        const bool pendingWork = g_queuedEvents.load(std::memory_order_acquire) != 0u || cycleEventDue ||
++                                 m_stopRequested.load(std::memory_order_acquire);
+         m_checkpointPending.store(pendingWork, std::memory_order_release);
++        if (!pendingWork && g_queuedEvents.load(std::memory_order_acquire) != 0u)
++            m_checkpointPending.store(true, std::memory_order_release);
+     }
+     applyPendingPreemption();
+ }
+ 
+ void EeScheduler::processDueDeadlines()
+ {
++    // Fast path: nothing is due before the earliest deadline cycle (kept by updateNextDeadline under the lock).
++    {
++        const uint64_t next = m_nextDeadlineCycle.load(std::memory_order_acquire);
++        if (next == 0u || m_eeCycle < next)
++            return;
++    }
+     for (;;)
+     {
+         std::vector<ScheduledEvent> due;
