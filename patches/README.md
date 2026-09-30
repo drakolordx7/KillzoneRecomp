@@ -362,3 +362,66 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
   the checkpoint flag is recomputed lock-free (re-checked against a concurrent post), and `processDueDeadlines`
   returns immediately while the EE cycle is below the earliest deadline. Killzone at 120 Hz vblank, gameplay-only
   window, 3 runs: ~46 -> 68-76 frames/s.
+
+- `0019-vu0-sched-locks.patch` (runtime: `EeScheduler.cpp`, `ps2_memory.cpp`; the VU0 half is in the main repo:
+  `src/kz_vu.cpp`, `ext/kzvu/{include/kzvu.h,src/kzvu.cpp,test/kzvu0_test.cpp}`). Trims the EE thread's per-call and
+  per-dispatch fixed costs. Generated against the working tree as it was, which already carried uncommitted changes
+  to `ps2_memory.cpp` (the GIF_STAT pointer cache and the `eeCycles < kEeClockHz` shortcut in `advanceEeTimers`, the
+  DMAC-drain fast path); the hunks here need those as context. No header changed, no regen.
+  - **Scheduler dispatch loop** (`EeScheduler::run`). Gameplay runs ~0.9-1.2 M scheduler dispatches per second (entry
+    fragments and every return after a non-local unwind go through it), so per-dispatch work matters.
+    (1) `processPendingEvents` was called twice per iteration (1.5-2.8 M/s) and only has work when an event was posted,
+    a deadline or EE timer interrupt is due, a reschedule is pending or the checkpoint flag is set; those are now tested
+    inline (300 calls/s left; `PS2X_EVENT_PUMP_ALWAYS=1` = old). (2) The dispatch's own 8-cycle charge went through a
+    full `checkpointDue` -> `accountCycles` (timers, IOP clock, wall clock, COP0 Count) each time; it is now charged
+    against the guest checkpoint budget like a call is (`g_ps2EeBudget`, ps2_cg.h) and passed on when the budget runs
+    out. Total cycles charged are unchanged; events are still noticed at the top of the loop
+    (`PS2X_DISPATCH_BUDGET=0` = old). (3) One dense-table probe replaces `hasFunction` + `lookupFunction` (two calls;
+    the latter also pushed the dispatch history ring, a missing-function diagnostic that no longer records scheduler
+    hops). (4) pc/ra/sp/gp debug publish every 8th dispatch. (5) The `PS2X_WALLCLOCK` / `PS2X_STRESS_YIELD` function-local
+    statics became namespace constants (MSVC's thread-safe-init check is a TLS load per call), and `accountCycles`
+    inlines the cached-thread lookup.
+  - **Lazy EE timers** (`PS2Memory::advanceEeTimers`, `resetEeTimers`, `cyclesUntilNextEeTimerInterrupt`, timer register
+    read/write). Timer state is only observable through its registers and interrupts, so `advanceEeTimers` now collects
+    cycles and applies them when a timer register is read or written, when the earliest cycle at which any timer can
+    raise an interrupt flag is reached (computed once per flush, `eeTimersNextEventCycles`), or when the scheduler asks
+    for the next timer deadline. The tick split carries its remainder exactly, so chunking does not change the result;
+    the interrupt is raised by the same checkpoint call as before. `PS2X_LAZY_TIMERS=0` = old,
+    `PS2X_LAZY_TIMERS=verify` keeps an eager shadow copy advanced every checkpoint and compares it at every flush, at
+    every register read and whenever the shadow raises an interrupt (10 s summary, see below).
+  - **VU0 call** (`src/kz_vu.cpp`, `kzvu0Call` in kzvu). `onVu0Call` copied the COP2 file context -> `Kzvu0Regs` ->
+    VU0 and back (four 496-byte copies, plus the flag seeding, per call, 0.4-0.6 M calls/s). `kzvu0Call` copies straight
+    between `R5900Context` and VU0 (AVX copies, VI/flag seeding as before), and every VU0 access on the call path binds
+    the per-thread `VU0` reference once instead of reloading a TLS pointer after each store. Semantics unchanged: the
+    same registers, the same VF0/VI0 write-back, same TPC/VPU_STAT. `KZ_VU0_DIRECT=0` = staged path.
+    `KZ_VU0_VERIFY=<n>` runs every n-th call through both paths from the same state and compares all registers, flags,
+    TPC/VPU_STAT and VU0 data memory.
+  - **Tests.** `kzvu0_test` (now 509 checks, 0 failures; `--clamp 0/1/2/3` all pass) compares `kzvu0Call` with
+    `SetRegs/Execute/GetRegs` on all 103 captured game calls and on 16 randomized inputs each (random VF bits including
+    NaN/Inf/denormals, flags, VI, R/I/Q, FBRST); mutation-checked (dropping the Q write-back gives 75 failures).
+    `kzvu_test` 575 checks, 0 failures. `kzvu0_test --bench` times the old and new call path per captured program.
+  - **Debug.** `PS2X_SCHED_STATS=1` (`[sched-stats]` every 10 s: yields by reason, dispatches/s, events, rdtsc split of
+    `run()` time between guest code and scheduler, host time slept in vblank pacing; `=2` adds dispatch-pc
+    histograms; `-DPS2X_SCHED_STATS_HOT` adds per-checkpoint counters). Helpers used for the numbers
+    below: `tools/scripts/perf_run.ps1`, `perf_pairs.ps1` (variants run concurrently) and `perf_metric.py`.
+  - **Measured** (headless, `KZ_FPS=120`, scripted input, window t=150..200 s; the machine was shared with 2-3 other
+    game instances and builds, so every A/B is a pair of runs started together in the same binary with the switches above;
+    V0 = `PS2X_LAZY_TIMERS=0 PS2X_EVENT_PUMP_ALWAYS=1 PS2X_DISPATCH_BUDGET=0 KZ_VU0_DIRECT=0`, V1 = defaults):
+    - EE-thread host time per displayed frame (1000 ms minus the vblank-pacing sleep, divided by fps), 6 pairs:
+      V0 median 14.05 ms, V1 median 13.68 ms; per-pair change -0.83, -0.83, -0.60, -0.48, -0.47, +0.06 ms (median -0.54 ms,
+      -3.8 %). fps (unchanged, see docs/findings.md "EE thread frame budget"): V0 median 60.3, V1 median 59.6.
+    - Scheduler per dispatch (rdtsc, each figure includes ~15-20 ns of instrumentation): V0 84-99 ns, V1 51-56 ns.
+    - EE timers per checkpoint (rdtsc pair around `advanceEeTimers`, ~10 ns of it instrumentation): eager 28-30 ns, lazy
+      14-15 ns.
+    - VU0 call, host cost per call over the 11 captured start PCs (`kzvu0_test --bench`, min of 3 runs, includes the
+      context copies the old path made): original 136-194 ns (median 160), `kzvu0Call` 64-117 ns (median 79).
+  - **Correctness evidence.** `PS2X_LAZY_TIMERS=verify` + `KZ_VU0_VERIFY=8` over a full 235 s run: 102 508 timer
+    comparisons, 2 014 interrupts and 200 M early returns checked, 5.04 M VU0 calls compared, 0 mismatches in both. Gameplay
+    frames of V0 and V1 runs look identical (first-mission scenes). 88 of 88 20 s boots with the final binary passed the
+    module-load phase (a separate pre-existing IOP module-loading flake is described in docs/findings.md);
+    `PS2X_STRESS_YIELD=97` boots to the menu in both V0 and V1.
+  - **Not changed / left.** The EE thread sleeps 10-47 % of the time in vblank pacing, and the VIF1 worker needs
+    ~9-10 ms per frame (VU1 7.6-8.3 ms of it), more than a 120 Hz vblank period (docs/findings.md "EE thread frame
+    budget"): fixed-cost trimming on the EE thread does not move fps by itself. The ~1 M dispatches/s come from tail jumps
+    between `entry_*` fragments and the resume of every caller after a non-local unwind; a trampoline in
+    `ps2CgAfterCallSlow` (ps2_cg.h, full rebuild) would remove most of them.

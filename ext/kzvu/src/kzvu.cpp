@@ -7,6 +7,7 @@
 #include "common/FPControl.h"
 
 #include <cstring>
+#include <immintrin.h>
 
 // VU0/VU1 micro and data memory. Static so they sit inside the executable image, within +-2 GB of the recompiler's
 // text pointer (&cpuRegs.GPR.r[9]): microVU encodes constant VU memory addresses as 32-bit displacements from it.
@@ -366,71 +367,93 @@ void kzvu0MicroWritten(uint32_t offset, uint32_t size)
 		CpuMicroVU0.Clear(offset & VU0_PROGMASK, size);
 }
 
+// VU0 is a per-thread pointer in kzvu (see kzvu_prefix.h), and the compiler cannot prove that the many stores below do
+// not change that pointer, so it would reload it for every access. Everything on the VU0 call path binds it once.
+
+// 31 registers (VF1..VF31): 496 bytes.
+static inline void CopyVf31(void* dst, const void* src)
+{
+	const __m256i* s = static_cast<const __m256i*>(src);
+	__m256i* d = static_cast<__m256i*>(dst);
+	for (int i = 0; i < 15; i++)
+		_mm256_storeu_si256(d + i, _mm256_loadu_si256(s + i));
+	_mm_storeu_si128(reinterpret_cast<__m128i*>(static_cast<char*>(dst) + 480),
+		_mm_loadu_si128(reinterpret_cast<const __m128i*>(static_cast<const char*>(src) + 480)));
+}
+
+// Seeds the VU0 flag state the way PCSX2's vu0ExecMicro() does: the interpreter's flag copies, and microVU's four
+// pipelined instances of each flag (its status instances are kept in microVU's internal bit layout, see
+// mVUallocSFLAGd()). Q is seeded in both of microVU's instances (current + pending): no division is in flight between
+// programs.
+static inline void SeedVu0Flags(VURegs& v0, u32 status, u32 mac, u32 clip, u32 r, u32 i, u32 q)
+{
+	v0.VI[REG_STATUS_FLAG].UL = status;
+	v0.VI[REG_MAC_FLAG].UL = mac;
+	v0.VI[REG_CLIP_FLAG].UL = clip;
+	v0.clipflag = clip;
+	v0.macflag = mac;
+	v0.statusflag = status;
+	const u32 microStatus = ((status >> 3) & 0x18u) | ((status >> 11) & 0x1800u) | ((status >> 14) & 0x3cf0000u);
+	for (u32& f : v0.micro_statusflags) f = microStatus;
+	for (u32& f : v0.micro_macflags) f = mac;
+	for (u32& f : v0.micro_clipflags) f = clip;
+	v0.VI[REG_R].UL = r;
+	v0.VI[REG_I].UL = i;
+	v0.VI[REG_Q].UL = q;
+	v0.pending_q = q;
+}
+
 void kzvu0SetRegs(const Kzvu0Regs& in)
 {
-	std::memcpy(VU0.VF[1].UL, in.vf[1], 31 * 16);
-	VU0.VF[0].UL[0] = VU0.VF[0].UL[1] = VU0.VF[0].UL[2] = 0;
-	VU0.VF[0].f.w = 1.0f;
-	VU0.VI[0].UL = 0;
+	VURegs& v0 = VU0;
+	std::memcpy(v0.VF[1].UL, in.vf[1], 31 * 16);
+	v0.VF[0].UL[0] = v0.VF[0].UL[1] = v0.VF[0].UL[2] = 0;
+	v0.VF[0].f.w = 1.0f;
+	v0.VI[0].UL = 0;
 	for (int i = 1; i < 16; i++)
-		VU0.VI[i].UL = in.vi[i] & 0xffff;
-	std::memcpy(VU0.ACC.UL, in.acc, 16);
-	VU0.VI[REG_STATUS_FLAG].UL = in.status;
-	VU0.VI[REG_MAC_FLAG].UL = in.mac;
-	VU0.VI[REG_CLIP_FLAG].UL = in.clip;
-	// Same as PCSX2's vu0ExecMicro(): the interpreter's flag copies, and microVU's four pipelined instances of each
-	// flag (its status instances are kept in microVU's internal bit layout, see mVUallocSFLAGd()). Q is seeded in both
-	// of microVU's instances (current + pending): no division is in flight between programs.
-	VU0.clipflag = in.clip;
-	VU0.macflag = in.mac;
-	VU0.statusflag = in.status;
-	const u32 microStatus = ((in.status >> 3) & 0x18u) | ((in.status >> 11) & 0x1800u) | ((in.status >> 14) & 0x3cf0000u);
-	for (u32& f : VU0.micro_statusflags) f = microStatus;
-	for (u32& f : VU0.micro_macflags) f = in.mac;
-	for (u32& f : VU0.micro_clipflags) f = in.clip;
-	VU0.VI[REG_R].UL = in.r;
-	VU0.VI[REG_I].UL = in.i;
-	VU0.VI[REG_Q].UL = in.q;
-	VU0.pending_q = in.q;
+		v0.VI[i].UL = in.vi[i] & 0xffff;
+	std::memcpy(v0.ACC.UL, in.acc, 16);
+	SeedVu0Flags(v0, in.status, in.mac, in.clip, in.r, in.i, in.q);
 }
 
 void kzvu0GetRegs(Kzvu0Regs& out)
 {
-	std::memcpy(out.vf, VU0.VF, 32 * 16);
+	VURegs& v0 = VU0;
+	std::memcpy(out.vf, v0.VF, 32 * 16);
 	for (int i = 0; i < 16; i++)
-		out.vi[i] = VU0.VI[i].UL & 0xffff;
-	std::memcpy(out.acc, VU0.ACC.UL, 16);
-	out.status = VU0.VI[REG_STATUS_FLAG].UL;
-	out.mac = VU0.VI[REG_MAC_FLAG].UL;
-	out.clip = VU0.VI[REG_CLIP_FLAG].UL;
-	out.r = VU0.VI[REG_R].UL;
-	out.i = VU0.VI[REG_I].UL;
-	out.q = VU0.VI[REG_Q].UL;
+		out.vi[i] = v0.VI[i].UL & 0xffff;
+	std::memcpy(out.acc, v0.ACC.UL, 16);
+	out.status = v0.VI[REG_STATUS_FLAG].UL;
+	out.mac = v0.VI[REG_MAC_FLAG].UL;
+	out.clip = v0.VI[REG_CLIP_FLAG].UL;
+	out.r = v0.VI[REG_R].UL;
+	out.i = v0.VI[REG_I].UL;
+	out.q = v0.VI[REG_Q].UL;
 }
 
-static u32 RunCycles0(u32 budget)
+static u32 RunCycles0(VURegs& v0, u32 budget)
 {
-	VU0.VI[REG_FBRST].UL = s_fbrst & kFbrstStopEnables;
-	cpuRegs.cycle = VU0.cycle;
-	const u64 start = VU0.cycle;
+	v0.VI[REG_FBRST].UL = s_fbrst & kFbrstStopEnables;
+	cpuRegs.cycle = v0.cycle;
+	const u64 start = v0.cycle;
 	CpuVU0->Execute(budget);
-	const u64 used = VU0.cycle - start;
+	const u64 used = v0.cycle - start;
 	s_vu0_cycles += used;
 	return static_cast<u32>(used);
 }
 
 // Runs VU0 while VBS0 is set: past M-bit pauses, until the E bit, a D/T stop or the budget.
-static u32 RunVu0ToEnd(u32 maxCycles)
+static u32 RunVu0ToEnd(VURegs& v0, u32 maxCycles)
 {
 	u32 used = 0;
 	// Every Execute() makes progress (at least one instruction pair or one block), so this terminates; the iteration
 	// cap only guards against a program that pauses on an M bit without consuming cycles.
-	for (int iter = 0; iter < 1 << 20 && (VU0.VI[REG_VPU_STAT].UL & 0x1) && used < maxCycles; iter++)
-		used += RunCycles0(maxCycles - used);
+	for (int iter = 0; iter < 1 << 20 && (v0.VI[REG_VPU_STAT].UL & 0x1) && used < maxCycles; iter++)
+		used += RunCycles0(v0, maxCycles - used);
 	return used;
 }
 
-uint32_t kzvu0Execute(uint32_t startPcBytes, uint32_t maxCycles)
+static u32 Vu0Execute(VURegs& v0, uint32_t startPcBytes, uint32_t maxCycles)
 {
 	if (!s_init)
 		return 0;
@@ -439,24 +462,69 @@ uint32_t kzvu0Execute(uint32_t startPcBytes, uint32_t maxCycles)
 
 	// vu0ExecMicro(): a still-running program is finished first (PCSX2's vu0Finish).
 	u32 used = 0;
-	if (VU0.VI[REG_VPU_STAT].UL & 0x1)
+	if (v0.VI[REG_VPU_STAT].UL & 0x1)
 	{
-		used += RunVu0ToEnd(maxCycles);
-		if (VU0.VI[REG_VPU_STAT].UL & 0x1)
+		used += RunVu0ToEnd(v0, maxCycles);
+		if (v0.VI[REG_VPU_STAT].UL & 0x1)
 		{
 			Console.Warning("kzvu: force-stopping VU0, it ran for too long");
-			VU0.VI[REG_VPU_STAT].UL &= ~0x1;
+			v0.VI[REG_VPU_STAT].UL &= ~0x1;
 		}
 	}
 
-	VU0.VI[REG_VPU_STAT].UL &= ~0xFF;
-	VU0.VI[REG_VPU_STAT].UL |= 0x01;
+	v0.VI[REG_VPU_STAT].UL &= ~0xFF;
+	v0.VI[REG_VPU_STAT].UL |= 0x01;
 	if (startPcBytes != 0xFFFFFFFFu)
-		VU0.VI[REG_TPC].UL = (startPcBytes >> 3) & (VU0_PROGMASK >> 3);
-	CpuVU0->SetStartPC(VU0.VI[REG_TPC].UL << 3);
-	used += RunVu0ToEnd(maxCycles);
+		v0.VI[REG_TPC].UL = (startPcBytes >> 3) & (VU0_PROGMASK >> 3);
+	CpuVU0->SetStartPC(v0.VI[REG_TPC].UL << 3);
+	used += RunVu0ToEnd(v0, maxCycles);
 	kzvu::TakeInterrupts(1u << INTC_VU0); // D/T stops are reported through VPU_STAT; the host has no VU0 INTC line
 	return used;
+}
+
+uint32_t kzvu0Execute(uint32_t startPcBytes, uint32_t maxCycles)
+{
+	return Vu0Execute(VU0, startPcBytes, maxCycles);
+}
+
+Kzvu0CallOut kzvu0Call(const Kzvu0Host& h, uint32_t startPcBytes, uint32_t maxCycles, uint32_t fbrst)
+{
+	// Same as kzvu0SetRegs + kzvuSetFBRST + kzvu0Execute + kzvu0GetRegs, without the Kzvu0Regs staging copy: registers go
+	// straight between the host's COP2 file and VU0's.
+	VURegs& v0 = VU0;
+	CopyVf31(v0.VF[1].UL, h.vf[1]);
+	v0.VF[0].UL[0] = v0.VF[0].UL[1] = v0.VF[0].UL[2] = 0;
+	v0.VF[0].f.w = 1.0f;
+	v0.VI[0].UL = 0;
+	for (int i = 1; i < 16; i++)
+		v0.VI[i].UL = h.vi[i];
+	_mm_storeu_si128(reinterpret_cast<__m128i*>(v0.ACC.UL), _mm_loadu_si128(reinterpret_cast<const __m128i*>(h.acc)));
+	SeedVu0Flags(v0, *h.status, *h.mac, *h.clip, h.r[0], *h.i, *h.q);
+	s_fbrst = fbrst;
+
+	Vu0Execute(v0, startPcBytes, maxCycles);
+
+	CopyVf31(h.vf[1], v0.VF[1].UL);
+	h.vf[0][0] = h.vf[0][1] = h.vf[0][2] = 0;
+	h.vf[0][3] = 0x3F800000u;
+	h.vi[0] = 0;
+	for (int i = 1; i < 16; i++)
+		h.vi[i] = static_cast<uint16_t>(v0.VI[i].UL);
+	_mm_storeu_si128(reinterpret_cast<__m128i*>(h.acc), _mm_loadu_si128(reinterpret_cast<const __m128i*>(v0.ACC.UL)));
+	*h.status = static_cast<uint16_t>(v0.VI[REG_STATUS_FLAG].UL);
+	*h.mac = v0.VI[REG_MAC_FLAG].UL;
+	const u32 clip = v0.VI[REG_CLIP_FLAG].UL;
+	*h.clip = clip;
+	*h.clip2 = clip;
+	const u32 r = v0.VI[REG_R].UL;
+	h.r[0] = h.r[1] = h.r[2] = h.r[3] = r;
+	*h.i = v0.VI[REG_I].UL;
+	*h.q = v0.VI[REG_Q].UL;
+
+	Kzvu0CallOut out;
+	out.tpc = v0.VI[REG_TPC].UL << 3;
+	out.vpuStat = v0.VI[REG_VPU_STAT].UL & 0xFF;
+	return out;
 }
 
 bool kzvu0Running()

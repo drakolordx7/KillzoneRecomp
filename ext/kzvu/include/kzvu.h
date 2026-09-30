@@ -183,6 +183,29 @@ struct Kzvu0Regs
 void kzvu0SetRegs(const Kzvu0Regs& in);
 void kzvu0GetRegs(Kzvu0Regs& out);
 
+// kzvu0Call: the whole VCALLMS in one step, for hosts whose COP2 file is plain memory (the game's R5900Context).
+// Equivalent to kzvu0SetRegs + kzvuSetFBRST + kzvu0Execute + kzvu0GetRegs, but the registers are copied straight
+// between the host's storage and VU0's, with no Kzvu0Regs in between.
+struct Kzvu0Host
+{
+	uint32_t (*vf)[4]; // 32 x 4 raw bits; VF0 is not read, and is written back as (0, 0, 0, 1)
+	uint16_t* vi;      // 16 entries; VI0 is not read, and is written back as 0
+	uint32_t* acc;     // 4 lanes
+	uint16_t* status;
+	uint32_t* mac;
+	uint32_t* clip;
+	uint32_t* clip2;   // written with the same value as clip
+	uint32_t* r;       // 4 lanes: lane 0 is read, all four are written
+	uint32_t* i;
+	uint32_t* q;
+};
+struct Kzvu0CallOut
+{
+	uint32_t tpc;     // TPC in bytes, as kzvu0TPC()
+	uint32_t vpuStat; // as kzvu0VpuStat()
+};
+Kzvu0CallOut kzvu0Call(const Kzvu0Host& host, uint32_t startPcBytes, uint32_t maxCycles, uint32_t fbrst);
+
 // VCALLMS: starts VU0 at `startPcBytes` (byte address, multiple of 8; 0xFFFFFFFF = continue at TPC) and runs it until
 // the E bit (plus its delay slot), a D/T-bit stop (if enabled in FBRST, see kzvuSetFBRST: DE0 bit 2 / TE0 bit 3), or at
 // least `maxCycles` VU cycles. M-bit pauses (where a real VU0 lets an interlocked COP2 transfer through) are run past:
