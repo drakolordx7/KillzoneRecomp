@@ -1,0 +1,509 @@
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index f247ff9..ede4cb5 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -266,6 +266,8 @@ public:
+     static constexpr uint64_t kEeClockHz = 294912000ull;
+     static constexpr uint32_t kGeneratedCheckpointCycles = 32u;
+     static constexpr uint32_t kGuestDispatchCycles = 8u;
++    // The estimated EE cycle clock (timeline recorder, diagnostics). EE thread only.
++    uint64_t eeCycleForTrace() const noexcept { return m_eeCycle; }
+     static constexpr uint64_t kDefaultTimeSliceCycles = 65536ull;
+ 
+     explicit EeScheduler(PS2Runtime &runtime);
+diff --git a/b/ps2xRuntime/include/runtime/ps2_timeline.h b/ps2xRuntime/include/runtime/ps2_timeline.h
+new file mode 100644
+index 0000000..7251c41
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_timeline.h
+@@ -0,0 +1,181 @@
++#pragma once
++// Frame-pipeline timeline recorder (patch 0025). Off unless KZ_TIMELINE=<file.csv> is set.
++//
++//   KZ_TIMELINE=<file.csv>  record events with a QPC-based nanosecond clock, write the CSV when the window ends
++//   KZ_TL_START=<s>         window start, seconds since the runtime started (default 160)
++//   KZ_TL_END=<s>           window end (default 200); the file is written by the first event after it
++//
++// Every event is one 24-byte record in a preallocated array (one relaxed fetch_add, no locks), so the recorder itself
++// costs ~30 ns per event and no allocation. Nothing here is included by generated code.
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++namespace ps2tl
++{
++    enum Lane : uint8_t { LaneEE = 0, LaneWorker = 1, LaneGS = 2, LaneOther = 3 };
++
++    // id, lane, name. Pairs are *_B / *_E (begin / end).
++#define PS2TL_EVENTS(X)                                                                                              \
++    X(VBLANK, LaneEE)            /* a=vsync tick, b=guest vblank rate flag */                                        \
++    X(SLEEP_B, LaneEE)           /* a=0 pacing sleep in processDueDeadlines, 1 idle wait */                          \
++    X(SLEEP_E, LaneEE)                                                                                               \
++    X(BARRIER_B, LaneEE)         /* a=Vif1BarrierReason; only logged when the worker was busy */                     \
++    X(BARRIER_E, LaneEE)                                                                                             \
++    X(APPLY_B, LaneEE)           /* applyCompletions: a=1 scheduler event, 2 barrier, 3 register poll */             \
++    X(APPLY_E, LaneEE)           /* a=completions applied */                                                         \
++    X(DMAC_IRQ, LaneEE)          /* dispatchIrq(dmac): a=cause, b=handlers queued */                                 \
++    X(INV_B, LaneEE)             /* guest invocation (interrupt/callback) starts: a=pc, b=kind */                    \
++    X(INV_E, LaneEE)                                                                                                 \
++    X(D1_KICK, LaneEE)           /* DMA start reached the worker: a=bytes, b=(gif<<1|vif1) */                       \
++    X(CHCR_BUSY, LaneEE)         /* first busy read of D1/D2 CHCR since the last idle read: a=channel */             \
++    X(CHCR_IDLE, LaneEE)         /* first idle read after a busy one: a=channel */                                   \
++    X(G_ENTER, LaneEE)           /* hooked guest function entry: a=address, b=$ra (limiter: vsync counter) */ \
++    X(G_EXIT, LaneEE)            /* returned without unwinding: a=address, b as above */ \
++    X(JOB_B, LaneWorker)         /* a=1 DMA job, 2 call (MSCAL), 3 vsync/GS call; b=bytes */                         \
++    X(JOB_E, LaneWorker)                                                                                             \
++    X(DONE_POST, LaneWorker)     /* completion posted to the EE */                                                   \
++    X(VSYNC_B, LaneWorker)       /* kz runVsync (GS half of the vblank) */                                           \
++    X(VSYNC_E, LaneWorker)                                                                                           \
++    X(GS_THROTTLE_B, LaneWorker) /* kzgsVsync waiting for the GS thread (maxQueuedFrames) */                         \
++    X(GS_THROTTLE_E, LaneWorker)                                                                                     \
++    X(GS_RING_B, LaneWorker)     /* kzgs ring full: producer waits */                                                \
++    X(GS_RING_E, LaneWorker)                                                                                         \
++    X(GS_IDLE_B, LaneGS)         /* unused */ \
++    X(GS_IDLE_E, LaneGS)         /* a = GS thread idle time in us since the previous frame (logged when a frame starts) */ \
++    X(GS_VSYNC_B, LaneGS)        /* GSvsync (render + present of one frame) */                                       \
++    X(GS_VSYNC_E, LaneGS)                                                                                            \
++    X(GS_QUEUED, LaneWorker)     /* frames queued in kzgs after this vsync was pushed */                            \
++    X(IOP_B, LaneOther)                                                                                              \
++    X(IOP_E, LaneOther)
++
++    enum Id : uint16_t
++    {
++#define X(n, l) n,
++        PS2TL_EVENTS(X)
++#undef X
++        Count
++    };
++
++    struct Rec
++    {
++        uint64_t ns;
++        uint32_t a, b, c;
++        uint16_t id;
++        uint16_t pad;
++    };
++
++    struct State
++    {
++        std::atomic<bool> enabled{false};
++        std::atomic<bool> recording{false};
++        std::atomic<bool> written{false};
++        std::atomic<uint64_t> n{0};
++        Rec *buf = nullptr;
++        uint64_t cap = 0;
++        uint64_t epochNs = 0;
++        uint64_t startNs = 0, endNs = 0;
++        char path[512] = {};
++    };
++
++    inline State g_state;
++
++    inline uint64_t rawNs()
++    {
++        return static_cast<uint64_t>(
++            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
++    }
++
++    inline bool on() { return g_state.enabled.load(std::memory_order_relaxed); }
++
++    inline void write();
++
++    // Called when the runtime starts executing: seconds in KZ_TL_START/END count from here (the "t=" of the heartbeat).
++    inline void init()
++    {
++        const char *p = std::getenv("KZ_TIMELINE");
++        if (!p || !*p)
++            return;
++        State &s = g_state;
++        std::snprintf(s.path, sizeof(s.path), "%s", p);
++        const char *a = std::getenv("KZ_TL_START");
++        const char *b = std::getenv("KZ_TL_END");
++        const double t0 = a && *a ? std::atof(a) : 160.0;
++        const double t1 = b && *b ? std::atof(b) : 200.0;
++        s.epochNs = rawNs();
++        s.startNs = s.epochNs + static_cast<uint64_t>(t0 * 1e9);
++        s.endNs = s.epochNs + static_cast<uint64_t>(t1 * 1e9);
++        s.cap = 8ull << 20; // 8 M records = 192 MB virtual, only touched as far as used
++        s.buf = static_cast<Rec *>(std::malloc(s.cap * sizeof(Rec)));
++        if (!s.buf)
++            return;
++        s.enabled.store(true, std::memory_order_release);
++        std::fprintf(stderr, "[timeline] recording t=%.1f..%.1f s to %s\n", t0, t1, s.path);
++    }
++
++    inline void rec(Id id, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0)
++    {
++        State &s = g_state;
++        if (!s.enabled.load(std::memory_order_relaxed))
++            return;
++        const uint64_t t = rawNs();
++        if (t < s.startNs)
++            return;
++        if (t > s.endNs)
++        {
++            write();
++            return;
++        }
++        const uint64_t i = s.n.fetch_add(1, std::memory_order_relaxed);
++        if (i >= s.cap)
++            return;
++        s.buf[i] = Rec{t - s.epochNs, a, b, c, static_cast<uint16_t>(id), 0};
++    }
++
++    inline void write()
++    {
++        State &s = g_state;
++        if (s.written.exchange(true))
++            return;
++        static const char *names[] = {
++#define X(n, l) #n,
++            PS2TL_EVENTS(X)
++#undef X
++        };
++        static const uint8_t lanes[] = {
++#define X(n, l) static_cast<uint8_t>(l),
++            PS2TL_EVENTS(X)
++#undef X
++        };
++        static const char *laneNames[] = {"EE", "WORKER", "GS", "OTHER"};
++        const uint64_t n = std::min<uint64_t>(s.n.load(), s.cap);
++        // Records from different threads are not in time order in the array (index order = fetch_add order, close to it).
++        std::FILE *f = std::fopen(s.path, "w");
++        if (!f)
++            return;
++        std::fprintf(f, "t_us,lane,event,a,b,c\n");
++        for (uint64_t i = 0; i < n; ++i)
++        {
++            const Rec &r = s.buf[i];
++            if (r.id >= Count)
++                continue;
++            std::fprintf(f, "%.3f,%s,%s,%u,%u,%u\n", r.ns / 1000.0, laneNames[lanes[r.id]], names[r.id], r.a, r.b, r.c);
++        }
++        std::fclose(f);
++        s.enabled.store(false, std::memory_order_release);
++        std::fprintf(stderr, "[timeline] wrote %llu events to %s\n", static_cast<unsigned long long>(n), s.path);
++    }
++
++    // Function-scope helper for begin/end pairs.
++    struct Span
++    {
++        Id e;
++        uint32_t a;
++        Span(Id b, Id e_, uint32_t a_ = 0, uint32_t b_ = 0) : e(e_), a(a_) { rec(b, a_, b_); }
++        ~Span() { rec(e, a); }
++    };
++} // namespace ps2tl
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 8283add..72017a4 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,4 +1,5 @@
+ #include "runtime/ps2_host_gs.h"
++#include "runtime/ps2_timeline.h"
+ #include <atomic>
+ #include <cstdlib>
+ #include "runtime/ee_scheduler.h"
+@@ -11,6 +12,7 @@
+ #include "ps2_cg.h" // g_ps2EeBudget: the guest code's checkpoint budget (the dispatch loop charges through it as well)
+ 
+ #include <algorithm>
++#include <string_view>
+ #include <intrin.h>
+ #include <unordered_map>
+ #include <vector>
+@@ -43,6 +45,30 @@ namespace
+         const char *v = std::getenv("PS2X_DISPATCH_BUDGET");
+         return !(v && v[0] == '0');
+     }();
++    // EE cycle clock scale (patch 0025, docs/findings.md "Frame pipeline timeline"). Multiplies the cycles the guest code's
++    // checkpoints charge to the EE cycle clock, the way PCSX2's "EE cycle rate" does. The vblank event needs both its cycle
++    // deadline and its host deadline. The charged estimate runs ~2x faster than wall time on this host, so a frame whose
++    // estimated work is more than one vblank period's cycles (2.46 M at 120 Hz) spans two vblanks although the host executed it
++    // in less than one, and the EE thread sleeps in processDueDeadlines for the rest of the second vblank.
++    //   PS2X_EE_CYCLE_SCALE unset or "auto" (default): 60 Hz / vblank rate, at most 1: the game gets the same estimated
++    //     cycles per vblank as at its native 60 Hz, which is what makes the guest see the same timing per vblank at any rate
++    //     (timers, IOP time, spin-loop iterations per vblank), the same way kz_timing scales the frame timer.
++    //   PS2X_EE_CYCLE_SCALE=1: the previous behaviour. <f>: a fixed factor. 0: the clock follows wall time only.
++    // Q16 fixed point; 65536 = off. Set from ps2SetVblankPeriodMicros() (auto) or the environment, before the EE thread runs.
++    std::atomic<uint32_t> g_eeCycleScaleQ16{65536u};
++    bool g_eeCycleScaleAuto = true;
++    double g_eeCycleScaleFixed = 1.0;
++    const bool g_eeCycleScaleInit = []() {
++        const char *v = std::getenv("PS2X_EE_CYCLE_SCALE");
++        if (v && *v && std::string_view(v) != "auto")
++        {
++            g_eeCycleScaleAuto = false;
++            g_eeCycleScaleFixed = std::atof(v);
++            g_eeCycleScaleQ16.store(g_eeCycleScaleFixed <= 0.0 ? 0u : static_cast<uint32_t>(std::min(g_eeCycleScaleFixed, 16.0) * 65536.0),
++                                    std::memory_order_relaxed);
++        }
++        return true;
++    }();
+     const uint32_t g_stressYield = []() {
+         const char *v = std::getenv("PS2X_STRESS_YIELD");
+         return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u;
+@@ -428,6 +454,7 @@ void EeScheduler::run()
+                 {
+                     SET_GPR_U32(&invocation.context, 29, invocationStackTop());
+                 }
++                ps2tl::rec(ps2tl::INV_B, invocation.context.pc, static_cast<uint32_t>(invocation.kind), static_cast<uint32_t>(m_eeCycle));
+                 owner->invocations.push_back(std::move(invocation));
+             }
+         }
+@@ -474,6 +501,7 @@ void EeScheduler::run()
+             {
+                 GuestInvocation completed = std::move(running->invocations.back());
+                 running->invocations.pop_back();
++                ps2tl::rec(ps2tl::INV_E, completed.context.pc, static_cast<uint32_t>(completed.kind), static_cast<uint32_t>(m_eeCycle));
+                 schedTrace('D', running->id, running->invocations.size(), running->activeContext());
+                 if (completed.onComplete)
+                 {
+@@ -507,6 +535,7 @@ void EeScheduler::run()
+             {
+                 SET_GPR_U32(&invocation.context, 29, invocationStackTop());
+             }
++            ps2tl::rec(ps2tl::INV_B, invocation.context.pc, static_cast<uint32_t>(invocation.kind), static_cast<uint32_t>(m_eeCycle));
+             running->invocations.push_back(std::move(invocation));
+             schedTrace('I', running->id, running->invocations.size(), context);
+             continue;
+@@ -688,6 +717,8 @@ void EeScheduler::postEvent(EeEvent event)
+ 
+ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+ {
++    if (const uint32_t scale = g_eeCycleScaleQ16.load(std::memory_order_relaxed); scale != 65536u) [[unlikely]]
++        cycles = static_cast<uint32_t>((static_cast<uint64_t>(cycles) * scale) >> 16); // accountCycles charges at least 1
+     accountCycles(cycles);
+ #ifdef PS2X_SCHED_STATS_HOT // per-checkpoint counters cost a load and a branch each: compiled in only on request
+     SCHED_STAT(++g_schedStats.checkpoints; g_schedStats.checkpointCycles += cycles);
+@@ -1679,6 +1710,8 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+             matching.push_back(handler);
+         }
+     }
++    if (dmac)
++        ps2tl::rec(ps2tl::DMAC_IRQ, cause, static_cast<uint32_t>(matching.size()), static_cast<uint32_t>(m_eeCycle));
+     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
+               { return left.order < right.order; });
+     for (const EeIrqHandler &handler : matching)
+@@ -2231,9 +2264,11 @@ void EeScheduler::processDueDeadlines()
+             if (now < pacingDeadline)
+             {
+                 const uint64_t statSleep0 = g_schedStats.on ? __rdtsc() : 0u;
++                ps2tl::rec(ps2tl::SLEEP_B, 0u, 0u, static_cast<uint32_t>(m_eeCycle));
+                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
+                                      { return !m_events.empty() ||
+                                               m_stopRequested.load(std::memory_order_acquire); });
++                ps2tl::rec(ps2tl::SLEEP_E, 0u, m_events.empty() ? 0u : 1u, static_cast<uint32_t>(m_eeCycle)); // b=1: woken by a posted event
+                 if (g_schedStats.on)
+                 {
+                     g_schedStats.pacingSleepTsc += __rdtsc() - statSleep0;
+@@ -2307,6 +2342,7 @@ void EeScheduler::processEvent(const EeEvent &event)
+         break;
+     case EeEventType::VBlankStart:
+         ++m_vsyncTick;
++        ps2tl::rec(ps2tl::VBLANK, static_cast<uint32_t>(m_vsyncTick), 0u, static_cast<uint32_t>(m_eeCycle));
+         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
+         if ((m_vsyncTick & 1u) != 0u)
+         {
+@@ -2492,9 +2528,11 @@ void EeScheduler::waitForEvent()
+         }
+     }
+ 
++    ps2tl::rec(ps2tl::SLEEP_B, 1u, 0u, static_cast<uint32_t>(m_eeCycle));
+     const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
+                                                { return !m_events.empty() ||
+                                                         m_stopRequested.load(std::memory_order_acquire); });
++    ps2tl::rec(ps2tl::SLEEP_E, 1u, signaled ? 1u : 0u, static_cast<uint32_t>(m_eeCycle));
+     if (!signaled)
+     {
+         const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;
+@@ -2604,6 +2642,16 @@ void EeScheduler::publishIdleDebugContext()
+ void ps2SetVblankPeriodMicros(uint32_t micros)
+ {
+     g_vblankPeriodMicros.store(micros < 1000u ? 1000u : micros, std::memory_order_relaxed);
++    (void)g_eeCycleScaleInit;
++    if (g_eeCycleScaleAuto)
++    {
++        const double s = std::clamp(static_cast<double>(micros < 1000u ? 1000u : micros) / 16667.0, 0.125, 1.0);
++        g_eeCycleScaleQ16.store(static_cast<uint32_t>(s * 65536.0), std::memory_order_relaxed);
++    }
++    const uint32_t q = g_eeCycleScaleQ16.load(std::memory_order_relaxed);
++    if (q != 65536u)
++        std::fprintf(stderr, "[sched] EE cycle clock scale %.3f (%s)\n", q / 65536.0,
++                     g_eeCycleScaleAuto ? "auto: 60 Hz / vblank rate; PS2X_EE_CYCLE_SCALE=1 restores the old clock" : "PS2X_EE_CYCLE_SCALE");
+ }
+ 
+ uint32_t ps2VblankPeriodMicros()
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 9cd9ec6..31917e6 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,3 +1,4 @@
++#include "runtime/ps2_timeline.h"
+ #include "ps2_runtime.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+@@ -2865,6 +2866,7 @@ void PS2Runtime::run()
+     }
+ 
+     std::atomic<bool> gameThreadFinished{false};
++    ps2tl::init(); // KZ_TIMELINE: the recorder's clock starts with the run (its window is in heartbeat seconds)
+ 
+     std::thread gameThread([&]()
+                            {
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_worker.cpp b/ps2xRuntime/src/lib/ps2_vif1_worker.cpp
+index a61d6d1..29fb825 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_worker.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_worker.cpp
+@@ -1,4 +1,5 @@
+ #include "ps2_vif1_worker.h"
++#include "runtime/ps2_timeline.h"
+ #include <cstring>
+ #include <unordered_map>
+ 
+@@ -37,6 +38,8 @@ namespace
+         std::vector<std::vector<uint8_t>> vif1; // buffers for processVIF1Data, in order
+         bool hadGif = false;
+         bool hadVif1 = false;
++        uint8_t kind = 1;     // timeline: 1 DMA job, 2 call (MSCAL/MSCNT from the EE), 3 GS half of a vblank
++        uint32_t bytes = 0;   // timeline
+         std::function<void()> call; // if set: run this on the worker instead (MSCAL from the EE thread)
+     };
+ 
+@@ -194,6 +197,7 @@ namespace
+                     _mm_pause();
+             }
+             const uint64_t t0 = g.stats.enabled ? nowNs() : 0u;
++            ps2tl::rec(ps2tl::JOB_B, job.kind, job.bytes);
+             try
+             {
+                 runJob(job);
+@@ -216,6 +220,7 @@ namespace
+                     printStats((t1 - statsStart) / 1'000'000ull);
+                 }
+             }
++            ps2tl::rec(ps2tl::JOB_E, job.kind, job.bytes);
+             for (auto &buf : job.gif)
+                 ps2ChainBufferRecycle(std::move(buf));
+             for (auto &buf : job.vif1)
+@@ -237,7 +242,10 @@ namespace
+             }
+             g.idleCv.notify_all();
+             if (completes && g.runtime)
++            {
++                ps2tl::rec(ps2tl::DONE_POST, job.hadVif1 ? 1u : 0u, job.hadGif ? 1u : 0u);
+                 g.runtime->postEeEvent(EeEvent{EeEventType::Dmac, kVif1WorkerEventId, 0u});
++            }
+         }
+     }
+ 
+@@ -264,7 +272,7 @@ namespace
+     }
+ 
+     // EE thread. Applies finished jobs: what the synchronous processPendingTransfers() did after the data was consumed.
+-    void applyCompletions()
++    void applyCompletions(uint32_t source)
+     {
+         std::vector<Completion> local;
+         {
+@@ -273,6 +281,7 @@ namespace
+         }
+         if (local.empty())
+             return;
++        ps2tl::Span tlSpan(ps2tl::APPLY_B, ps2tl::APPLY_E, static_cast<uint32_t>(local.size()), source);
+         PS2Memory &m = *g.memory;
+         for (const Completion &c : local)
+         {
+@@ -443,11 +452,14 @@ bool ps2Vif1DispatchAsync(PS2Memory &m)
+     }
+     m.m_pendingGifTransfers.clear();
+     m.m_pendingVif1Transfers.clear();
++    job.bytes = static_cast<uint32_t>(bytes);
+ 
+     if (job.hadGif)
+         ++g.outstanding[2];
+     if (job.hadVif1)
+         ++g.outstanding[1];
++    ps2tl::rec(ps2tl::D1_KICK, static_cast<uint32_t>(bytes), (job.hadGif ? 2u : 0u) | (job.hadVif1 ? 1u : 0u),
++               ps2tl::on() && g.runtime ? static_cast<uint32_t>(g.runtime->eeScheduler().eeCycleForTrace()) : 0u);
+     enqueue(std::move(job));
+ 
+     if (g.stats.enabled)
+@@ -470,6 +482,7 @@ void ps2Vif1Barrier(Vif1BarrierReason reason)
+     if (g.finished.load(std::memory_order_acquire) != target)
+     {
+         const uint64_t t0 = g.stats.enabled ? nowNs() : 0u;
++        ps2tl::rec(ps2tl::BARRIER_B, static_cast<uint32_t>(reason));
+         for (int spin = 0; spin < 2000 && g.finished.load(std::memory_order_acquire) != target; ++spin)
+             _mm_pause();
+         if (g.finished.load(std::memory_order_acquire) != target)
+@@ -477,13 +490,14 @@ void ps2Vif1Barrier(Vif1BarrierReason reason)
+             std::unique_lock<std::mutex> lock(g.mutex);
+             g.idleCv.wait(lock, [target] { return g.finished.load(std::memory_order_acquire) == target; });
+         }
++        ps2tl::rec(ps2tl::BARRIER_E, static_cast<uint32_t>(reason));
+         if (g.stats.enabled)
+         {
+             g.stats.barrierWaits[ri].fetch_add(1, std::memory_order_relaxed);
+             g.stats.barrierNs[ri].fetch_add(nowNs() - t0, std::memory_order_relaxed);
+         }
+     }
+-    applyCompletions();
++    applyCompletions(2u);
+ }
+ 
+ void ps2Vif1PollCompletions()
+@@ -492,7 +506,7 @@ void ps2Vif1PollCompletions()
+         return;
+     if (g.doneCount.load(std::memory_order_acquire) == g.applied)
+         return;
+-    applyCompletions();
++    applyCompletions(3u);
+ }
+ 
+ bool ps2Vif1ChannelBusy(uint32_t channelBase)
+@@ -503,6 +517,15 @@ bool ps2Vif1ChannelBusy(uint32_t channelBase)
+     if (idx == 0)
+         return false;
+     const bool busy = g.outstanding[idx] > 0;
++    if (ps2tl::on())
++    {
++        static bool lastBusy[3] = {false, false, false}; // EE thread only
++        if (busy != lastBusy[idx])
++        {
++            lastBusy[idx] = busy;
++            ps2tl::rec(busy ? ps2tl::CHCR_BUSY : ps2tl::CHCR_IDLE, static_cast<uint32_t>(idx));
++        }
++    }
+     if (busy && g.stats.enabled)
+         g.stats.busyReads.fetch_add(1, std::memory_order_relaxed);
+     return busy;
+@@ -512,7 +535,7 @@ void ps2Vif1ApplyEvent(PS2Runtime &runtime)
+ {
+     if (!g.active.load(std::memory_order_relaxed) || !g.memory)
+         return;
+-    applyCompletions();
++    applyCompletions(1u);
+     runtime.drainCompletedDmacHandlers(g.memory->getRDRAM());
+ }
+ 
+@@ -533,6 +556,7 @@ namespace
+             return true;
+         }
+         Job job;
++        job.kind = 2;
+         job.call = std::move(fn);
+         enqueue(std::move(job));
+         ps2Vif1Barrier(Vif1BarrierReason::Other);
+@@ -770,6 +794,7 @@ void ps2RunAfterQueuedGif(void (*fn)(void *), void *arg)
+         return;
+     }
+     Job job;
++    job.kind = 3;
+     job.call = [fn, arg] { fn(arg); };
+     enqueue(std::move(job)); // no completion: the EE does not wait
+ }
