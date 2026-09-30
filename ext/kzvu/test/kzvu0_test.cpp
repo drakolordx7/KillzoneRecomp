@@ -35,6 +35,10 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <intrin.h>
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 namespace fs = std::filesystem;
 
@@ -268,6 +272,121 @@ static Result RunKzvu0(const Input& in, bool jit, uint32_t budget = 1u << 20)
 	}
 	r.vpuStat = kzvu0VpuStat();
 	return r;
+}
+
+// ---- kzvu0Call (the game's direct path): a stand-in for the R5900Context COP2 members ---------------------------------------
+struct HostRegs
+{
+	alignas(16) uint32_t vf[32][4];
+	uint16_t vi[16];
+	alignas(16) uint32_t acc[4];
+	uint16_t status;
+	uint32_t mac, clip, clip2;
+	alignas(16) uint32_t r[4];
+	uint32_t i, q;
+};
+
+static void ToHost(const Kzvu0Regs& in, HostRegs& h)
+{
+	std::memset(&h, 0xA5, sizeof(h)); // poison: whatever kzvu0Call does not define stays visible
+	std::memcpy(h.vf, in.vf, sizeof(h.vf));
+	for (int k = 0; k < 16; k++)
+		h.vi[k] = static_cast<uint16_t>(in.vi[k]);
+	std::memcpy(h.acc, in.acc, sizeof(h.acc));
+	h.status = static_cast<uint16_t>(in.status);
+	h.mac = in.mac;
+	h.clip = in.clip;
+	h.clip2 = in.clip;
+	h.r[0] = in.r;
+	h.r[1] = h.r[2] = h.r[3] = 0x11111111u;
+	h.i = in.i;
+	h.q = in.q;
+}
+
+static Kzvu0Host BindHost(HostRegs& h)
+{
+	Kzvu0Host b;
+	b.vf = h.vf;
+	b.vi = h.vi;
+	b.acc = h.acc;
+	b.status = &h.status;
+	b.mac = &h.mac;
+	b.clip = &h.clip;
+	b.clip2 = &h.clip2;
+	b.r = h.r;
+	b.i = &h.i;
+	b.q = &h.q;
+	return b;
+}
+
+// Same setup as RunKzvu0, but the run goes through kzvu0Call (registers straight from/to `h`).
+static Result RunKzvu0Direct(const Input& in, HostRegs& h, Kzvu0CallOut* callOut = nullptr)
+{
+	KzvuConfig cfg = kzvuGetConfig();
+	cfg.vu0UseJit = true;
+	kzvuSetConfig(cfg);
+	std::memcpy(kzvu0CodeMem(), in.code, kKzvu0CodeSize);
+	kzvu0MicroWritten(0, kKzvu0CodeSize);
+	std::memcpy(kzvu0DataMem(), in.data, kKzvu0DataSize);
+	for (int i = 1; i < 32; i++)
+	{
+		kzvuSetVF(i, in.vu1Vf[i]);
+		kzvuSetVI(i, in.vu1Vi[i]);
+	}
+	ToHost(in.regs, h);
+	const Kzvu0CallOut co = kzvu0Call(BindHost(h), in.startPc, 1u << 20, in.fbrst);
+	if (callOut)
+		*callOut = co;
+	Result r;
+	r.ended = !kzvu0Running();
+	if (!r.ended)
+		kzvu0Execute(0xFFFFFFFFu, 1u << 24);
+	std::memcpy(r.data, kzvu0DataMem(), kKzvu0DataSize);
+	for (int i = 0; i < 32; i++)
+	{
+		kzvuGetVF(i, r.vu1Vf[i]);
+		r.vu1Vi[i] = kzvuGetVI(i);
+	}
+	r.vpuStat = co.vpuStat;
+	return r;
+}
+
+// kzvu0Call must leave exactly what SetRegs + Execute + GetRegs leave. Returns the number of mismatches.
+static int CompareDirect(const Result& old, const HostRegs& h, const Kzvu0CallOut& co, const Result& direct, std::string& why)
+{
+	int bad = 0;
+	auto note = [&](const char* what) {
+		if (bad++ < 4)
+			why += std::string(" ") + what;
+	};
+	for (int k = 0; k < 32; k++)
+		if (std::memcmp(old.regs.vf[k], h.vf[k], 16) != 0)
+			note((std::string("vf") + std::to_string(k)).c_str());
+	for (int k = 0; k < 16; k++)
+		if ((old.regs.vi[k] & 0xFFFFu) != h.vi[k])
+			note((std::string("vi") + std::to_string(k)).c_str());
+	if (std::memcmp(old.regs.acc, h.acc, 16) != 0)
+		note("acc");
+	if (static_cast<uint16_t>(old.regs.status) != h.status)
+		note("status");
+	if (old.regs.mac != h.mac)
+		note("mac");
+	if (old.regs.clip != h.clip || old.regs.clip != h.clip2)
+		note("clip");
+	for (int k = 0; k < 4; k++)
+		if (old.regs.r != h.r[k])
+			note("r");
+	if (old.regs.i != h.i)
+		note("i");
+	if (old.regs.q != h.q)
+		note("q");
+	if (std::memcmp(old.data, direct.data, kKzvu0DataSize) != 0)
+		note("data-mem");
+	if (std::memcmp(old.vu1Vf, direct.vu1Vf, sizeof(old.vu1Vf)) != 0 || std::memcmp(old.vu1Vi, direct.vu1Vi, sizeof(old.vu1Vi)) != 0)
+		note("vu1-regs");
+	if (co.vpuStat != old.vpuStat)
+		note("vpu-stat");
+	return bad;
 }
 
 #ifdef KZVU_TEST_HAVE_PS2RECOMP
@@ -690,6 +809,51 @@ static void ReplayCaptures(const std::vector<fs::path>& dirs, CaptureStats& cs)
 		}
 		Check(jit->ended, path.filename().string() + ": JIT run reached the E bit");
 
+		// kzvu0Call (the game's direct path) vs SetRegs/Execute/GetRegs: the captured input, then randomized variants.
+		{
+			auto host = std::make_unique<HostRegs>();
+			Kzvu0CallOut co{};
+			auto direct = std::make_unique<Result>(RunKzvu0Direct(*in, *host, &co));
+			std::string why;
+			const int bad = CompareDirect(*jit, *host, co, *direct, why);
+			Check(bad == 0 && co.tpc == kzvu0TPC(), path.filename().string() + ": kzvu0Call == SetRegs/Execute/GetRegs" + why);
+			uint64_t rng = 0x9E3779B97F4A7C15ull ^ cap->callIndex;
+			auto next = [&rng]() {
+				rng ^= rng << 13;
+				rng ^= rng >> 7;
+				rng ^= rng << 17;
+				return static_cast<uint32_t>(rng >> 16);
+			};
+			int fuzzBad = 0;
+			for (int v = 0; v < 16 && fuzzBad == 0; v++)
+			{
+				auto variant = std::make_unique<Input>(*in);
+				for (int k = 1; k < 32; k++)
+					for (int l = 0; l < 4; l++)
+						if (next() & 3u) // mostly random bits (NaN/Inf/denormals included), some lanes stay as captured
+							variant->regs.vf[k][l] = next();
+				for (int k = 1; k < 16; k++)
+					variant->regs.vi[k] = next() & 0xFFFFu;
+				for (int l = 0; l < 4; l++)
+					variant->regs.acc[l] = next();
+				variant->regs.status = next() & 0xFFFFu;
+				variant->regs.mac = next() & 0xFFFFu;
+				variant->regs.clip = next() & 0xFFFFFFu;
+				variant->regs.r = 0x3F800000u | (next() & 0x7FFFFFu);
+				variant->regs.i = next();
+				variant->regs.q = next();
+				variant->fbrst = next() & 0x0C0Cu;
+				auto a = std::make_unique<Result>(RunKzvu0(*variant, true));
+				Kzvu0CallOut co2{};
+				auto b = std::make_unique<Result>(RunKzvu0Direct(*variant, *host, &co2));
+				std::string why2;
+				fuzzBad = CompareDirect(*a, *host, co2, *b, why2);
+				if (fuzzBad)
+					Check(false, path.filename().string() + ": kzvu0Call fuzz variant " + std::to_string(v) + " differs:" + why2);
+			}
+			Check(fuzzBad == 0, path.filename().string() + ": kzvu0Call == old path on 16 randomized inputs");
+		}
+
 		const DiffSummary dInterp = Compare(*jit, *interp);
 		if (TotalDiffs(dInterp))
 			cs.interpDiffer++;
@@ -731,14 +895,140 @@ static void ReplayCaptures(const std::vector<fs::path>& dirs, CaptureStats& cs)
 	}
 }
 
+
+// ---- --bench: host-side cost of one VU0 call (what src/kz_vu.cpp onVu0Call pays) --------------------------------------------
+// Replays captured calls in a loop and times the register copy-in, the run and the copy-out with rdtsc (old path:
+// kzvu0SetRegs / kzvu0Execute / kzvu0GetRegs through a Kzvu0Regs staging copy).
+static double TscPerNs()
+{
+	LARGE_INTEGER f, a, b;
+	QueryPerformanceFrequency(&f);
+	QueryPerformanceCounter(&a);
+	const uint64_t t0 = __rdtsc();
+	do
+		QueryPerformanceCounter(&b);
+	while ((b.QuadPart - a.QuadPart) * 1000 < f.QuadPart * 100); // 100 ms
+	const uint64_t t1 = __rdtsc();
+	return double(t1 - t0) / (double(b.QuadPart - a.QuadPart) * 1e9 / double(f.QuadPart));
+}
+
+// contextToVu0 / vu0ToContext of src/kz_vu.cpp, on the HostRegs stand-in.
+static void StageIn(const HostRegs& h, Kzvu0Regs& r)
+{
+	std::memcpy(r.vf, h.vf, sizeof(r.vf));
+	for (int i = 0; i < 16; ++i)
+		r.vi[i] = h.vi[i];
+	std::memcpy(r.acc, h.acc, sizeof(r.acc));
+	r.status = h.status;
+	r.mac = h.mac;
+	r.clip = h.clip;
+	r.r = h.r[0];
+	r.i = h.i;
+	r.q = h.q;
+}
+
+static void StageOut(const Kzvu0Regs& r, HostRegs& h)
+{
+	std::memcpy(&h.vf[1], r.vf[1], 31 * 16);
+	h.vf[0][0] = h.vf[0][1] = h.vf[0][2] = 0;
+	h.vf[0][3] = 0x3F800000u;
+	h.vi[0] = 0;
+	for (int i = 1; i < 16; ++i)
+		h.vi[i] = static_cast<uint16_t>(r.vi[i]);
+	std::memcpy(h.acc, r.acc, sizeof(h.acc));
+	h.status = static_cast<uint16_t>(r.status);
+	h.mac = r.mac;
+	h.clip = h.clip2 = r.clip;
+	h.r[0] = h.r[1] = h.r[2] = h.r[3] = r.r;
+	h.i = r.i;
+	h.q = r.q;
+}
+
+static void Bench(const std::vector<fs::path>& dirs, int iters)
+{
+	std::vector<fs::path> files;
+	for (const auto& dir : dirs)
+	{
+		std::error_code ec;
+		for (const auto& e : fs::directory_iterator(dir, ec))
+			if (e.is_regular_file() && e.path().extension() == ".bin")
+				files.push_back(e.path());
+	}
+	std::sort(files.begin(), files.end());
+	const double tsc = TscPerNs();
+	std::printf("\n[bench: %d iterations per capture, TSC %.3f GHz]\n", iters, tsc);
+	std::printf("  %-34s %-6s %8s %8s %8s %8s   %s\n", "file", "start", "in ns", "run ns", "out ns", "old total", "kzvu0Call ns");
+	std::map<uint32_t, int> seen;
+	auto cap = std::make_unique<Kzvu0Capture>();
+	for (const auto& path : files)
+	{
+		FILE* f = std::fopen(path.string().c_str(), "rb");
+		if (!f)
+			continue;
+		const size_t n = std::fread(cap.get(), sizeof(Kzvu0Capture), 1, f);
+		std::fclose(f);
+		if (n != 1 || cap->magic != Kzvu0Capture::kMagic || cap->version != Kzvu0Capture::kVersion)
+			continue;
+		if (seen[cap->startPc]++ >= 1)
+			continue; // one capture per start PC
+		std::memcpy(kzvu0CodeMem(), cap->code, kKzvu0CodeSize);
+		kzvu0MicroWritten(0, kKzvu0CodeSize);
+		std::memcpy(kzvu0DataMem(), cap->dataIn, kKzvu0DataSize);
+		for (int i = 1; i < 32; i++)
+		{
+			kzvuSetVF(i, cap->vu1VfIn[i]);
+			kzvuSetVI(i, cap->vu1ViIn[i]);
+		}
+		Kzvu0Regs regs;
+		HostRegs host;
+		ToHost(cap->in, host);
+		uint64_t tIn = 0, tRun = 0, tOut = 0, tNew = 0;
+		for (int it = 0; it < iters + 100; it++)
+		{
+			const bool timed = it >= 100;
+			// Old path as src/kz_vu.cpp ran it: context -> Kzvu0Regs, SetRegs, Execute, GetRegs, Kzvu0Regs -> context.
+			const uint64_t a0 = __rdtsc();
+			StageIn(host, regs);
+			const uint64_t a = __rdtsc();
+			kzvu0SetRegs(regs);
+			kzvuSetFBRST(cap->fbrst);
+			const uint64_t b = __rdtsc();
+			kzvu0Execute(cap->startPc, 1u << 20);
+			const uint64_t c = __rdtsc();
+			kzvu0GetRegs(regs);
+			const uint64_t d = __rdtsc();
+			StageOut(regs, host);
+			const uint64_t d1 = __rdtsc();
+			ToHost(cap->in, host);
+			const uint64_t e = __rdtsc();
+			kzvu0Call(BindHost(host), cap->startPc, 1u << 20, cap->fbrst);
+			const uint64_t g = __rdtsc();
+			if (timed)
+			{
+				tIn += b - a0;
+				tRun += c - b;
+				tOut += d1 - c;
+				tNew += g - e;
+			}
+		}
+		const double k = 1.0 / (tsc * iters);
+		const double oldTotal = (tIn + tRun + tOut) * k;
+		std::printf("  %-34s 0x%03x  %8.1f %8.1f %8.1f %8.1f   %8.1f  (%.0f%%)\n", path.filename().string().c_str(), cap->startPc,
+			tIn * k, tRun * k, tOut * k, oldTotal, tNew * k, 100.0 * tNew * k / oldTotal);
+	}
+}
+
 int main(int argc, char** argv)
 {
 	std::vector<fs::path> dirs;
 	int vu0Clamp = 3; // what src/kz_vu.cpp uses in the game
+	int benchIters = 0;
 	for (int i = 1; i < argc; i++)
 	{
 		if (!std::strcmp(argv[i], "--clamp") && i + 1 < argc)
 			vu0Clamp = std::atoi(argv[++i]);
+		else if (!std::strcmp(argv[i], "--bench"))
+			benchIters = 200000;
 		else
 			dirs.emplace_back(argv[i]);
 	}
@@ -755,6 +1045,12 @@ int main(int argc, char** argv)
 		return 1;
 	}
 
+	if (benchIters)
+	{
+		Bench(dirs, benchIters);
+		kzvuShutdown();
+		return 0;
+	}
 	Synthetic();
 	CaptureStats cs;
 	ReplayCaptures(dirs, cs);

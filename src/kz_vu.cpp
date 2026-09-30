@@ -223,6 +223,16 @@ namespace
     };
     std::unique_ptr<Vu0Debug> g_vu0Debug;
     uint32_t g_vu0CallIndex = 0;
+    // KZ_VU0_VERIFY=<n>: see verifyVu0Call.
+    const uint32_t g_vu0VerifyEvery = []() {
+        const char *v = std::getenv("KZ_VU0_VERIFY");
+        return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u;
+    }();
+    // KZ_VU0_DIRECT=0 restores the staged path (Kzvu0Regs copies in and out), for A/B measurements.
+    const bool g_vu0Direct = []() {
+        const char *v = std::getenv("KZ_VU0_DIRECT");
+        return !(v && *v == '0');
+    }();
 
     void setupVu0Debug()
     {
@@ -380,6 +390,94 @@ namespace
         }
     }
 
+    // The VU0 call itself, straight between the context's COP2 registers and VU0 (kzvu0Call), then the result registers
+    // the runtime keeps in the context.
+    void runVu0Direct(R5900Context *ctx, uint32_t startPc)
+    {
+        Kzvu0Host host;
+        host.vf = reinterpret_cast<uint32_t(*)[4]>(ctx->vu0_vf);
+        host.vi = ctx->vi;
+        host.acc = reinterpret_cast<uint32_t *>(&ctx->vu0_acc);
+        host.status = &ctx->vu0_status;
+        host.mac = &ctx->vu0_mac_flags;
+        host.clip = &ctx->vu0_clip_flags;
+        host.clip2 = &ctx->vu0_clip_flags2;
+        host.r = reinterpret_cast<uint32_t *>(&ctx->vu0_r);
+        host.i = reinterpret_cast<uint32_t *>(&ctx->vu0_i);
+        host.q = reinterpret_cast<uint32_t *>(&ctx->vu0_q);
+        const Kzvu0CallOut out = kzvu0Call(host, startPc, kVu0Budget, ctx->vu0_fbrst);
+        ctx->vu0_tpc = out.tpc;
+        ctx->vu0_pc = out.tpc;
+        ctx->vu0_vpu_stat = (ctx->vu0_vpu_stat & ~0xFFu) | out.vpuStat;
+    }
+
+    // The original path: context -> Kzvu0Regs -> VU0 and back (KZ_VU0_DIRECT=0).
+    void runVu0Staged(R5900Context *ctx, uint32_t startPc)
+    {
+        Kzvu0Regs regs;
+        contextToVu0(ctx, regs);
+        kzvu0SetRegs(regs);
+        kzvuSetFBRST(ctx->vu0_fbrst);
+        kzvu0Execute(startPc, kVu0Budget);
+        kzvu0GetRegs(regs);
+        vu0ToContext(regs, ctx);
+        const uint32_t tpc = kzvu0TPC();
+        ctx->vu0_tpc = tpc;
+        ctx->vu0_pc = tpc;
+        ctx->vu0_vpu_stat = (ctx->vu0_vpu_stat & ~0xFFu) | (kzvu0VpuStat() & 0xFFu);
+    }
+
+    // KZ_VU0_VERIFY=<n>: every n-th call runs both paths from the same state (VU0 data memory restored in between) and
+    // compares every register the runtime keeps, VU0 data memory and VPU_STAT/TPC. Prints a summary every 10 s.
+    uint64_t g_vuVerifyChecked = 0, g_vuVerifyBad = 0;
+    std::chrono::steady_clock::time_point g_vuVerifyLast = std::chrono::steady_clock::now();
+    void verifyVu0Call(R5900Context *ctx, uint32_t startPc)
+    {
+        static uint8_t snap[kKzvu0DataSize], dataDirect[kKzvu0DataSize];
+        std::memcpy(snap, kzvu0DataMem(), kKzvu0DataSize);
+        auto direct = std::make_unique<R5900Context>(*ctx);
+        auto staged = std::make_unique<R5900Context>(*ctx);
+        runVu0Direct(direct.get(), startPc);
+        std::memcpy(dataDirect, kzvu0DataMem(), kKzvu0DataSize);
+        std::memcpy(kzvu0DataMem(), snap, kKzvu0DataSize);
+        runVu0Staged(staged.get(), startPc);
+        bool same = std::memcmp(dataDirect, kzvu0DataMem(), kKzvu0DataSize) == 0;
+        same = same && std::memcmp(direct->vu0_vf, staged->vu0_vf, sizeof(direct->vu0_vf)) == 0;
+        same = same && std::memcmp(direct->vi, staged->vi, sizeof(direct->vi)) == 0;
+        same = same && std::memcmp(&direct->vu0_acc, &staged->vu0_acc, sizeof(direct->vu0_acc)) == 0;
+        same = same && std::memcmp(&direct->vu0_r, &staged->vu0_r, sizeof(direct->vu0_r)) == 0;
+        same = same && std::memcmp(&direct->vu0_i, &staged->vu0_i, 4) == 0 && std::memcmp(&direct->vu0_q, &staged->vu0_q, 4) == 0;
+        same = same && direct->vu0_status == staged->vu0_status && direct->vu0_mac_flags == staged->vu0_mac_flags &&
+               direct->vu0_clip_flags == staged->vu0_clip_flags && direct->vu0_clip_flags2 == staged->vu0_clip_flags2 &&
+               direct->vu0_tpc == staged->vu0_tpc && direct->vu0_pc == staged->vu0_pc &&
+               direct->vu0_vpu_stat == staged->vu0_vpu_stat;
+        ++g_vuVerifyChecked;
+        if (!same && g_vuVerifyBad++ < 5)
+            std::fprintf(stderr, "[kz] VU0 verify MISMATCH at call #%u start 0x%03x caller 0x%06x\n", g_vu0CallIndex, startPc, ctx->pc);
+        // Leave the state the direct path produced.
+        std::memcpy(kzvu0DataMem(), dataDirect, kKzvu0DataSize);
+        std::memcpy(ctx->vu0_vf, direct->vu0_vf, sizeof(ctx->vu0_vf));
+        std::memcpy(ctx->vi, direct->vi, sizeof(ctx->vi));
+        ctx->vu0_acc = direct->vu0_acc;
+        ctx->vu0_r = direct->vu0_r;
+        ctx->vu0_i = direct->vu0_i;
+        ctx->vu0_q = direct->vu0_q;
+        ctx->vu0_status = direct->vu0_status;
+        ctx->vu0_mac_flags = direct->vu0_mac_flags;
+        ctx->vu0_clip_flags = direct->vu0_clip_flags;
+        ctx->vu0_clip_flags2 = direct->vu0_clip_flags2;
+        ctx->vu0_tpc = direct->vu0_tpc;
+        ctx->vu0_pc = direct->vu0_pc;
+        ctx->vu0_vpu_stat = direct->vu0_vpu_stat;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - g_vuVerifyLast >= std::chrono::seconds(10))
+        {
+            std::fprintf(stderr, "[kz] VU0 verify: %llu calls checked, %llu mismatches\n", static_cast<unsigned long long>(g_vuVerifyChecked),
+                         static_cast<unsigned long long>(g_vuVerifyBad));
+            g_vuVerifyLast = now;
+        }
+    }
+
     void onVu0Call(R5900Context *ctx, uint32_t startPc, uint64_t codeGeneration)
     {
         if (codeGeneration != g_vu0CodeGeneration)
@@ -388,22 +486,22 @@ namespace
             g_vu0CodeGeneration = codeGeneration;
         }
         if (g_vu0Debug)
-            onVu0CallDebug(ctx, startPc);
-        else
         {
-            Kzvu0Regs regs;
-            contextToVu0(ctx, regs);
-            kzvu0SetRegs(regs);
-            kzvuSetFBRST(ctx->vu0_fbrst);
-            kzvu0Execute(startPc, kVu0Budget);
-            kzvu0GetRegs(regs);
-            vu0ToContext(regs, ctx);
+            onVu0CallDebug(ctx, startPc);
+            ++g_vu0CallIndex;
+            const uint32_t tpc = kzvu0TPC();
+            ctx->vu0_tpc = tpc;
+            ctx->vu0_pc = tpc;
+            ctx->vu0_vpu_stat = (ctx->vu0_vpu_stat & ~0xFFu) | (kzvu0VpuStat() & 0xFFu);
+            return;
         }
+        if (g_vu0VerifyEvery != 0u && g_vu0CallIndex % g_vu0VerifyEvery == 0u)
+            verifyVu0Call(ctx, startPc);
+        else if (g_vu0Direct)
+            runVu0Direct(ctx, startPc);
+        else
+            runVu0Staged(ctx, startPc);
         ++g_vu0CallIndex;
-        const uint32_t tpc = kzvu0TPC();
-        ctx->vu0_tpc = tpc;
-        ctx->vu0_pc = tpc;
-        ctx->vu0_vpu_stat = (ctx->vu0_vpu_stat & ~0xFFu) | (kzvu0VpuStat() & 0xFFu);
     }
 }
 

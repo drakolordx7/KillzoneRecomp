@@ -1,0 +1,766 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -7,8 +7,12 @@
+ #include "../ps2_iop_post.h"
+ #include "../ps2_vif1_worker.h"
+ #include "ps2_runtime_macros.h"
++#include "ps2_cg.h" // g_ps2EeBudget: the guest code's checkpoint budget (the dispatch loop charges through it as well)
+ 
+ #include <algorithm>
++#include <intrin.h>
++#include <unordered_map>
++#include <vector>
+ #include <cassert>
+ #include <cstring>
+ #include <limits>
+@@ -22,6 +26,109 @@
+     // Number of events in m_events, readable without the lock: processPendingEvents runs on nearly every scheduler
+     // iteration and used to lock twice, allocate a deque and read the host clock even with nothing to do.
+     std::atomic<uint32_t> g_queuedEvents{0};
++}
++
++namespace
++{
++    // Read once at startup. Function-local statics with dynamic initialisers cost a thread-safe-init check (a TLS load)
++    // on every call under MSVC, and these functions run at every checkpoint.
++    const bool g_wallClockPacing = []() {
++        const char *v = std::getenv("PS2X_WALLCLOCK");
++        return !(v && v[0] == '0');
++    }();
++    // PS2X_DISPATCH_BUDGET=0: charge every scheduler dispatch with a checkpoint of its own (the old behaviour) instead of
++    // through the guest budget.
++    const bool g_dispatchViaBudget = []() {
++        const char *v = std::getenv("PS2X_DISPATCH_BUDGET");
++        return !(v && v[0] == '0');
++    }();
++    const uint32_t g_stressYield = []() {
++        const char *v = std::getenv("PS2X_STRESS_YIELD");
++        return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u;
++    }();
++}
++
++#define SCHED_STAT(expr) do { if (g_schedStats.on) { expr; } } while (0)
++
++namespace
++{
++    // PS2X_SCHED_STATS=1: every 10 s a few lines with the scheduler's per-second rates (yields by reason, dispatches, events),
++    // the rdtsc split of run() time between guest functions and the scheduler around them, and host time slept in vblank
++    // pacing. =2 adds per-pc histograms of what the scheduler dispatched (skews the time split: a hash map update per
++    // dispatch). Compile with -DPS2X_SCHED_STATS_HOT for the per-checkpoint counters too (checkpoint count, estimated vs
++    // wall-clock-floor cycles, cost of the timer and IOP parts of accountCycles). All counters are EE-thread only.
++    struct SchedStats
++    {
++        bool on = false;
++        bool hist = false; // PS2X_SCHED_STATS=2: also per-pc histograms (a hash map update per dispatch: skews the time split)
++        uint64_t checkpoints = 0, checkpointCycles = 0;
++        uint64_t yieldPending = 0, yieldDeadline = 0, yieldSlice = 0, yieldStress = 0;
++        std::unordered_map<uint32_t, uint64_t> pcHist, exitHist;
++        // rdtsc time split: inside guest functions vs the scheduler loop around them, for dispatches in the guest's
++        // vsync/flag wait loop (FUN_0014fd90 and its entry fragments, 0x14fd90..0x15008c) and everywhere else.
++        // Guest clock: cycles charged by the checkpoint estimate vs cycles added by the wall-clock floor, and host time
++        // slept waiting for a vblank's host deadline (processDueDeadlines) although its guest cycle had been reached.
++        uint64_t estCycles = 0, clampCycles = 0, pacingSleepTsc = 0, pacingSleeps = 0;
++        uint64_t acctCalls = 0, acctTsc = 0, timersTsc = 0, iopTsc = 0; // PS2X_SCHED_STATS_HOT: accountCycles and its two callees
++        uint64_t tscInGuestSpin = 0, tscInGuestOther = 0, tscLoopSpin = 0, tscLoopOther = 0, tscPrevExit = 0;
++        uint64_t transfers = 0;
++        uint64_t loopIters = 0, dispatches = 0, pendingCalls = 0, events = 0, deadlineEvents = 0, timerIrqs = 0, idleWaits = 0;
++        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
++    };
++    SchedStats g_schedStats;
++    const bool g_schedStatsInit = []() {
++        const char *v = std::getenv("PS2X_SCHED_STATS");
++        g_schedStats.on = v && *v && *v != '0';
++        g_schedStats.hist = v && *v == '2';
++        return true;
++    }();
++    void schedStatsReport()
++    {
++        SchedStats &st = g_schedStats;
++        const auto now = std::chrono::steady_clock::now();
++        const double secs = std::chrono::duration<double>(now - st.last).count();
++        if (secs < 10.0)
++            return;
++        const double k = 1.0 / secs;
++        std::fprintf(stderr,
++                     "[sched-stats] %.1fs per second: checkpoints=%.0f (avg %.1f cycles) yields: pending=%.0f deadline=%.0f slice=%.0f stress=%.0f "
++                     "| loop=%.0f dispatch=%.0f pendingCalls=%.0f events=%.0f deadlineEvents=%.0f timerIrq=%.0f idleWaits=%.0f\n",
++                     secs, st.checkpoints * k, st.checkpoints ? double(st.checkpointCycles) / double(st.checkpoints) : 0.0,
++                     st.yieldPending * k, st.yieldDeadline * k, st.yieldSlice * k, st.yieldStress * k, st.loopIters * k,
++                     st.dispatches * k, st.pendingCalls * k, st.events * k, st.deadlineEvents * k, st.timerIrqs * k, st.idleWaits * k);
++        auto top = [](const std::unordered_map<uint32_t, uint64_t> &h, const char *label, double k) {
++            std::vector<std::pair<uint64_t, uint32_t>> v;
++            for (const auto &e : h)
++                v.emplace_back(e.second, e.first);
++            std::sort(v.rbegin(), v.rend());
++            std::fprintf(stderr, "[sched-stats]   %s:", label);
++            for (size_t i = 0; i < v.size() && i < 12; ++i)
++                std::fprintf(stderr, " %06x:%.0f", v[i].second, v[i].first * k);
++            std::fprintf(stderr, "\n");
++        };
++        top(st.pcHist, "dispatch pcs", k);
++        top(st.exitHist, "exit pcs (ctx->pc after return)", k);
++        std::fprintf(stderr, "[sched-stats]   transfers(exceptions)=%.0f/s\n", st.transfers * k);
++        if (st.acctCalls != 0u)
++            std::fprintf(stderr, "[sched-stats]   accountCycles, EE timers + IOP clock part: %.0f calls/s, %.1f ns each (EE timers %.1f ns, IOP clock %.1f ns; rdtsc: each figure includes ~10 ns of its own overhead)\n",
++                         st.acctCalls * k, st.acctTsc / 3.187 / st.acctCalls, st.timersTsc / 3.187 / st.acctCalls, st.iopTsc / 3.187 / st.acctCalls);
++        std::fprintf(stderr,
++                     "[sched-stats]   guest clock per second: estimated %.1f Mcycles, added by the wall-clock floor %.1f Mcycles (EE clock 294.9 M/s); "
++                     "slept for vblank pacing %.1f ms in %.0f waits\n",
++                     st.estCycles * k / 1e6, st.clampCycles * k / 1e6, st.pacingSleepTsc * k / 3.187e6, st.pacingSleeps * k);
++        {
++            const uint64_t total = st.tscInGuestSpin + st.tscInGuestOther + st.tscLoopSpin + st.tscLoopOther;
++            const double t = total ? 100.0 / double(total) : 0.0;
++            std::fprintf(stderr,
++                         "[sched-stats]   time in run(): guest wait-loop %.1f%%, guest other %.1f%%, scheduler around wait-loop dispatches %.1f%%, "
++                         "scheduler around other dispatches %.1f%% (rdtsc, run() only; %.0f Mtsc/s)\n",
++                         st.tscInGuestSpin * t, st.tscInGuestOther * t, st.tscLoopSpin * t, st.tscLoopOther * t, total * k / 1e6);
++        }
++        const bool hist = st.hist;
++        st = SchedStats{};
++        st.on = true;
++        st.hist = hist;
++    }
+ }
+ 
+ namespace
+@@ -222,9 +329,33 @@
+     assertExecutor();
+     m_running.store(true, std::memory_order_release);
+ 
++    // processPendingEvents ran twice per iteration (and iterations are ~1M/s in gameplay) although it has work only when
++    // an event was posted, a cycle deadline or EE timer interrupt is due, a reschedule is requested, or the checkpoint
++    // flag is set (the flag is what it clears). Everything it looks at is tested here without the call.
++    // PS2X_EVENT_PUMP_ALWAYS=1 restores the unconditional call (A/B).
++    static const bool alwaysPump = [] {
++        const char *v = std::getenv("PS2X_EVENT_PUMP_ALWAYS");
++        return v && *v && *v != '0';
++    }();
++    const auto eventPumpNeeded = [this]() noexcept {
++        if (alwaysPump)
++            return true;
++        if (m_checkpointPending.load(std::memory_order_relaxed) || m_rescheduleRequested ||
++            m_pendingEeTimerInterrupts != 0u || g_queuedEvents.load(std::memory_order_relaxed) != 0u)
++            return true;
++        const uint64_t nextDeadline = m_nextDeadlineCycle.load(std::memory_order_relaxed);
++        return nextDeadline != 0u && m_eeCycle >= nextDeadline;
++    };
++
+     while (!m_stopRequested.load(std::memory_order_acquire))
+     {
+-        processPendingEvents();
++        if (g_schedStats.on)
++        {
++            ++g_schedStats.loopIters;
++            schedStatsReport();
++        }
++        if (eventPumpNeeded())
++            processPendingEvents();
+         if (m_stopRequested.load(std::memory_order_acquire))
+         {
+             break;
+@@ -238,7 +369,9 @@
+                 copyMainContextToRuntime();
+                 publishIdleDebugContext();
+                 publishSnapshot();
++                SCHED_STAT(++g_schedStats.idleWaits);
+                 waitForEvent();
++                SCHED_STAT(g_schedStats.tscPrevExit = 0u);
+                 continue;
+             }
+             if (next)
+@@ -292,7 +425,10 @@
+             --m_debugPublishCountdown;
+         }
+ 
+-        publishDebugContext(context);
++        // Debug display only (pc/ra/sp/gp of the running thread): every 8th dispatch is plenty.
++        static uint32_t debugPublishTick = 0u;
++        if ((++debugPublishTick & 7u) == 0u)
++            publishDebugContext(context);
+ 
+         if (context.pc == 0u)
+         {
+@@ -338,7 +474,15 @@
+             continue;
+         }
+ 
+-        if (!m_runtime.hasFunction(context.pc))
++        // One probe of the dense function table instead of hasFunction + lookupFunction (two out-of-line calls; the
++        // latter also records the dispatch history, a debug aid for missing-function reports).
++        PS2Runtime::RecompiledFunction function = nullptr;
++        {
++            const uint32_t slot = (context.pc - g_ps2RecompiledFunctionTableBase) >> 2;
++            if ((context.pc & 3u) == 0u && slot < g_ps2RecompiledFunctionTableSlotCount)
++                function = g_ps2RecompiledFunctionTable[slot];
++        }
++        if (function == nullptr)
+         {
+             if (!running->invocations.empty())
+             {
+@@ -358,27 +502,64 @@
+             }
+             continue;
+         }
+-        PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
+-
+-        if (checkpointDue(kGuestDispatchCycles))
++
++        // A dispatch costs kGuestDispatchCycles like a call does, and is charged the same way: against the guest's
++        // checkpoint budget (ps2_cg.h), with the accumulated charge passed to checkpointDue when it runs out. A checkpoint
++        // per dispatch (~1M/s in gameplay: every entry fragment and every return after an unwind comes through here) was
++        // the largest part of the scheduler's cost. Total cycles charged are the same; events and deadlines are noticed at
++        // the top of the loop, so nothing waits for the checkpoint.
++        if (g_dispatchViaBudget)
++        {
++            if ((g_ps2EeBudget -= static_cast<int32_t>(kGuestDispatchCycles)) < 0)
++            {
++                const int32_t refill = ps2CgBudgetRefill();
++                const int32_t consumed = refill - g_ps2EeBudget;
++                g_ps2EeBudget = refill;
++                if (checkpointDue(static_cast<uint32_t>(consumed > 0 ? consumed : 1)))
++                {
++                    continue;
++                }
++            }
++        }
++        else if (checkpointDue(kGuestDispatchCycles))
+         {
+             continue;
+         }
+ 
+         try
+         {
++            uint64_t statT0 = 0;
++            bool statSpin = false;
++            if (g_schedStats.on)
++            {
++                ++g_schedStats.dispatches;
++                if (g_schedStats.hist)
++                    ++g_schedStats.pcHist[context.pc];
++                statSpin = context.pc >= 0x14fd90u && context.pc < 0x15008cu;
++                statT0 = __rdtsc();
++                if (g_schedStats.tscPrevExit != 0u)
++                    (statSpin ? g_schedStats.tscLoopSpin : g_schedStats.tscLoopOther) += statT0 - g_schedStats.tscPrevExit;
++            }
+             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+             m_guestExecuting.store(true, std::memory_order_release);
+             schedTrace('E', running->id, running->invocations.size(), context);
+             g_ps2GuestUnwinding = false;
+             function(m_rdram, &context, &m_runtime);
+             schedTrace('X', running->id, running->invocations.size(), context);
++            if (g_schedStats.on)
++            {
++                if (g_schedStats.hist)
++                    ++g_schedStats.exitHist[context.pc];
++                g_schedStats.tscPrevExit = __rdtsc();
++                (statSpin ? g_schedStats.tscInGuestSpin : g_schedStats.tscInGuestOther) += g_schedStats.tscPrevExit - statT0;
++            }
+             m_guestExecuting.store(false, std::memory_order_release);
+             m_insideInterrupt = false;
+         }
+         catch (const EeDispatcherTransfer &)
+         {
+             schedTrace('T', running->id, running->invocations.size(), context);
++            SCHED_STAT(++g_schedStats.transfers);
+             m_guestExecuting.store(false, std::memory_order_release);
+             m_insideInterrupt = false;
+         }
+@@ -390,7 +571,8 @@
+             throw;
+         }
+ 
+-        processPendingEvents();
++        if (eventPumpNeeded())
++            processPendingEvents();
+         if (m_rescheduleRequested && m_currentThreadId != 0)
+         {
+             GuestThread *preempted = currentThread();
+@@ -435,22 +617,24 @@
+ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+ {
+     accountCycles(cycles);
++#ifdef PS2X_SCHED_STATS_HOT // per-checkpoint counters cost a load and a branch each: compiled in only on request
++    SCHED_STAT(++g_schedStats.checkpoints; g_schedStats.checkpointCycles += cycles);
++#endif
+ 
+     // PS2X_STRESS_YIELD=N: yield to the scheduler at every Nth checkpoint (debug aid for resume bugs).
+-    static const uint32_t stressYield = []() {
+-        const char *v = std::getenv("PS2X_STRESS_YIELD");
+-        return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u;
+-    }();
++    const uint32_t stressYield = g_stressYield;
+     static uint32_t stressCount = 0;
+     if (stressYield != 0u && ++stressCount >= stressYield)
+     {
+         stressCount = 0;
++        SCHED_STAT(++g_schedStats.yieldStress);
+         return true;
+     }
+ 
+     if (m_checkpointPending.load(std::memory_order_acquire) ||
+         m_stopRequested.load(std::memory_order_acquire))
+     {
++        SCHED_STAT(++g_schedStats.yieldPending);
+         return true;
+     }
+ 
+@@ -458,6 +642,7 @@
+     if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
+     {
+         m_checkpointPending.store(true, std::memory_order_release);
++        SCHED_STAT(++g_schedStats.yieldDeadline);
+         return true;
+     }
+ 
+@@ -471,6 +656,7 @@
+     {
+         m_rescheduleRequested = true;
+         m_timeSliceExpired = true;
++        SCHED_STAT(++g_schedStats.yieldSlice);
+         return true;
+     }
+ 
+@@ -496,10 +682,7 @@
+     // The EE cycle clock never falls behind wall time: checkpoints only charge an estimate per block, so recompiled
+     // code (and especially guest spin-waits) would otherwise let emulated time lag real time, and every cycle-gated
+     // event (vblank, EE timers, IOP time) would run slow. Faster-than-real-time execution still accrues cycles.
+-    static const bool wallClock = []() {
+-        const char *v = std::getenv("PS2X_WALLCLOCK");
+-        return !(v && v[0] == '0');
+-    }();
++    const bool wallClock = g_wallClockPacing;
+     // Reading the host clock costs ~20-30 ns and this runs on nearly every guest call: sample it every 64th call.
+     static uint64_t wallCycles = 0;
+     static uint32_t wallSampleCountdown = 0;
+@@ -509,14 +692,42 @@
+         wallSampleCountdown = 63u;
+     }
+     uint64_t next = m_eeCycle + std::max<uint64_t>(1u, cycles);
++#ifdef PS2X_SCHED_STATS_HOT
++    if (g_schedStats.on)
++    {
++        g_schedStats.estCycles += std::max<uint64_t>(1u, cycles);
++        if (wallClock && next < wallCycles)
++            g_schedStats.clampCycles += wallCycles - next;
++    }
++#endif
+     if (wallClock && next < wallCycles)
+         next = wallCycles;
+     const uint64_t elapsed = next - m_eeCycle;
+     m_eeCycle = next;
+-    if (R5900Context *ctx = currentContext())
+-        ctx->cop0_count = static_cast<uint32_t>(wallCycles);
++    // Inline fast path of currentContext(): the thread cache (currentThread) is valid at nearly every checkpoint.
++    GuestThread *const self = (g_cachedScheduler == this && g_cachedThreadId == m_currentThreadId && g_cachedThread != nullptr)
++                                  ? g_cachedThread
++                                  : currentThread();
++    if (self != nullptr)
++        (self->invocations.empty() ? self->context : self->invocations.back().context).cop0_count = static_cast<uint32_t>(wallCycles);
++#ifdef PS2X_SCHED_STATS_HOT
++    const uint64_t statA0 = g_schedStats.on ? __rdtsc() : 0u;
++#endif
+     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
++#ifdef PS2X_SCHED_STATS_HOT
++    const uint64_t statA1 = g_schedStats.on ? __rdtsc() : 0u;
++#endif
+     m_runtime.advanceIopEeCycles(elapsed);
++#ifdef PS2X_SCHED_STATS_HOT
++    if (g_schedStats.on)
++    {
++        const uint64_t statA2 = __rdtsc();
++        ++g_schedStats.acctCalls;
++        g_schedStats.timersTsc += statA1 - statA0;
++        g_schedStats.iopTsc += statA2 - statA1;
++        g_schedStats.acctTsc += statA2 - statA0;
++    }
++#endif
+     if (m_pendingEeTimerInterrupts != 0u)
+     {
+         m_checkpointPending.store(true, std::memory_order_release);
+@@ -1874,6 +2085,7 @@
+ void EeScheduler::processPendingEvents()
+ {
+     assertExecutor();
++    SCHED_STAT(++g_schedStats.pendingCalls);
+     processDueDeadlines();
+     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
+     m_pendingEeTimerInterrupts = 0u;
+@@ -1881,6 +2093,7 @@
+     {
+         if ((timerInterrupts & (1u << timer)) != 0u)
+         {
++            SCHED_STAT(++g_schedStats.timerIrqs);
+             dispatchIrq(false, 9u + timer);
+         }
+     }
+@@ -1945,9 +2158,15 @@
+ 
+             if (now < pacingDeadline)
+             {
++                const uint64_t statSleep0 = g_schedStats.on ? __rdtsc() : 0u;
+                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
+                                      { return !m_events.empty() ||
+                                               m_stopRequested.load(std::memory_order_acquire); });
++                if (g_schedStats.on)
++                {
++                    g_schedStats.pacingSleepTsc += __rdtsc() - statSleep0;
++                    ++g_schedStats.pacingSleeps;
++                }
+                 if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
+                 {
+                     updateNextDeadline();
+@@ -2006,6 +2225,7 @@
+ 
+ void EeScheduler::processEvent(const EeEvent &event)
+ {
++    SCHED_STAT(++g_schedStats.events);
+     switch (event.type)
+     {
+     case EeEventType::Stop:
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -22,6 +22,71 @@
+ class PS2Memory;
+ static const PS2Memory *g_gifStatOwner = nullptr; // advanceEeTimers: cached GIF_STAT register
+ static uint32_t *g_gifStat = nullptr;
++
++// Lazy EE timers. EeScheduler::accountCycles calls advanceEeTimers at every checkpoint (~1M/s in gameplay). Timer
++// state is only observable through the timer registers and through interrupts, so the cycles are collected here and
++// applied (a) when a timer register is read or written, (b) when the earliest cycle at which a timer interrupt flag can
++// be set has been reached, (c) when the scheduler asks for the next timer deadline. The result is the same as applying
++// every chunk: the tick split carries its remainder exactly, and the interrupt is raised at the same checkpoint (the
++// first one at which the cumulative cycles reach the event). PS2X_LAZY_TIMERS=0 restores per-checkpoint updates.
++// One PS2Memory in practice; the state is reset when another instance calls in.
++static const PS2Memory *g_eeTimerOwner = nullptr;
++static uint64_t g_eeTimerPending = 0;                                  // cycles not yet applied to m_eeTimers
++static uint64_t g_eeTimerNextEvent = std::numeric_limits<uint64_t>::max(); // pending value at which an event can occur
++static uint32_t g_eeTimerDeferredMask = 0;                             // interrupts found by a register-access flush
++// A namespace-scope constant, not a function-local static: the latter costs a thread-safe-init check (TLS load) per call.
++static const bool g_eeTimersLazy = []
++{
++    const char *v = std::getenv("PS2X_LAZY_TIMERS");
++    return !(v && *v == '0');
++}();
++
++// PS2X_LAZY_TIMERS=verify: lazy mode plus an eager shadow copy of the timers, advanced at every checkpoint the old way.
++// Whenever the lazy state is brought up to date (register access, event deadline, scheduler query) it is compared with
++// the shadow, and an interrupt found by the shadow must be raised by the same call. A 10 s summary goes to stderr.
++static const bool g_eeTimersVerify = []
++{
++    const char *v = std::getenv("PS2X_LAZY_TIMERS");
++    return v && std::strcmp(v, "verify") == 0;
++}();
++struct EeTimerShadow
++{
++    uint32_t count = 0, mode = 0, compare = 0, hold = 0;
++    uint64_t clockRemainder = 0;
++};
++static std::array<EeTimerShadow, 4> g_eeTimerShadow{};
++static uint32_t g_eeTimerShadowMask = 0; // interrupts the shadow raised since the lazy state was last brought up to date
++static uint64_t g_eeTimerVerifyChecks = 0, g_eeTimerVerifyBad = 0, g_eeTimerVerifyIrqs = 0, g_eeTimerVerifyEarly = 0;
++static std::chrono::steady_clock::time_point g_eeTimerVerifyLast = std::chrono::steady_clock::now();
++template <class Timers>
++static void eeTimersVerifyCompare(const Timers &timers, const char *where) noexcept
++{
++    ++g_eeTimerVerifyChecks;
++    bool same = true;
++    for (size_t i = 0; i < timers.size(); ++i)
++    {
++        const auto &a = timers[i];
++        const EeTimerShadow &b = g_eeTimerShadow[i];
++        if (a.count != b.count || a.mode != b.mode || a.compare != b.compare || a.hold != b.hold || a.clockRemainder != b.clockRemainder)
++        {
++            same = false;
++            if (g_eeTimerVerifyBad < 5)
++                std::fprintf(stderr, "[eetimers-verify] MISMATCH (%s) timer %zu: lazy count=%u mode=%x cmp=%u rem=%llu, eager count=%u mode=%x cmp=%u rem=%llu\n",
++                             where, i, a.count, a.mode, a.compare, static_cast<unsigned long long>(a.clockRemainder), b.count, b.mode,
++                             b.compare, static_cast<unsigned long long>(b.clockRemainder));
++        }
++    }
++    if (!same)
++        ++g_eeTimerVerifyBad;
++    const auto now = std::chrono::steady_clock::now();
++    if (now - g_eeTimerVerifyLast >= std::chrono::seconds(10))
++    {
++        std::fprintf(stderr, "[eetimers-verify] %llu comparisons, %llu mismatches, %llu interrupts raised, %llu early returns checked\n",
++                     static_cast<unsigned long long>(g_eeTimerVerifyChecks), static_cast<unsigned long long>(g_eeTimerVerifyBad),
++                     static_cast<unsigned long long>(g_eeTimerVerifyIrqs), static_cast<unsigned long long>(g_eeTimerVerifyEarly));
++        g_eeTimerVerifyLast = now;
++    }
++}
+ 
+ // Number of completed-DMAC causes queued and not yet consumed (one PS2Memory in practice; with several it only costs an
+ // unneeded lock). PS2Runtime::Store32 drains completed DMAC handlers after every MMIO store; taking the mutex twice per
+@@ -636,34 +701,66 @@
+ void PS2Memory::resetEeTimers() noexcept
+ {
+     m_eeTimers = {};
+-}
+-
+-uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+-{
+-    if (eeCycles == 0u)
+-    {
+-        return 0u;
+-    }
+-
+-    constexpr uint32_t kGifStat = 0x10003020u;
+-    constexpr uint32_t kGifFqcMask = 0x1F000000u;
+-    // Runs on every EE checkpoint: remember where GIF_STAT lives instead of hashing it each time (unordered_map
+-    // node addresses are stable; re-looked-up while the register does not exist yet).
+-    const PS2Memory *&gifStatOwner = g_gifStatOwner;
+-    uint32_t *&gifStat = g_gifStat;
+-    if (gifStatOwner != this || gifStat == nullptr)
+-    {
+-        auto gifStatIt = m_ioRegisters.find(kGifStat);
+-        gifStat = gifStatIt != m_ioRegisters.end() ? &gifStatIt->second : nullptr;
+-        gifStatOwner = this;
+-    }
+-    if (gifStat)
+-        *gifStat &= ~kGifFqcMask;
+-
++    g_eeTimerOwner = this;
++    g_eeTimerPending = 0u;
++    g_eeTimerNextEvent = std::numeric_limits<uint64_t>::max();
++    g_eeTimerDeferredMask = 0u;
++    g_eeTimerShadow = {};
++    g_eeTimerShadowMask = 0u;
++}
++
++// Cycles until the earliest interrupt flag any timer can set (UINT64_MAX: none), given the timer state as it is now.
++template <class Timers>
++static uint64_t eeTimersNextEventCycles(const Timers &timers) noexcept
++{
++    uint64_t nearest = std::numeric_limits<uint64_t>::max();
++    for (const auto &timer : timers)
++    {
++        if ((timer.mode & kEeTimerModeCue) == 0u)
++        {
++            continue;
++        }
++
++        const uint32_t count = timer.count & 0xFFFFu;
++        const uint32_t compare = timer.compare & 0xFFFFu;
++        const uint64_t compareDistance = ticksUntilMatch(count, compare);
++        const uint64_t overflowDistance = 0x10000ull - count;
++        uint64_t eventTicks = std::numeric_limits<uint64_t>::max();
++
++        if ((timer.mode & kEeTimerModeCmpe) != 0u &&
++            (timer.mode & kEeTimerModeEquf) == 0u)
++        {
++            eventTicks = compareDistance;
++        }
++        const bool overflowCanOccur = (timer.mode & kEeTimerModeZret) == 0u ||
++                                      overflowDistance <= compareDistance;
++        if (overflowCanOccur &&
++            (timer.mode & kEeTimerModeOvfe) != 0u &&
++            (timer.mode & kEeTimerModeOvff) == 0u)
++        {
++            eventTicks = std::min(eventTicks, overflowDistance);
++        }
++        if (eventTicks == std::numeric_limits<uint64_t>::max())
++        {
++            continue;
++        }
++
++        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
++        const uint64_t numerator = eventTicks * kEeClockHz - timer.clockRemainder;
++        const uint64_t cycles = (numerator + clockHz - 1u) / clockHz;
++        nearest = std::min(nearest, std::max<uint64_t>(1u, cycles));
++    }
++    return nearest;
++}
++
++// Applies eeCycles to the timers (counting, compare/overflow flags); returns the timers whose interrupt flag was set.
++template <class Timers>
++static uint32_t eeTimersAdvanceLoop(Timers &timers, uint64_t eeCycles) noexcept
++{
+     uint32_t interruptMask = 0u;
+-    for (size_t index = 0; index < m_eeTimers.size(); ++index)
+-    {
+-        EeTimer &timer = m_eeTimers[index];
++    for (size_t index = 0; index < timers.size(); ++index)
++    {
++        auto &timer = timers[index];
+         if ((timer.mode & kEeTimerModeCue) == 0u)
+         {
+             continue;
+@@ -733,46 +830,98 @@
+     return interruptMask;
+ }
+ 
++// eeCycles == 0 applies the cycles collected so far (lazy mode) without adding any; the returned interrupt mask is then
++// the caller's to keep (register-access callers stash it in g_eeTimerDeferredMask, which the next call returns).
++uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
++{
++    const bool lazy = g_eeTimersLazy;
++    if (eeCycles != 0u)
++    {
++        constexpr uint32_t kGifStat = 0x10003020u;
++        constexpr uint32_t kGifFqcMask = 0x1F000000u;
++        // Runs on every EE checkpoint: remember where GIF_STAT lives instead of hashing it each time (unordered_map
++        // node addresses are stable; re-looked-up while the register does not exist yet).
++        const PS2Memory *&gifStatOwner = g_gifStatOwner;
++        uint32_t *&gifStat = g_gifStat;
++        if (gifStatOwner != this || gifStat == nullptr)
++        {
++            auto gifStatIt = m_ioRegisters.find(kGifStat);
++            gifStat = gifStatIt != m_ioRegisters.end() ? &gifStatIt->second : nullptr;
++            gifStatOwner = this;
++        }
++        if (gifStat)
++            *gifStat &= ~kGifFqcMask;
++    }
++
++    if (lazy)
++    {
++        if (g_eeTimerOwner != this)
++        {
++            g_eeTimerOwner = this;
++            g_eeTimerPending = 0u;
++            g_eeTimerDeferredMask = 0u;
++            g_eeTimerNextEvent = eeTimersNextEventCycles(m_eeTimers);
++        }
++        g_eeTimerPending += eeCycles;
++        if (g_eeTimersVerify && eeCycles != 0u)
++        {
++            const uint32_t shadowMask = eeTimersAdvanceLoop(g_eeTimerShadow, eeCycles);
++            g_eeTimerShadowMask |= shadowMask;
++            if (shadowMask != 0u && g_eeTimerPending < g_eeTimerNextEvent)
++            {
++                ++g_eeTimerVerifyBad; // the eager timers raised an interrupt this call, the lazy ones would not
++                if (g_eeTimerVerifyBad <= 5)
++                    std::fprintf(stderr, "[eetimers-verify] MISMATCH: eager interrupt mask %x not raised by the lazy path\n", shadowMask);
++            }
++            else if (shadowMask == 0u && g_eeTimerPending < g_eeTimerNextEvent)
++                ++g_eeTimerVerifyEarly;
++        }
++        if (eeCycles != 0u && g_eeTimerPending < g_eeTimerNextEvent)
++        {
++            const uint32_t deferred = g_eeTimerDeferredMask;
++            g_eeTimerDeferredMask = 0u;
++            return deferred;
++        }
++        eeCycles = g_eeTimerPending;
++        g_eeTimerPending = 0u;
++    }
++    if (eeCycles == 0u)
++    {
++        const uint32_t deferred = g_eeTimerDeferredMask;
++        g_eeTimerDeferredMask = 0u;
++        return deferred;
++    }
++
++    uint32_t interruptMask = eeTimersAdvanceLoop(m_eeTimers, eeCycles);
++    if (g_eeTimersVerify && lazy)
++    {
++        eeTimersVerifyCompare(m_eeTimers, "flush");
++        if (interruptMask != g_eeTimerShadowMask)
++        {
++            ++g_eeTimerVerifyBad;
++            if (g_eeTimerVerifyBad <= 5)
++                std::fprintf(stderr, "[eetimers-verify] MISMATCH: lazy interrupt mask %x, eager %x\n", interruptMask, g_eeTimerShadowMask);
++        }
++        g_eeTimerVerifyIrqs += (interruptMask != 0u);
++        g_eeTimerShadowMask = 0u;
++    }
++    if (lazy)
++    {
++        g_eeTimerNextEvent = eeTimersNextEventCycles(m_eeTimers);
++        interruptMask |= g_eeTimerDeferredMask;
++        g_eeTimerDeferredMask = 0u;
++    }
++    return interruptMask;
++}
++
+ uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
+ {
+-    uint64_t nearest = std::numeric_limits<uint64_t>::max();
+-    for (const EeTimer &timer : m_eeTimers)
+-    {
+-        if ((timer.mode & kEeTimerModeCue) == 0u)
+-        {
+-            continue;
+-        }
+-
+-        const uint32_t count = timer.count & 0xFFFFu;
+-        const uint32_t compare = timer.compare & 0xFFFFu;
+-        const uint64_t compareDistance = ticksUntilMatch(count, compare);
+-        const uint64_t overflowDistance = 0x10000ull - count;
+-        uint64_t eventTicks = std::numeric_limits<uint64_t>::max();
+-
+-        if ((timer.mode & kEeTimerModeCmpe) != 0u &&
+-            (timer.mode & kEeTimerModeEquf) == 0u)
+-        {
+-            eventTicks = compareDistance;
+-        }
+-        const bool overflowCanOccur = (timer.mode & kEeTimerModeZret) == 0u ||
+-                                      overflowDistance <= compareDistance;
+-        if (overflowCanOccur &&
+-            (timer.mode & kEeTimerModeOvfe) != 0u &&
+-            (timer.mode & kEeTimerModeOvff) == 0u)
+-        {
+-            eventTicks = std::min(eventTicks, overflowDistance);
+-        }
+-        if (eventTicks == std::numeric_limits<uint64_t>::max())
+-        {
+-            continue;
+-        }
+-
+-        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
+-        const uint64_t numerator = eventTicks * kEeClockHz - timer.clockRemainder;
+-        const uint64_t cycles = (numerator + clockHz - 1u) / clockHz;
+-        nearest = std::min(nearest, std::max<uint64_t>(1u, cycles));
+-    }
+-    return nearest;
++    if (g_eeTimersLazy && g_eeTimerPending != 0u && g_eeTimerOwner == this)
++    {
++        // The timer state lags by the cycles collected so far: apply them first (EE thread only, like every caller).
++        g_eeTimerDeferredMask |= const_cast<PS2Memory *>(this)->advanceEeTimers(0);
++    }
++    return eeTimersNextEventCycles(m_eeTimers);
+ }
+ 
+ bool PS2Memory::isScratchpad(uint32_t address) const
+@@ -1420,6 +1569,8 @@
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+     {
++        if (g_eeTimersLazy)
++            g_eeTimerDeferredMask |= advanceEeTimers(0); // apply the collected cycles under the old settings first
+         EeTimer &timer = m_eeTimers[timerIndex];
+         switch (timerOffset)
+         {
+@@ -1446,6 +1597,19 @@
+             break;
+         default:
+             return false;
++        }
++        if (g_eeTimersLazy)
++        {
++            g_eeTimerNextEvent = eeTimersNextEventCycles(m_eeTimers);
++            if (g_eeTimersVerify)
++            {
++                EeTimerShadow &sh = g_eeTimerShadow[timerIndex];
++                sh.count = timer.count;
++                sh.mode = timer.mode;
++                sh.compare = timer.compare;
++                sh.hold = timer.hold;
++                sh.clockRemainder = timer.clockRemainder;
++            }
+         }
+         return true;
+     }
+@@ -2885,6 +3049,10 @@
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+     {
++        if (g_eeTimersLazy && g_eeTimerPending != 0u)
++            g_eeTimerDeferredMask |= advanceEeTimers(0); // the registers must show the cycles collected so far
++        if (g_eeTimersVerify)
++            eeTimersVerifyCompare(m_eeTimers, "register read");
+         const EeTimer &timer = m_eeTimers[timerIndex];
+         switch (timerOffset)
+         {

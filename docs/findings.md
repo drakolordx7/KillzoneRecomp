@@ -257,3 +257,63 @@ inside microVU.
   load/convert/store per vector; masked UNPACKs are 13 % of Killzone's ~8700 per frame. `PS2X_VIF_UNPACK_CHECK=4` ran every
   4th UNPACK of a boot + gameplay run both ways (5.8 M checked): 0 differences in VU1 memory and VIF registers.
 - Heap traffic on the EE thread (`RtlAllocateHeap` 2.5-3.2 %, `RtlFreeHeap` 1.4-1.5 %) is not from these buffers; unchanged.
+
+## EE thread frame budget (2026-09-30, patch 0019)
+Measured in-process (`PS2X_SCHED_STATS=1`: counters and rdtsc, no sampling) in the gameplay window t=150..200 s, `KZ_FPS=120`.
+The machine was shared with 2-3 other game instances and builds, so absolute numbers are 10-20 % worse than a quiet
+machine (the least loaded run of the final binary measured 73 fps with the sampling profiler on).
+- **The EE thread never idles.** `idleWaits=0` in every 10 s window. Per second of wall time: ~70-80 % in guest functions,
+  ~5-6 % in the scheduler loop around them (~9 % before patch 0019), **10-25 % (100-240 ms, ~100 waits/s) asleep in
+  `EeScheduler::processDueDeadlines`**: the guest clock reached a vblank's cycle deadline before the host reached its
+  time, so the scheduler sleeps until the vblank's host deadline. That sleep is what the 32 % "wait site" in the earlier
+  profile was.
+- **Frame time is a staircase.** The finished frame list is kicked at a vblank, so a frame whose EE work ends at 14 ms
+  starts its successor at the next vblank (16.7 ms) and the EE sleeps the difference. EE host time per displayed frame,
+  (1000 ms - pacing sleep) / fps: 9.6-13.8 ms in sequential runs (70.8-58.6 fps), 12.1-15.3 ms in concurrent pairs (57-66 fps). fps only moves when
+  frames cross a vblank boundary: 6 concurrent pairs of "all patch-0019 switches off" against "on" gave EE ms/frame -0.83,
+  -0.83, -0.60, -0.48, -0.47, +0.06 (median -0.54 ms, -3.8 %) and fps 60.3 -> 59.6 (median of six, noise). Getting from
+  ~14 ms to under 8.33 ms needs the guest-code side (about 80 % of the thread), not more fixed-cost trimming. On a
+  quieter machine the EE has more slack: the least loaded run (73 fps, profiler on) had the EE thread asleep in
+  `processDueDeadlines` for 47 % of all samples (busy 51.5 %, ~7 ms per frame including the wait loops), and the sequential
+  runs of the final binary measured 9.6, 11.2 and 13.8 ms/frame at 70.8, 66.6 and 58.6 fps as the other instances on the
+  machine came and went (pre-patch binary, same sequence: 68.3, 65.8, 64.6 fps; final: 70.8, 66.6, 58.6).
+- **The VIF1 worker is at least as much of a limiter.** `PS2X_VIF1_STATS=1` (68 fps, t=150..200): one job per frame
+  (601-673 per 10 s), worker busy 5.84-6.37 s per 10 s = 9.1-10.0 ms per frame, of which VU1 (microVU1 run + JIT compile)
+  4.88-5.30 s = 7.6-8.3 ms and the host-GS hook 0.64-0.70 s; the EE's chain walk is 0.32-0.36 s per 10 s. The game kicks the
+  next frame list only when D1 is idle (`FUN_00151fc8`, docs/perf_research.md section 2.6; not re-checked here), so a worker that needs more than one vblank period (8.33 ms) per frame gives
+  2-vblank frames whatever the EE does. 120 fps needs the worker's per-frame time (mostly VU1) well under 8.3 ms too,
+  not only the EE thread.
+- **The guest cycle estimate is not the limiter.** `PS2X_EE_CYCLE_SCALE=0.5` (charge half the cycles per call/back edge; a
+  temporary knob, not kept) cut the estimated cycles from 215 to 135 M/s and left fps at 57.5 vs 58.8 in a concurrent pair.
+- **Where the ~1 M scheduler dispatches/s come from** (`PS2X_SCHED_STATS=2` histograms; every dispatch is an entry into
+  a guest function from the scheduler loop): tail jumps between `entry_*` fragments and the returns after a
+  non-local unwind. `ps2CgAfterCallSlow` (ps2_cg.h) sets `g_ps2GuestUnwinding` when a callee returns with `ctx->pc` != the
+  return address, so every enclosing guest frame returns to the scheduler, which dispatches the target and then, one
+  dispatch per level, each caller's resume label. Top dispatch pcs (per second, one window): 0x17f8e0 31k, 0x185e20 30k,
+  0x33cd84 29k, 0x3fb18c/3fb184/3fb108 20k each, 0x401750/4017a4/401720 17k each, 0x3a3c18/3a3ee4 12k each, and, when the
+  game sits in its flag-wait loop `FUN_0014fd90` (spins on a byte cleared by an interrupt handler, reading COP0 Count),
+  0x14fe28/14fe38/14fe54/14fec0/14fec8 at 47-152k each. Untried because it edits ps2_cg.h (full rebuild): let
+  `ps2CgAfterCallSlow` call a table function at `ctx->pc` in a loop (a trampoline) while the pc is a table entry other than
+  `fall`, instead of unwinding. That turns each of those dispatches into a plain C call and keeps the caller frames alive.
+- **Locks.** Before the DMAC-drain fast path (another agent's change to `consumeCompletedDmacCauses`, PS2X_DMAC_DRAIN_FAST)
+  `RtlAcquire/ReleaseSRWLockExclusive` + `Mtx_lock/unlock` were 5.0 % of the EE thread, all under `PS2Runtime::Store32` ->
+  `drainCompletedDmacHandlers`. A profile of the final binary (`work/profile_pa2.txt` style, gameplay) shows no SRW/mutex
+  entry above 0.1 % on the EE thread except `IopSubsystem::lockExec` in `handleRpc` (0.2 %, RPC path). Nothing else takes a
+  lock per checkpoint, per dispatch or per call.
+- **VU0 calls in gameplay:** ~470 k/s (`KZ_VU0_STATS=1`), start PCs by share of calls: 0x520 21 %, 0x270 15 %, 0x020 14 %,
+  0xD18 12 %, 0x870 9 %, 0xC80 9 %, 0x910 5 %, 0x7B0 4 %, 0x778 4 %. The three programs of `FUN_00505a78`
+  (0x870/0x778/0x7B0) are 17 % of the calls in this window, not the 84 % of the first measurement (that was a different
+  scene), so hand-translating them would not remove most of the cost.
+  `kzvu0_test --bench` (host cost of one call incl. the context copies, min of 3 runs, 11 captured start PCs): original
+  path 136-194 ns (median 160), `kzvu0Call` 64-117 ns (median 79). Where the rest goes: ~45 ns is microVU's fixed
+  dispatch cost (an E-bit-only program at 0x000 takes ~45 ns to run), ~10 ns the MXCSR switch, the copies ~20 ns.
+- **EE timers.** `advanceEeTimers` was called at every checkpoint (~0.8 M/s): 28-30 ns each (rdtsc pair, ~10 ns of it
+  instrumentation); lazy: 14-15 ns. Verified with `PS2X_LAZY_TIMERS=verify` (eager shadow copy compared at every flush and
+  register read; an interrupt found by the shadow must be raised by the same call): 102 508 comparisons, 0 mismatches,
+  2 014 interrupts, 200 M early returns checked in a 235 s run. `KZ_VU0_VERIFY=8` in the same run: 5.04 M calls checked
+  (both paths from the same state, all registers/flags/TPC/VPU_STAT and VU0 data memory), 0 mismatches.
+- **Boot flake (not from these changes).** About 1 boot in 30-40 under load ends in `[IOP] module arena exhausted` (the
+  game loads `MCSERV.IRX` again and again until the IOP module arena is gone, then exits): 3 of ~115 boots, with the
+  patch-0019 switches on (2) and off (1), always when several instances were booting at once. Log signature: a
+  `load-emulated id=N path=...MCSERV.IRX` line repeating in stdout, hundreds of thousands of `module arena exhausted`
+  lines in stderr. IOP module loading is not part of this patch.

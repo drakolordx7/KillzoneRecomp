@@ -342,7 +342,13 @@ void kzvu0MicroWritten(uint32_t offset, uint32_t size);   // after VIF0 MPG / EE
 void kzvu0SetRegs(const Kzvu0Regs&);  void kzvu0GetRegs(Kzvu0Regs&);  // VF, VI, ACC, status/MAC/clip, R, I, Q
 uint32_t kzvu0Execute(uint32_t startPcBytes, uint32_t maxCycles);   // VCALLMS; 0xFFFFFFFF = continue at TPC
 bool kzvu0Running();  uint32_t kzvu0VpuStat();  uint32_t kzvu0TPC();  uint64_t kzvu0Cycles();  uint64_t kzvu0Calls();
+Kzvu0CallOut kzvu0Call(const Kzvu0Host&, uint32_t startPcBytes, uint32_t maxCycles, uint32_t fbrst);  // all of the above in one step
 ```
+
+- **`kzvu0Call`:** SetRegs + `kzvuSetFBRST` + Execute + GetRegs for a host whose COP2 file is plain memory (`Kzvu0Host`
+  holds pointers to the VF/VI/ACC/flag/R/I/Q storage; VF0 and VI0 are written back as the constants). No `Kzvu0Regs`
+  staging copy, and the per-thread `VU0` pointer is bound once per call. The game uses it (`src/kz_vu.cpp`,
+  `KZ_VU0_DIRECT=0` = the staged path, `KZ_VU0_VERIFY=<n>` = compare both in-game).
 
 - **Registers:** VU0's register file is the EE's COP2 register file, so the host copies it in before each call and
   out afterwards (`Kzvu0Regs`). `kzvu0SetRegs` seeds the flags the way PCSX2's `vu0ExecMicro` does: the interpreter's
@@ -365,12 +371,16 @@ bool kzvu0Running();  uint32_t kzvu0VpuStat();  uint32_t kzvu0TPC();  uint64_t k
 
 ### Test (`test/kzvu0_test.cpp`)
 
-`kzvu0_test [--clamp N] [capture dir ...]` (default: `test/vu0_captures`, clamp 3). Exit code 0 = pass.
+`kzvu0_test [--clamp N] [--bench] [capture dir ...]` (default: `test/vu0_captures`, clamp 3). Exit code 0 = pass.
+`--bench` only times one call of each captured start PC (200 000 iterations): the old path (context -> `Kzvu0Regs`,
+`kzvu0SetRegs`, `kzvu0Execute`, `kzvu0GetRegs`, back) and `kzvu0Call`, ns per call.
 
 1. Synthetic programs with known results on the JIT and PCSX2's interpreter: FMAC + LQ/SQ with registers passed in,
    the 4 KB data wrap, VU1 VF/VI read and written through 0x4000+, M bits in the middle of a program, ITOF0 of
    integer bit patterns, and a 2000-iteration loop (6005 cycles). The old path stops that loop at its 4096-cycle
    budget (vf2.x = 1024 instead of 2001); no captured game program comes close to 4096 cycles.
+   `kzvu0Call` is also compared with SetRegs/Execute/GetRegs (all registers, flags, TPC, VPU_STAT, data memory, VU1
+   registers) on every captured call and on 16 randomized inputs each (random VF bits including NaN/Inf/denormals).
 2. Captured game calls (`Kzvu0Capture`, `include/kzvu0_capture.h`), written by the game with `KZ_VU0_DUMP=<dir>`
    (`KZ_VU0_DUMP_AFTER`, `_PER`, `_MAX`, `_FINITE=1`; see `src/kz_vu.cpp`). Each is replayed from its input state on
    the JIT, PCSX2's interpreter and PS2Recomp's interpreter run exactly like the runtime's old path. Fails if the JIT
