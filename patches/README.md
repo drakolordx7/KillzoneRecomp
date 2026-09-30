@@ -283,3 +283,75 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
     variant: locals without the direct-call/budget part).
   - Compile cost: the locals output is smaller (FUN_00153d28, the largest function: 1.4 MB object vs 2.7 MB, 20 s vs 42 s to compile), and the
     executable is half the size (102 MB vs 211 MB).
+
+- `0016-vif1-worker-thread.patch` (runtime; the rest of the change is in the main repo: `ext/kzvu`, `src/kz_vu.cpp`,
+  `src/kz_gs.cpp`, `src/kz_main.cpp`): VIF1 DMA, VU1 (microVU1), XGKICK and the GIF arbiter run on their own worker
+  thread, the way PCSX2's MTVU does for VU1. In-game (headless, 60 Hz vblank, same scene, no other game instance or compile
+  running, `vif=` counter t=170..232 s): ~31 -> ~46 frames/s with the IOP thread on (31.3 -> 46.0, and 24.4 -> 44.9 in a second pair that ran on a busier machine); the new synchronous path measures the same as before (32.0 and 30.7 against 31.3) (details and the runs behind them: docs/findings.md, "VIF1 worker thread").
+  `PS2X_VIF1_THREAD=0` keeps the old synchronous path. Threaded is the default whenever a host VU1 is installed (its JIT
+  is tied to the thread that runs it, so the mode is fixed at startup; with `KZ_VU=builtin` the runtime stays synchronous).
+  - **Design.** A DMA start on D1 (VIF1) or D2 (GIF) still walks the DMA chain on the EE thread. That copies the source
+    data into the chain buffer, exactly as before, so the game may reuse its frame lists as soon as the CHCR store
+    returns (a normal-mode MADR/QWC transfer is copied chunk by chunk at the start instead of being read later). The
+    buffers go to the worker as one job (`ps2_vif1_worker.cpp`, new). Jobs run in FIFO order and do what the
+    synchronous `processPendingTransfers` did: PATH3 packets first (undrained), then `processVIF1Data` per buffer (UNPACK,
+    MPG, MSCAL/MSCNT on the host VU1, DIRECT -> PATH2, XGKICK -> PATH1), then the arbiter drain. So the host GS sees the
+    same packet order as before. From the first job on, the worker owns: VIF1 registers/state, VU1 code+data memory,
+    the host VU1, the GIF arbiter, the PATH3 mask state. VIF0 (VU0) transfers stay synchronous on the EE thread.
+  - **Completion.** CHCR.STR of D1/D2 reads busy until the job is done (`readIORegister`; the old code always read STR
+    as idle). The worker records the completion and posts an `EeEventType::Dmac` event (`kVif1WorkerEventId`); the EE
+    applies it (STR/QWC clear, D_STAT bit, `queueCompletedDmacCause`, DMAC handlers via `drainCompletedDmacHandlers`)
+    from `EeScheduler::processEvent`, or lazily on the first read of D1/D2 CHCR or D_STAT. A DMA started on a busy
+    channel queues behind the old one (per-channel outstanding count).
+  - **EE <-> worker interaction points.** Each of these waits until the worker is idle ("barrier"), unless stated:
+    VU1 code/data access through `mapVuMemory` (all read/write8..128); VIF1 register writes (FBRST, MARK, CYCLE, MODE,
+    NUM, MASK, CODE, ITOPS, BASE, OFST, TOPS, ITOP, TOP; a write to STAT or ERR only touches the register map, no
+    barrier); GIF_STAT reads (M3P is the worker's PATH3 mask); VIF1_FIFO writes (the EE-side `processVIF1Data`; its MSCAL
+    still runs on the worker, as a blocking call); `submitGifPacket`/`processGIFPacket` from the EE; the public
+    `processPendingTransfers()` (HLE stubs, VIF0). D1/D2 CHCR and D_STAT reads only apply finished work, they do not
+    wait. GS frame boundary: the scheduler used to call the host `vsync` hook at each guest vblank. Now the kz hook does
+    its EE-side work (guest patches, timing) inline, and sends its GS half (`kzgsVsync`, with the private-register
+    snapshot taken on the EE thread) through `ps2RunAfterQueuedGif`: it runs on the worker behind the frame's packets,
+    and the EE does not wait (`PS2HostGs::vsyncOrdered`; without it the scheduler waits for the worker at every vblank).
+    SIGNAL/FINISH/LABEL packets still reach the built-in GS through the arbiter (`packetWritesGsEvent`), on the worker;
+    they set CSR with atomics that the EE polls.
+  - **Worker thread.** MXCSR copied from the game thread (FTZ/DAZ); above-normal priority and no EcoQoS throttling
+    (`ps2_vif1_worker_win.cpp`); `PS2X_VIF1_CORES=perf` also restricts it to the P-cores of a hybrid CPU (off by default:
+    no measurable difference on the i9-12900K). It spins ~100 us for the next job before sleeping: loading screens start
+    a GIF DMA only after the previous one reads idle (hundreds per second), so job latency matters there.
+  - **kzvu split (main repo).** VU0 micro mode stays on the EE thread, so microVU0 and microVU1 now run concurrently.
+    VU1 code reads and writes VU0's VPU_STAT and FBRST words, and both VUs do unlocked read-modify-writes on them.
+    `kzvuBindVu1Thread()` (called by the worker through `PS2HostVu1::bindWorkerThread`) makes `VU0` (PCSX2's
+    `static VURegs& VU0`) a per-thread pointer in the kzvu sources: the VU1 thread gets a private VPU_STAT/FBRST (the
+    JIT embeds the address at compile time on the compiling thread, so microVU1 code compiled there uses it), and
+    FBRST / pending-IRQ / host-FPCR state is thread-local. This does what the THREAD_VU1 special cases in PCSX2 do (skip
+    those writes for VU1). VU1 must stay on one thread once code was compiled.
+  - **Render-feeding costs on the EE thread** (measured with `PS2X_VIF1_STATS=1`, same binary, env A/B):
+    the DMA chain walk + snapshot was 6.2-6.7 % of the EE thread (fresh 3 MB vector per frame, grown by `insert` per tag,
+    freed on another thread: page faults and copies). Chain buffers now come from a pool (`ps2ChainBuffer*`) sized by
+    the previous chain of the channel: 1.8-2.0 % (`PS2X_CHAIN_POOL=0` = old behaviour). `vif1UnpackPcsx2` had 5.0 % of
+    the EE thread in synchronous mode (16 % of the worker's busy time threaded): plain UNPACK (no mask, STMOD 0,
+    WL <= CL: masked UNPACKs are ~13 % of Killzone's ~8700 per frame) now does one SSE load/convert/store per vector, 1.0 %
+    (`PS2X_VIF_UNPACK_FAST=0` = old loop; `PS2X_VIF_UNPACK_CHECK=n` runs every n-th UNPACK both ways and compares VU1 memory
+    and VIF registers: 5.8 M UNPACKs over a boot + gameplay run, 0 differences). An MPG that does not change VU1 code
+    memory no longer bumps the code generation (`PS2X_MPG_SKIP_SAME=0` = old); only ~5 % of Killzone's ~3500 uploads
+    per second are identical, the rest alternate between programs.
+  - **microVU1 recompiles** (`KZ_VU_STATS=1`, every 10 s: MSCAL calls, calls that emitted code and how much, cache
+    resets, new programs; `KZ_VU_STATS_DIFF=n` logs the first differing micro-memory word of the first n new programs).
+    Cause of the compile time seen in gameplay profiles: microVU keeps one program list per MSCAL start PC and
+    Killzone's skinning/lighting programs are entered at ~540 different start PCs (entry addresses 0x30 bytes apart,
+    which looks like an unrolled loop entered `6*n` instructions before its end), times several microcode versions: ~3700 programs / 22 MB of JIT in the first 100 s of
+    the first level (new programs per 10 s: hundreds while new content appears, 15-60 in between; 0 cache
+    resets in 235 s, 22 of 61 MB used). No program was created for content identical to a cached one: the 411 logged
+    creations that had an older program for the same PC all differ in the compiled ranges. So it is first-use compile
+    cost, not recompilation, and it is off the EE thread now (worker: `mVUcompileJIT<1>` ~4 % of a core in that window).
+    Unresolved: a long session may fill the 61 MB cache (microVU resets and recompiles everything).
+  - **Switches / debug.** `PS2X_VIF1_THREAD=0` (synchronous), `PS2X_VIF1_STATS=1` (`[vif1-thread]` line every 10 s: jobs,
+    bytes, MPGs (same), EE chain-walk time, EE dispatch time, worker busy time split into VU1 and host-GS hook,
+    barriers per reason with wait counts), `PS2X_VIF1_VSYNC_SYNC=1` (wait for the worker at every vblank),
+    `PS2X_VIF1_CORES=perf`, `PS2X_VIF1_DELAY_US=n` (busy-wait before every job: slow-worker stress test),
+    `KZ_GS_HASH=1` (per-vsync packet count + FNV hash of the GIF stream), `KZ_PROFILE_OUT=<file>`, and the A/B switches above.
+  - **Known limits.** Guest FBRST (VU1 D/T-stop enables) is sampled once per vblank, and the D/T stop bits of VPU_STAT
+    are not propagated to the guest in threaded mode (Killzone never enables them). VU0 microcode that reads VU1
+    registers through VU0 memory (0x4000+) is not synchronised with the worker (none of the 103 captured Killzone VU0
+    calls touches them). GIF/VIF1 completion interrupts now arrive ~1-15 ms after the CHCR store instead of inside it.

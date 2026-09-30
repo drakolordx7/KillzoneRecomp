@@ -169,3 +169,91 @@ The ELF is stripped, so Sony library functions are identified by `ps2_analyzer`'
   it. From code reading, PFILE_R's close path (FUN_00001278, RPC 0x210) polls with DelayThread while a file has
   running requests. DelayThread outside a thread still returns at once. In traced boots it ran outside a thread only
   once per boot, from USBD at start, never from PFILE_R.
+
+## VIF1 worker thread (2026-09-29, patch 0016)
+
+VIF1 DMA, VU1 (microVU1), XGKICK and the GIF arbiter run on a worker thread. The design and every EE <-> worker interaction
+point are in patches/README.md (0016). This section has the measurements.
+
+**Method.** The `tools/scripts/run_headless.ps1` scene (`KZ_FPS=60`, `KZ_IPU=off`, the task's `KZ_INPUT_SCRIPT`), 235 s;
+in-game rate = increase of the heartbeat's `vif=` counter per second between t=170 s and t=230 s. The scene is not
+deterministic (tutorial events fire on wall-clock time), so single runs of one configuration differ by about +-10 %. The
+machine load of every run was logged once a second (`work/<run>/load.csv`: total CPU %, `cl.exe` and `killzone*`
+process counts). No other game instance or compile ran during any run listed below; the background CPU load (other
+agents' python/ghidra/steam processes, not game instances) was 32-50 %, higher for the runs marked `*` (> 40 %), which
+read low. "Before" = `build/vifth_base`, the synchronous build from just before this change (same tree otherwise,
+including the IOP thread code, which is selectable with `PS2X_IOP_THREAD` in both).
+
+| VIF1/VU1/GIF | IOP thread on (default): frames/s | IOP thread off (`PS2X_IOP_THREAD=0`): frames/s |
+|---|---|---|
+| synchronous, before this change | 31.3, 24.4* | 23.9*, 15.9* |
+| synchronous, this change (`PS2X_VIF1_THREAD=0`) | 32.0, 30.7* | 27.9, 29.9 |
+| threaded (default) | 46.0, 44.9 | 33.4*, 34.2 |
+
+More clean runs of the final code, before the IOP switch was set explicitly (IOP thread state as the tree had it at the
+time): threaded 43.9, 45.4, 50.8, 48.0 (worker not pinned to P-cores), 44.4 (vblank waits for the worker); synchronous
+before the change 32.8, 33.1, 28.8. Threaded is about 1.45x the synchronous path of the same build and 1.5x the old
+build (IOP thread on); the synchronous fallback is not slower than the old code.
+
+**What the worker costs** (`PS2X_VIF1_STATS=1`, gameplay, ~45 frames/s): the worker is busy 23-60 % of a core (VU1 ~80 %
+of that, including XGKICK; the host-GS hook ~10 %). The EE thread pays ~1.9 % for the chain walk and snapshot copy
+(~900 MB of chains per 10 s), <0.1 % for dispatch, and barriers wait < 60 ms per 10 s in total (the one VIF1 register
+write per job found the worker idle in more than 98 % of the cases). The guest vblank never waits for the worker. A job
+takes about 10 ms on the worker on average, so a D1 completion interrupt arrives that long after the CHCR store instead of inside it.
+
+**Things that did not matter.** Waiting for the worker at every vblank (`PS2X_VIF1_VSYNC_SYNC=1`) instead of ordering
+the GS half of the vsync behind the worker's queue: 44.4 vs 43.9-50.8 (the ordered form is the default: it costs
+nothing and never stalls the EE). Restricting the worker to P-cores on the i9-12900K (`PS2X_VIF1_CORES=perf`): 43.9 with,
+48.0 without; off by default. An early threaded run measured 20 frames/s; it overlapped a full rebuild by another agent
+(12 `cl.exe`) and is not comparable.
+
+**Checks.** 6 + 6 boots of 50 s (`dma=` advanced in every 10 s interval, exit code 0), more than 10 full 235 s threaded
+gameplay runs, 60 s boots with `KZ_VU=interp` (PCSX2's interpreter on the worker) and `KZ_VU=builtin` (falls back to synchronous, as designed), stress runs
+with a slow worker (`PS2X_VIF1_DELAY_US=700`: gameplay reached, frames intact; 4000 us busy-waits stretched the loading screen
+because the game waits for each GIF DMA to go idle before starting the next), kzvu_test 575 checks and kzvu0_test 303
+checks (0 failures, both after the VU0/VU1 split), kzvu_linkcheck_ab/ba link. Rendering compared with the old build at
+the same timestamps (menus t=10-130, weapon/HUD/level/explosions t=140-230): same screens, same artifacts (the
+banded highlight bars in the profile and character menus are in the old build too), no flicker, missing geometry or
+corruption. The GIF stream cannot be compared byte for byte across runs (the game is not deterministic): with
+`KZ_GS_HASH=1`, 493 menu frames have byte-identical packet streams in a synchronous and a threaded run, the others are
+animation frames that differ between any two runs; packets per frame have the same distribution, but threaded runs had more
+empty vsyncs (390 of 4500 vs 90) and more vsyncs with two chains (147 vs 58): the game's kicks fall differently between
+the vblanks when the completion interrupt is late.
+
+**VU1 recompiles** (asked for: `mVUcompileJIT<1>` ~6 % in steady-state gameplay). `KZ_VU_STATS=1`, threaded, first level,
+per 10 s:
+
+| t (s) | 100 | 120 | 130 | 140 | 150 | 160 | 170 | 180 | 190 | 200 | 210 | 220 | 230 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| MSCAL (k) | 45 | 41 | 176 | 178 | 353 | 412 | 441 | 406 | 410 | 327 | 375 | 240 | 71 |
+| MSCALs that emitted JIT code | 1 | 0 | 38 | 203 | 230 | 166 | 121 | 70 | 47 | 19 | 19 | 293 | 128 |
+| JIT emitted (KB) | 13 | 0 | 1408 | 5358 | 3857 | 2372 | 1720 | 706 | 445 | 125 | 216 | 5014 | 981 |
+| new microPrograms | 3 | 0 | 311 | 1080 | 535 | 289 | 219 | 74 | 57 | 16 | 21 | 607 | 164 |
+| MPG code-generation changes (k) | 0 | 0 | 9.1 | 13.1 | 29.6 | 35.7 | 36.2 | 32.7 | 32.8 | 28.1 | 31.3 | 23.3 | 4.7 |
+
+Cache resets: 0 in 235 s (22 of 61 MB used, 3700 programs). Cause: microVU keeps one program list per MSCAL start PC,
+and Killzone enters its skinning/lighting programs at ~540 different start PCs (entry addresses 0x30 bytes apart, which looks like an
+unrolled loop entered `6*n` instructions before its end), times several microcode versions. Every (start PC, code) pair is
+compiled once, on first use, from scratch, so the cost comes in bursts whenever new content appears (level start at
+t=130-160, new effects at t=220) and is near zero in between (19 compile events in a whole 10 s at t=200). It is not repeated
+compilation: of 951 new programs logged with the first differing micro-memory word, 540 were the first program for their
+start PC and the other 411 all differ from the older program for the same PC inside its compiled ranges (different microcode
+uploaded to the same addresses); none matched a cached program's content. The ~3300 MPG uploads per second do force
+a program search per start PC after each change, which is cheap (`recMicroVU1::Clear` 0.2-0.7 % of the worker's busy
+time, the search itself is inlined into `mVUexecute<1>`, 1 %); only ~5 % of the uploads are byte-identical to the code already in VU1 memory (those no longer invalidate
+anything; `PS2X_MPG_SKIP_SAME=0` restores the old behaviour). With the worker, the compile bursts are off the EE thread
+(`mVUcompileJIT<1>` ~4 % of a core in the profile window). Not fixed: a long session may fill the 61 MB cache, and
+microVU then resets and recompiles everything (not seen yet); sharing compiled blocks between start PCs would need a change
+inside microVU.
+
+**Render-feeding costs on the EE thread, before -> after** (asked for: vector insert ~7 %, `vif1UnpackPcsx2` ~6 %):
+- DMA chain walk + snapshot (`std::vector::insert` per tag into a fresh ~3 MB buffer per frame, freed on another thread):
+  measured with `PS2X_VIF1_STATS=1` in the same binary, `PS2X_CHAIN_POOL=0` vs default, ~800-900 MB of chains per 10 s:
+  616-671 ms per 10 s (6.2-6.7 % of the EE thread) -> 181-202 ms (1.8-2.0 %). Most of the old cost was page faults and
+  reallocation copies, not visible as `_Insert_counted_range` self time (0.2 % in the profile); with the pool the worker's
+  `NtFreeVirtualMemory` (0.4 %) is gone too.
+- `vif1UnpackPcsx2` (`KZ_PROFILE=190,30`, share of the thread's wall time): synchronous EE thread 5.0 % -> 1.0 %; threaded worker
+  4.9 % of a core (16 % of its busy time) -> 0.9 % (2.6 % of busy). Plain UNPACK (no mask, STMOD 0, WL <= CL) takes one SSE
+  load/convert/store per vector; masked UNPACKs are 13 % of Killzone's ~8700 per frame. `PS2X_VIF_UNPACK_CHECK=4` ran every
+  4th UNPACK of a boot + gameplay run both ways (5.8 M checked): 0 differences in VU1 memory and VIF registers.
+- Heap traffic on the EE thread (`RtlAllocateHeap` 2.5-3.2 %, `RtlFreeHeap` 1.4-1.5 %) is not from these buffers; unchanged.
