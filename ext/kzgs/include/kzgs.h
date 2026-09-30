@@ -60,6 +60,14 @@ struct KzgsConfig
 	KzgsAspect aspect = KzgsAspect::Ratio4_3;
 	bool vsync = true;
 	bool bilinearPresent = true;                       // smooth scaling of the final image to the window
+	// Presentation crop in native (1x) output pixels: left, top, right, bottom. Applies to the displayed image and to
+	// kzgsReadback only, not to GS rendering. Hides the edge pixels PCSX2 shows that a CRT's overscan would hide.
+	int crop[4] = {0, 0, 0, 0};
+	// PCSX2 builds sprites and lines in the vertex shader (DisableVertexShaderExpand=false). On NVIDIA under D3D11 this
+	// intermittently corrupts frames (measured in docs/findings.md); D3D12 and Vulkan do not show it.
+	bool vertexShaderExpand = true;
+	bool pcrtcAntiBlur = true;                         // PCSX2 "Anti-Blur" (PCRTCAntiBlur): merges near-identical display circuits
+	int interlaceMode = 0;                             // PCSX2 GSInterlaceMode: 0 Automatic, 1 Off, 2/3 Weave TFF/BFF, 4/5 Bob, 6/7 Blend, 8/9 Adaptive
 
 	// Killzone GameIndex gsHWFixes (SCUS-97402 / SCES-52004 / SCES-52893).
 	int halfPixelOffset = 4;                           // GSHalfPixelOffset: 0 Off .. 4 Native, 5 Native+TexOffset
@@ -125,7 +133,9 @@ void kzgsSync();
 
 // Reads back the last output frame (display circuits merged, before scaling to the window), at internal resolution:
 // e.g. 640x448 at upscale 1, 1280x896 at upscale 2. RGBA8, top-down, w*h*4 bytes. Blocks (drains the queue first).
-bool kzgsReadback(std::vector<uint8_t>& rgba, int& width, int& height);
+// With presentWidth/presentHeight > 0 the image is instead scaled and aspect-corrected the way it is presented in a
+// window of that size (letterboxed with black to exactly presentWidth x presentHeight).
+bool kzgsReadback(std::vector<uint8_t>& rgba, int& width, int& height, int presentWidth = 0, int presentHeight = 0);
 
 // Optional sink for GS log lines (device info, warnings, errors). Called from the GS thread. nullptr = OutputDebugString.
 using KzgsLogFn = void (*)(int level /*0 error, 1 warning, 2 info*/, const char* msg);
