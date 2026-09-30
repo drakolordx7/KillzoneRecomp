@@ -102,6 +102,21 @@ namespace
         case KzAspect::Stretch: k.aspect = KzgsAspect::Stretch; break;
         }
         k.vsync = c.vsync;
+        // The game's GameIndex setting (halfPixelOffset=Native) leaves the top/left half native pixel of an upscaled frame
+        // unwritten, so it shows stale VRAM as a dotted line (docs/findings.md, "Display edge artifacts"). The picture
+        // starts 2 lines below the top edge (DISPLAY.DY), so the rim is on merged line 2 and column 0. Crop 4 columns
+        // each side and 3/4 lines top/bottom: 8:7 in total, the 512:448 aspect, so the presented picture keeps its
+        // shape and no letterbox row appears. KZ_CROP=l,t,r,b overrides (KZ_CROP=0,0,0,0 shows the uncropped frame).
+        k.crop[0] = 4;
+        k.crop[1] = 3;
+        k.crop[2] = 4;
+        k.crop[3] = 4;
+        if (const char *cr = std::getenv("KZ_CROP"))
+            std::sscanf(cr, "%d,%d,%d,%d", &k.crop[0], &k.crop[1], &k.crop[2], &k.crop[3]);
+        // PCSX2's vertex-shader sprite expansion corrupts frames on NVIDIA under D3D11; the CPU path costs nothing measurable.
+        k.vertexShaderExpand = k.renderer != KzgsRenderer::D3D11;
+        if (const char *ve = std::getenv("KZ_VS_EXPAND")) // automation: force 0/1
+            k.vertexShaderExpand = std::atoi(ve) != 0;
         static const std::string gpu = kzPreferredGpuName();
         k.adapter = gpu;
         return k;
