@@ -500,30 +500,34 @@ absolute frame rates are 56-64 and only concurrent pairs compare.
   standalone blocks are folded into their functions (82 652 -> 20 745 functions/files, `killzone.exe` 102.2 -> 74.1 MB,
   compile CPU 6 864 -> 3 543 s); the function table maps every old block address to the owning function, whose resume switch has
   a case for it; the switch is skipped when a call enters at the function start.
-- **fps and EE ms/frame** (concurrent pairs, `PS2X_SCHED_STATS=1`, EE ms/frame = (1000 ms - pacing sleep) / fps as in
-  perf_metric.py; baseline = `build\RelWithDebInfo`, new = this patch):
+- **fps and EE ms/frame** (concurrent pairs of two build dirs made from the same runtime sources: `dsp0` = the generated code of
+  `generated/` before this patch, `dsp2` = after; `PS2X_SCHED_STATS=3` in both, EE ms/frame = (1000 ms - pacing sleep) / fps as in
+  perf_metric.py; the machine was quieter than for the counts, 70-75 fps):
 
-  | pair | fps base / new | EE ms/frame base / new | change |
+  | pair | fps before / after | EE ms/frame before / after | change |
   |---|---|---|---|
-  | 1 | 56.1 / 58.3 | 15.05 / 12.84 | -2.21 |
-  | 2 | 60.9 / 61.1 | 12.75 / 12.08 | -0.67 |
-  | 3 | 59.9 / 59.3 | 13.11 / 12.62 | -0.49 |
-  | 4 (sampling profiler on in both) | 62.5 / 63.9 | 12.27 / 11.14 | -1.13 |
+  | 1 | 73.6 / 73.8 | 10.38 / 10.06 | -0.32 |
+  | 2 | 75.1 / 73.8 | 9.85 / 9.56 | -0.29 |
+  | 3 | 71.6 / 71.8 | 10.83 / 10.24 | -0.59 |
+  | 4 | 69.8 / 70.0 | 11.45 / 11.14 | -0.31 |
 
-  Median of pairs 1-3: fps 59.9 -> 59.3 (no change: the frame list is kicked at a vblank, so 12-13 ms of EE work per frame is a
-  2-vblank frame at 120 Hz whatever the EE does; docs/findings.md "EE thread frame budget"), EE ms/frame 13.11 -> 12.62 (-5 %, mean
-  of pairs 1-3 -1.1 ms = -8 %). The profile of the EE thread (KZ_PROFILE=160,40) shows where it went: `EeScheduler::run` 6.1 % self
-  before, not in the top 28 after; total busy 72.3 % -> 67.9 % of the samples. What is left in that profile is spread thinly
-  (no guest function above ~1.2 %), plus the memory slow paths (`ps2CgWr32Slow`, `ps2CgRd32Slow`, `ps2CgWr128Slow`,
-  `PS2Runtime::Load32/Store32`, `writeIORegister`: 4.7 % before, 6.4 % after, self time; addresses outside the 32 MB RAM window) and `kzvu0Call`/`Vu0Execute`
-  (~3 %). Getting under the 8.33 ms vblank period needs the guest code itself to get ~35 % cheaper and the VIF1 worker to fit
-  as well; dispatch removal alone is worth 0.5-1 ms per frame here.
+  Median fps 72.6 -> 72.8 (no change: the frame list is kicked at a vblank, so the frame rate only moves when a frame crosses a
+  vblank boundary; docs/findings.md "EE thread frame budget"), EE ms/frame median -0.31 ms, mean -0.38 ms (-3 %). Profile of the EE
+  thread without stats (KZ_PROFILE=160,40, one pair of runs): `EeScheduler::run` self 3.6 % -> 0.1 %. What is left in the profile is
+  spread thinly (no guest function above ~1.2 %) plus the memory paths outside the RAM window (`ps2CgWr32Slow`, `ps2CgRd32Slow`,
+  `ps2CgWr128Slow`, `PS2Runtime::Load32/Store32`, `writeIORegister`, ~5-6 % of the samples; patch 0020 works on those) and `kzvu0Call` /
+  `Vu0Execute` / `mVUexecute<0>` (~5 %). 30 % of the EE thread's samples in the earlier profile were the vblank pacing sleep.
+  Not used: a first set of pairs against `build\RelWithDebInfo` with `PS2X_SCHED_STATS=1` showed -0.67 ms median; that binary predates
+  patches 0020 and 0021 and `=1` costs ~40 ns per dispatch (host clock read + rdtsc), ~4.5 % of the EE thread in the baseline's
+  profile (`RtlQueryPerformanceCounter` 2.9 %, `schedStatsReport` 1.5 %) and nothing in the new build, so it flattered the patch.
+  `PS2X_SCHED_STATS=3` (pacing sleep only) exists for this reason. Getting under the 8.33 ms vblank period needs the guest code
+  itself to get ~20-25 % cheaper (EE 10-11 ms here) and the VIF1 worker to fit as well; dispatch removal is worth 0.3-0.6 ms.
 - **Correctness evidence.**
   - `PS2X_CODEGEN_DSP=0 PS2X_CODEGEN_FOLD=0` regenerates the patch-0017 output byte for byte (82 652 files, 0 differences).
   - `tools/scripts/verify_resume_table.py` on the folded tree: 144 623 table entries, the same addresses as before (0 lost, 0 new), 123 881
     of them inside a function that starts elsewhere, every one has a resume `case` in that function, no `goto` without its label.
     (A first version lost 58 code-pointer entries that had been registered under removed blocks; found by diffing the tables.)
-  - Headless gameplay runs of the final build (hist runs and 3 pairs): menu -> profile -> level -> difficulty -> character -> mission,
+  - Headless gameplay runs of the final build (one `=2` run, 7 runs of the pairs, 2 profiled runs): menu -> profile -> level -> difficulty -> character -> mission,
     HUD, weapon, explosions, mission-failed screen at the end, in the same order and looking like the baseline (frames compared side by
     side: work/dsp_c_hist vs work/dsp_b0_hist); no `guest-branch` / `sched-trace` / `[error]` line in any run, `missing tail targets=0`
     in all 23 windows of every run.
