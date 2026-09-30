@@ -425,3 +425,49 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
     budget"): fixed-cost trimming on the EE thread does not move fps by itself. The ~1 M dispatches/s come from tail jumps
     between `entry_*` fragments and the resume of every caller after a non-local unwind; a trampoline in
     `ps2CgAfterCallSlow` (ps2_cg.h, full rebuild) would remove most of them.
+
+- `0021-iop-rpc-offload.patch` (runtime + IOP; no header that generated code includes, so no full rebuild): nowait SIF RPC calls
+  to emulated IOP servers run on the IOP thread instead of inline on the EE thread (`PS2X_IOP_RPC_ASYNC`, default 1; `=0`
+  restores the inline path; only with the IOP thread of patch 0015).
+  - **Why.** Measured with the new `PS2X_IOP_RPC_STATS=1` (a `[iop-rpc]` table every 10 s: calls, wall time waiting for the IOP
+    lock, wall time running the server function, IOP instructions, per sid / function / nowait / end function), headless gameplay
+    scene at 120 Hz vblank, 235 s, before this patch: 40 k RPCs per run, all but 32 of them nowait, and one of them is the cost.
+    `sid 0x06662012 fn 0x600` (the sound driver's per-vblank command list, no end function, 16-64 byte send buffer, ~64 calls/s in
+    gameplay, ~130/s in the menus) takes 0.95-1.06 ms wall and ~46 k IOP instructions per call (that count includes the other IOP
+    threads that run while the server function waits on a semaphore or event flag, patches 0006/0013): 3.4 s per 50 s of gameplay =
+    6.8 % of the EE thread's wall time (`SifCallRpc` as a whole 7.5 %, 627 us per call). PFILE_R (`sid 0x66662012`) fn 0x400
+    (same rate, ~11 us) and fn 0x320 (623 per run, ~16 us) are cheap. Blocking calls: 32 per run, ~7 ms in total, so they stay
+    inline. Lock wait was not the cost (67 ms of 21.6 s): it is interpretation, including the SPU2 register hooks.
+  - **How.** `SifCallRpc` (RPC.cpp) still decodes the call and fills the client/server structures on the EE thread. For a
+    nowait call, `ps2IopRpcSubmit` (`ps2_iop_async.h`, implemented in ps2_iop_host.cpp) asks `IopSubsystem::canOffloadRpc(sid)`
+    (an emulated server is registered for the sid: cached per sid, positive answers only, cleared by every module operation and
+    reset), queues an `IopSubsystem::AsyncRpc` with a snapshot of the send buffer (the SIF DMA of the real thing) and returns 0 at
+    once. The IOP thread runs the queue in FIFO order between its time slices, holding the IOP lock and outside any IOP thread
+    (the environment of the inline path, so the semaphore waits of patch 0013 and the event-flag waits of patch 0006 work
+    unchanged), calls `IopRpcBridge::handleRpc` with the snapshot (the reply goes straight into the EE receive buffer, like a
+    SIF DMA), and posts the completion to the EE through the posted-work queue of patch 0015 (`PS2IopHostAdapter::postWork`,
+    ordered with the IOP's SIF commands). On the EE thread `finishOffloadedRpc` does what the inline path did after `handleRpc`,
+    in the same order: completion-semaphore signals, reply fix-ups, the client's busy flag (`sceSifCheckStatRpc` reports busy
+    until then, as on hardware), the debug event, and the end function, which now runs as a queued interrupt-time invocation
+    (`RpcCallback`, caller's gp) instead of inside `sceSifCallRpc`.
+  - **Ordering.** A blocking `handleRpc`, `reset` and the module operations first run everything queued before them under the
+    IOP lock, so calls stay in order. Calls to HLE-only servers (mcserv, dbcman, HLE libsd: they use EE-thread state) and
+    blocking calls take the old path.
+  - **Also.** `IopSubsystem::selectRpcAbi` (runs on every `SifCallRpc`) took the IOP lock; with a 1 ms server function on the
+    IOP thread every EE call waited for it (1 233 waits > 1 ms, 3.2 s of EE wait in one run). It only reads the constant service
+    list and which HLE modules are loaded (changed only on the EE thread), so it takes no lock now (EE-side lock acquisitions
+    per run: 80 k -> 75).
+  - **Measured** (headless, 120 Hz vblank, scripted input, 235 s; the machine ran 4-12 other game instances at 50-85 % CPU
+    load, so absolute frame rates were 35-65 and only runs made at the same time compare; docs/findings.md "IOP RPC offload"):
+    EE-thread time in `SifCallRpc` 24.9 s -> 0.32 s per 235 s (avg 621 us -> 8 us per call). CPU per frame, offload vs
+    `=0` on two copies of one binary run at the same time, 4 pairs: EE thread -0.5 / -1.7 / +0.1 / -2.1 ms (mean -1.0, noise
+    ~1 ms), IOP thread +1.1 / +0.9 / +1.3 / +0.9 ms; frame rate unchanged within noise (~60 fps is vblank-quantised at 120 Hz).
+    Offloaded calls wait 0.7 ms on average in the queue. IOP thread busy 7-10 % -> 17-19 % of wall.
+  - **Checks.** 35 headless boots of 50-60 s (12 with the flag set, 12 default, 8 at 120 Hz, 3 with movies on): `dma=` advanced in
+    every 5 s interval of every boot, no `TIMED OUT`; more than 20 full 235 s gameplay runs. SPU2 WAV (`KZ_AUDIO_WAV`),
+    baseline vs offload: silent until t=20 s, then menu-music RMS/peak equal within 0.1-0.7 dB and waveform correlation
+    0.997-1.000 per 10 s segment (a constant offset per run pair); the gameplay segments differ between offload and baseline
+    exactly as two baseline runs do (scene timing); overall RMS -14.8 / -14.6 / -14.8 / -14.8 dBFS (2 baseline, 2 offload runs),
+    2 silent gaps > 20 ms inside sound in all four, `kz_audio` underruns 0. Movies play. The four `ps2xIOP` test executables pass.
+  - **Debug.** `PS2X_IOP_RPC_STATS=1` (the table, plus the EE-side `SifCallRpc` totals, calls on a still-busy client and the queue
+    latency of offloaded calls), `PS2X_IOP_RPC_ASYNC=0`.
