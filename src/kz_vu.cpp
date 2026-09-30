@@ -28,7 +28,8 @@ namespace
 
     void onXgkick(void *, const uint8_t *packet, uint32_t bytes, uint32_t)
     {
-        if (ps2DmaStatsEnabled())
+        static const bool dmaStats = ps2DmaStatsEnabled();
+        if (dmaStats)
         {
             PS2DmaStats &st = ps2DmaStats();
             st.vu1Xgkick.fetch_add(1, std::memory_order_relaxed);
@@ -56,6 +57,8 @@ namespace
         uint64_t calls = 0, emitting = 0, bytes = 0, resets = 0, created = 0, generations = 0, sameContentMpg = 0;
         uint64_t lastCode = 0;
         uint32_t lastCreated = 0;
+        uint64_t lastCmpCalls = 0, lastCmpBytes = 0, lastCmpCycles = 0; // KZVU_SEARCH_STATS builds only
+        uint64_t lastMemo[6] = {}, lastMemoCycles = 0;
         std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
         std::chrono::steady_clock::time_point start = last;
     };
@@ -72,24 +75,25 @@ namespace
     void vu1StatsSample(uint32_t startPc)
     {
         Vu1Stats &s = g_vu1Stats;
-        KzvuVu1CodeStats st;
-        kzvuVu1CodeStats(&st);
+        uint64_t codeBytes = 0;
+        uint32_t programsCreated = 0;
+        kzvuVu1CodeCounters(&codeBytes, &programsCreated); // cheap; the full walk of the program lists is only done when printing
         ++s.calls;
-        if (st.codeBytes > s.lastCode)
+        if (codeBytes > s.lastCode)
         {
             ++s.emitting;
-            s.bytes += st.codeBytes - s.lastCode;
+            s.bytes += codeBytes - s.lastCode;
         }
-        else if (st.codeBytes < s.lastCode)
+        else if (codeBytes < s.lastCode)
         {
             ++s.resets;
-            s.bytes += st.codeBytes;
+            s.bytes += codeBytes;
         }
-        s.lastCode = st.codeBytes;
-        if (st.programsCreated != s.lastCreated)
+        s.lastCode = codeBytes;
+        if (programsCreated != s.lastCreated)
         {
-            const bool reset = st.programsCreated < s.lastCreated;
-            s.created += reset ? st.programsCreated : st.programsCreated - s.lastCreated;
+            const bool reset = programsCreated < s.lastCreated;
+            s.created += reset ? programsCreated : programsCreated - s.lastCreated;
             if (!reset && s.diffBudget > 0 && startPc != 0xFFFFFFFFu)
             {
                 --s.diffBudget;
@@ -102,16 +106,38 @@ namespace
                     std::fprintf(stderr, "[kz] VU1 new microProgram start=0x%03x (first program for this pc)\n", startPc);
             }
         }
-        s.lastCreated = st.programsCreated;
+        s.lastCreated = programsCreated;
         const auto now = std::chrono::steady_clock::now();
         if (now - s.last >= std::chrono::seconds(10))
         {
+            KzvuVu1CodeStats st;
+            kzvuVu1CodeStats(&st);
             std::fprintf(stderr,
                          "[kz] VU1 t=%.0fs mscal=%llu emitted-code-in=%llu (%.1f KB) resets=%llu new-programs=%llu cached=%u code=%.1f/%.0f MB mpg-generations=%llu\n",
                          std::chrono::duration<double>(now - s.start).count(), static_cast<unsigned long long>(s.calls),
                          static_cast<unsigned long long>(s.emitting), s.bytes / 1024.0, static_cast<unsigned long long>(s.resets),
                          static_cast<unsigned long long>(s.created), st.programsCached, st.codeBytes / 1048576.0,
                          st.cacheBytes / 1048576.0, static_cast<unsigned long long>(s.generations));
+            if (st.cmpCalls != 0)
+            {
+                std::fprintf(stderr, "[kz] VU1 program search: memcmp calls=%llu bytes=%.1f MB tsc=%.1f Mcycles\n",
+                             static_cast<unsigned long long>(st.cmpCalls - s.lastCmpCalls), (st.cmpBytes - s.lastCmpBytes) / 1048576.0,
+                             (st.cmpCycles - s.lastCmpCycles) / 1e6);
+                s.lastCmpCalls = st.cmpCalls;
+                s.lastCmpBytes = st.cmpBytes;
+                s.lastCmpCycles = st.cmpCycles;
+            }
+            {
+                const uint64_t cur[6] = {st.memoSwitches, st.memoHits, st.memoStale, st.memoNew, st.memoRestored, st.memoVerifyBad};
+                std::fprintf(stderr,
+                             "[kz] VU1 state memo: code changes=%llu table restored=%llu stale=%llu new-state=%llu entries-restored=%llu states=%llu verify-bad=%llu cost=%.1f Mcycles\n",
+                             static_cast<unsigned long long>(cur[0] - s.lastMemo[0]), static_cast<unsigned long long>(cur[1] - s.lastMemo[1]),
+                             static_cast<unsigned long long>(cur[2] - s.lastMemo[2]), static_cast<unsigned long long>(cur[3] - s.lastMemo[3]),
+                             static_cast<unsigned long long>(cur[4] - s.lastMemo[4]), static_cast<unsigned long long>(st.memoStates),
+                             static_cast<unsigned long long>(cur[5]), (st.memoCycles - s.lastMemoCycles) / 1e6);
+                s.lastMemoCycles = st.memoCycles;
+                std::memcpy(s.lastMemo, cur, sizeof(cur));
+            }
             s.calls = s.emitting = s.bytes = s.resets = s.created = s.generations = 0;
             s.last = now;
         }

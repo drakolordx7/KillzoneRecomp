@@ -153,6 +153,12 @@ MXCSR handling:
 The callback receives one complete GIF packet per call: every tag up to and including the one with EOP. It is called
 synchronously, from inside `kzvuExecute`/`kzvuContinue`.
 
+When no partial packet is buffered, the tags of an XGKICK transfer are walked where they are and the callback gets a
+pointer straight into VU1 data memory (no copy through kzvu's buffer; only the unfinished tail of a transfer, e.g. the
+first half of a packet that wraps VU memory, is buffered). `KZVU_XGKICK_INPLACE=0` restores the copy;
+`KZVU_XGKICK_CHECK=1` walks every in-place transfer a second time with `Gif_Tag` and compares packet boundaries and the
+tail (23 M Killzone XGKICK transfers: 0 differences).
+
 - A packet that wraps past qword 0x3FF is delivered already unwrapped into one contiguous buffer.
 - `startQw` is the VU1 data address the packet was read from.
 - The buffer is only valid during the call.
@@ -192,6 +198,22 @@ from.
   never recompiles.
 - A write to `kzvuCodeMem()` that is not announced is not seen by the JIT: it keeps running the cached code. The test
   checks this.
+
+**Code-state memo** (`kzvuVu1CodeChanged`, `shim/unity/KzvuMicroVU.cpp`; `KZVU_STATE_MEMO=0` = microVU's own
+invalidation). `kzvuMicroWritten`/`kzvuWriteMicro` used to call microVU1's `Clear`, which forgets its whole
+current-program table (`prog.quick`), so every program entry afterwards (an MSCAL, and every JR/JALR, which microVU
+treats as a new program start) searches its program list again: for each candidate program it compares every range it was
+compiled from with micro memory. Killzone changes VU1 microcode ~4000 times a second between a few thousand distinct
+contents, and that search was 15 M `memcmp` calls per second (17 bytes on average, ~270 TSC cycles each: cache misses on
+the candidates' copies of the code), ~10-15 % of the VU1 thread; it is not recompilation. The memo keeps, per 16 KB micro
+memory content (128-bit key), the table that was in use for it: when the code changes, the entries of the table in use are
+saved under the outgoing content, and if the incoming content was seen before its saved entries are put back (they are
+the programs the search would have found). Saved entries are only reused while nothing was compiled since (microVU's code
+pointer is unchanged: compiling can add ranges to a program), and everything is forgotten when microVU resets its cache,
+so the result is what the search would have produced. The rest of `mVUclear` (pipeline state cleared, `cleared` flag) is
+done as before. Measured: 15 M -> ~2 M `memcmp` calls per 10 s in gameplay (85-90 % of code changes find their table),
+memo cost ~450 M TSC cycles per 10 s. `KZVU_STATE_MEMO_VERIFY=1` keeps the contents and checks every saved and every
+restored entry with the same range comparison microVU uses (Killzone, 235 s: ~500 k code changes, ~10 M entries, 0 bad).
 
 The easiest hook for PS2Recomp:
 - In the MSCAL/MSCNT callback, compare `PS2Memory::getVU1CodeGeneration()` with the value seen last time.
@@ -297,13 +319,15 @@ The cases:
 | budget | the same final state from one call and from 64-cycle slices via `kzvuContinue` |
 | T bit | stop, VPU_STAT VTS1, interrupt, then MSCNT resume |
 | invalidation | announced and unannounced micro-memory writes; IbitHack immediates |
+| code-state memo | 600 alternations between three micro-memory contents with two entry points each: every run must execute its own content's program, A and B compile once (4 programs, 6 with C), most code changes restore a remembered table |
 | host state | MXCSR preserved and handed to the callback; shutdown and re-init |
 
 The integer loop decrements its counter right before `IBNE`. A branch reads the value from before that instruction,
 so the loop runs count + 1 times and ends with vi1 = -1. All three implementations model this quirk.
 
 Result:
-- RelWithDebInfo and Release both give 575 checks, 0 failures and exit code 0.
+- RelWithDebInfo gives 1776 checks (575 before the code-state memo test below), 0 failures and exit code 0; Release
+  was last run with the 575-check version.
 - There are 0 differences between the JIT and PS2Recomp on the checked programs.
 
 Two findings are printed as informational. Neither is a kzvu bug; both are PCSX2's own behaviour:

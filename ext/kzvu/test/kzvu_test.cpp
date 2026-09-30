@@ -1012,6 +1012,67 @@ int main(int argc, char** argv)
 		std::printf("    %s\n", g_failures == before ? "ok" : "FAILED");
 	}
 
+	// ---- code-state memo: contents that come back must run their own programs, without recompiling ------------------------
+	{
+		std::printf("[code-state memo: alternating micro-memory contents, two entry points]\n");
+		const int before = g_failures;
+		kzvuSetConfig(MakeConfig(true));
+		kzvuReset();
+		KzvuVu1CodeStats base{};
+		kzvuVu1CodeStats(&base); // the memo counters run on across tests: report the differences
+		// Entry 0 sets vf1.x = 1 (A) / vf2.x = 1 (B) / vf3.x = 1 (C); entry 0x18 does the same to vf4/vf5/vf6.
+		auto make = [](int reg0, int reg1) {
+			return Flatten({{NOPl, ADDbc(X, reg0, 0, 0, bcW)}, {NOPl, NOPu | Ebit}, {NOPl, NOPu},
+			                {NOPl, ADDbc(X, reg1, 0, 0, bcW)}, {NOPl, NOPu | Ebit}, {NOPl, NOPu}});
+		};
+		const std::vector<uint32_t> prog[3] = {make(1, 4), make(2, 5), make(3, 6)};
+		auto runEntry = [](uint32_t pc, int regA, int regB, int regC) {
+			const uint32_t zero[4] = {};
+			for (int r = 1; r <= 6; r++)
+				kzvuSetVF(r, zero);
+			kzvuExecute(pc, 1000);
+			std::string s;
+			for (int r : {regA, regB, regC})
+			{
+				uint32_t v[4];
+				kzvuGetVF(r, v);
+				s += v[0] == 0x3F800000u ? '1' : '0';
+			}
+			return s;
+		};
+		uint32_t rng = 12345;
+		int wrong = 0;
+		KzvuVu1CodeStats st0{}, st1{};
+		for (int i = 0; i < 600; i++)
+		{
+			rng = rng * 1664525u + 1013904223u;
+			// C only shows up late: its first compile happens between visits of the (already memoized) A and B states.
+			const int v = (i < 300) ? static_cast<int>((rng >> 16) & 1u) : static_cast<int>((rng >> 16) % 3u);
+			kzvuWriteMicro(0, prog[v].data(), static_cast<uint32_t>(prog[v].size() * 4));
+			const std::string e0 = runEntry(0, 1, 2, 3), e1 = runEntry(0x18, 4, 5, 6);
+			std::string want0 = "000", want1 = "000";
+			want0[v] = '1';
+			want1[v] = '1';
+			g_checks += 2;
+			if (e0 != want0 || e1 != want1)
+				++wrong;
+			if (i == 299)
+				kzvuVu1CodeStats(&st0);
+		}
+		kzvuVu1CodeStats(&st1);
+		if (wrong)
+			Fail(std::to_string(wrong) + " of 600 alternations ran the wrong program");
+		g_checks++;
+		// Steady state: A and B (2 versions x 2 entry points = 4 programs) are compiled once; C adds 2 more.
+		if (st0.programsCreated > 4 || st1.programsCreated > 6)
+			Fail("programs compiled: " + std::to_string(st0.programsCreated) + " after A/B, " + std::to_string(st1.programsCreated) + " after C");
+		std::printf("    600 alternations, wrong=%d, programs compiled %u (A/B) -> %u (with C), memo: %llu code changes, %llu tables restored, %llu stale, %llu new states\n",
+		            wrong, st0.programsCreated, st1.programsCreated, static_cast<unsigned long long>(st1.memoSwitches - base.memoSwitches),
+		            static_cast<unsigned long long>(st1.memoHits - base.memoHits), static_cast<unsigned long long>(st1.memoStale - base.memoStale),
+		            static_cast<unsigned long long>(st1.memoNew - base.memoNew));
+		std::printf("    %s\n", g_failures == before ? "ok" : "FAILED");
+	}
+
 	// ---- host MXCSR: kzvu must leave the caller's MXCSR alone and give it to the XGKICK callback ----------------------
 	{
 		std::printf("[host state: MXCSR, shutdown/re-init]\n");

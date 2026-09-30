@@ -1,0 +1,326 @@
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index d7b84c2..1ce1d1f 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -3,7 +3,10 @@
+ #include "../ps2_vif1_worker.h"
+ #include <algorithm>
+ #include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <functional>
+ 
+ namespace
+ {
+@@ -36,6 +39,19 @@ namespace
+                 nreg = 16u;
+             if (flg == 0u)
+             {
++                // Only A+D descriptors (0xE) can address SIGNAL/FINISH/LABEL: when none of the tag's NREG descriptor
++                // nibbles is 0xE the whole PACKED body is skipped without looking at it (nearly every XGKICK tag).
++                const uint64_t used = nreg >= 16u ? ~0ull : ((1ull << (4u * nreg)) - 1ull);
++                const uint64_t x = (hi ^ 0xEEEEEEEEEEEEEEEEull) | ~used; // a nibble is 0 where the descriptor is 0xE
++                const bool anyAd = (((x - 0x1111111111111111ull) & ~x & 0x8888888888888888ull) != 0ull);
++                if (!anyAd)
++                {
++                    const uint64_t body = static_cast<uint64_t>(nloop) * nreg;
++                    if (body > qwords - q)
++                        return false;
++                    q += static_cast<uint32_t>(body);
++                    continue;
++                }
+                 for (uint32_t l = 0; l < nloop; ++l)
+                     for (uint32_t r = 0; r < nreg; ++r, ++q)
+                     {
+@@ -56,6 +72,96 @@ namespace
+         }
+         return false;
+     }
++
++    // PS2X_GIF_SCAN_CHECK=1: compares the fast scan above with the plain loop for every packet.
++    bool packetWritesGsEventPlain(const uint8_t *data, uint32_t size)
++    {
++        const uint32_t qwords = size / 16u;
++        uint32_t q = 0;
++        while (q < qwords)
++        {
++            uint64_t lo, hi;
++            std::memcpy(&lo, data + q * 16u, 8);
++            std::memcpy(&hi, data + q * 16u + 8u, 8);
++            ++q;
++            const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu);
++            const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 3u);
++            uint32_t nreg = static_cast<uint32_t>((lo >> 60) & 0xFu);
++            if (nreg == 0u)
++                nreg = 16u;
++            if (flg == 0u)
++            {
++                for (uint32_t l = 0; l < nloop; ++l)
++                    for (uint32_t r = 0; r < nreg; ++r, ++q)
++                    {
++                        if (q >= qwords)
++                            return false;
++                        if (((hi >> (4u * r)) & 0xFu) == 0xEu)
++                        {
++                            const uint8_t addr = data[q * 16u + 8u];
++                            if (addr >= 0x60u && addr <= 0x62u)
++                                return true;
++                        }
++                    }
++            }
++            else if (flg == 1u)
++                q += (nloop * nreg + 1u) / 2u;
++            else
++                q += nloop;
++        }
++        return false;
++    }
++
++    bool gifScanCheckEnabled()
++    {
++        static const bool on = []
++        {
++            const char *v = std::getenv("PS2X_GIF_SCAN_CHECK");
++            return v && *v && *v != '0';
++        }();
++        return on;
++    }
++
++    // PS2X_GIF_DIRECT=0 queues every packet like before; by default a PATH1/PATH2 packet that arrives while nothing is
++    // queued goes straight to the host GS (see GifArbiter::submit).
++    bool gifDirectEnabled()
++    {
++        static const bool on = []
++        {
++            const char *v = std::getenv("PS2X_GIF_DIRECT");
++            return !(v && *v == '0');
++        }();
++        return on;
++    }
++
++    // One packet to the host GS, and to the built-in GS when it has to see it (was the body of GifArbiter::drain).
++    void emitPacket(const std::function<void(const uint8_t *, uint32_t)> &processFn, GifPathId pathId, const uint8_t *data,
++                    uint32_t size)
++    {
++        if (g_hostGs.gifPacket)
++        {
++            if (ps2Vif1StatsEnabled() && ps2Vif1OnWorkerThread())
++            {
++                const auto t0 = std::chrono::steady_clock::now();
++                g_hostGs.gifPacket(static_cast<int>(pathId), data, size);
++                ps2Vif1StatAddGifNs(static_cast<uint64_t>(
++                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()));
++            }
++            else
++                g_hostGs.gifPacket(static_cast<int>(pathId), data, size);
++        }
++        const bool hostOnly = g_hostGs.gifPacket && g_hostGs.exclusive;
++        if (!hostOnly)
++        {
++            processFn(data, size);
++            return;
++        }
++        const bool writesEvent = packetWritesGsEvent(data, size);
++        if (gifScanCheckEnabled() && writesEvent != packetWritesGsEventPlain(data, size))
++            std::fprintf(stderr, "[gif-arbiter] SCAN MISMATCH size=%u fast=%d\n", size, writesEvent ? 1 : 0);
++        if (writesEvent)
++            processFn(data, size);
++    }
+ }
+ 
+ const PS2HostGs &ps2HostGs()
+@@ -84,6 +190,15 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
+     if (!data || sizeBytes < 16 || !m_processFn)
+         return;
+ 
++    // Nothing queued and not a PATH3 packet: it would come out of drain() first and unchanged, so skip the queue (its
++    // heap copy, the sort and the second pass). PATH3 packets stay queued: they sort behind PATH1/PATH2 ones and are
++    // subject to the IMAGE rules below.
++    if (pathId != GifPathId::Path3 && m_queue.empty() && gifDirectEnabled())
++    {
++        emitPacket(m_processFn, pathId, data, sizeBytes);
++        return;
++    }
++
+     GifArbiterPacket pkt;
+     pkt.pathId = pathId;
+     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
+@@ -95,7 +210,7 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
+ 
+ void GifArbiter::drain()
+ {
+-    if (!m_processFn)
++    if (!m_processFn || m_queue.empty())
+         return;
+ 
+     std::stable_sort(m_queue.begin(), m_queue.end(),
+@@ -116,23 +231,7 @@ void GifArbiter::drain()
+     {
+         auto &pkt = m_queue[i];
+         if (!pkt.data.empty())
+-        {
+-            if (g_hostGs.gifPacket)
+-            {
+-                if (ps2Vif1StatsEnabled() && ps2Vif1OnWorkerThread())
+-                {
+-                    const auto t0 = std::chrono::steady_clock::now();
+-                    g_hostGs.gifPacket(static_cast<int>(pkt.pathId), pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+-                    ps2Vif1StatAddGifNs(static_cast<uint64_t>(
+-                        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()));
+-                }
+-                else
+-                    g_hostGs.gifPacket(static_cast<int>(pkt.pathId), pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+-            }
+-            if (!(g_hostGs.gifPacket && g_hostGs.exclusive) ||
+-                packetWritesGsEvent(pkt.data.data(), static_cast<uint32_t>(pkt.data.size())))
+-                m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+-        }
++            emitPacket(m_processFn, pkt.pathId, pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+     }
+     m_queue.clear();
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 5d9ebf7..6cc1cbf 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -89,6 +89,17 @@ namespace
+         return on;
+     }
+ 
++    // PS2X_VIF_UNPACK_MASKED_FAST=0 keeps masked UNPACKs on the generic loop (A/B measurements).
++    bool unpackMaskedFastEnabled()
++    {
++        static const bool on = []
++        {
++            const char *v = std::getenv("PS2X_VIF_UNPACK_MASKED_FAST");
++            return !(v && *v == '0');
++        }();
++        return on;
++    }
++
+     // PS2X_MPG_SKIP_SAME=0: bump the VU1 code generation on every MPG, even when the bytes did not change.
+     bool mpgSkipSameEnabled()
+     {
+@@ -224,6 +235,63 @@ namespace
+         return count;
+     }
+ 
++    // Masked UNPACK, STMOD 0, not fill mode (~15 % of Killzone's UNPACKs): per write cycle (min(vcl, 3)) every field is
++    // either the data, the row register, the column register of that cycle, or write-protected (keeps the VU memory
++    // word), so a vector is (data & sel) | (dest & keep) | fixed with per-cycle constants built once per UNPACK.
++    struct MaskConsts
++    {
++        __m128i data[4], keep[4], fixed[4];
++    };
++
++    MaskConsts buildMaskConsts(const VIFRegisters &regs)
++    {
++        MaskConsts mc;
++        for (uint32_t c = 0; c < 4u; ++c)
++        {
++            alignas(16) uint32_t d[4], k[4], x[4];
++            for (uint32_t f = 0; f < 4u; ++f)
++            {
++                const uint32_t m = (regs.mask >> (c * 8u + f * 2u)) & 3u;
++                d[f] = m == 0u ? ~0u : 0u;
++                k[f] = m == 3u ? ~0u : 0u;
++                x[f] = m == 1u ? regs.row[f] : (m == 2u ? regs.col[c] : 0u);
++            }
++            mc.data[c] = _mm_load_si128(reinterpret_cast<const __m128i *>(d));
++            mc.keep[c] = _mm_load_si128(reinterpret_cast<const __m128i *>(k));
++            mc.fixed[c] = _mm_load_si128(reinterpret_cast<const __m128i *>(x));
++        }
++        return mc;
++    }
++
++    template <class Conv>
++    uint32_t unpackMaskedRun(uint8_t *vuMem, uint32_t vuMemSize, uint32_t &addr, uint32_t &vcl, uint32_t &src,
++                             uint32_t count, uint32_t vsize, uint32_t wl, uint32_t skipBytes, const uint8_t *data,
++                             const MaskConsts &mc)
++    {
++        uint32_t a = addr, c = vcl, s = src;
++        const uint32_t wrap = vuMemSize - 16u;
++        for (uint32_t i = 0; i < count; ++i)
++        {
++            const uint32_t mcyc = c < 3u ? c : 3u;
++            __m128i *dest = reinterpret_cast<__m128i *>(vuMem + (a & wrap));
++            __m128i r = _mm_or_si128(_mm_and_si128(Conv::load(data + s), mc.data[mcyc]), mc.fixed[mcyc]);
++            r = _mm_or_si128(r, _mm_and_si128(_mm_loadu_si128(dest), mc.keep[mcyc]));
++            _mm_storeu_si128(dest, r);
++            a += 16u;
++            ++c;
++            s += vsize;
++            if (c >= wl)
++            {
++                a += skipBytes;
++                c = 0u;
++            }
++        }
++        addr = a;
++        vcl = c;
++        src = s;
++        return count;
++    }
++
+     // Number of leading vectors handled (updates addr/vcl/src); 0 if none.
+     uint32_t unpackPlain(uint32_t vnvl, bool usn, uint8_t *vuMem, uint32_t vuMemSize, uint32_t &addr, uint32_t &vcl,
+                          uint32_t &src, uint32_t num, uint32_t wl, uint32_t skipBytes, const uint8_t *data,
+@@ -262,6 +330,41 @@ namespace
+ #undef KZ_UNPACK_RUN
+     }
+ 
++    uint32_t unpackMasked(uint32_t vnvl, bool usn, uint8_t *vuMem, uint32_t vuMemSize, uint32_t &addr, uint32_t &vcl,
++                          uint32_t &src, uint32_t num, uint32_t wl, uint32_t skipBytes, const uint8_t *data,
++                          uint32_t dataBytes, const VIFRegisters &regs)
++    {
++        const uint32_t vsize = kVifGsize[vnvl];
++        const uint32_t vn = vnvl >> 2;
++        const uint32_t elem = vnvl == 15u ? 2u : (4u >> (vnvl & 3u));
++        const uint32_t need = (vn == 2u) ? vsize + elem : vsize;
++        if (dataBytes < need)
++            return 0u;
++        const uint32_t count = std::min<uint32_t>(num, 1u + (dataBytes - need) / vsize);
++        const MaskConsts mc = buildMaskConsts(regs);
++#define KZ_MASKED_RUN(CONV) return unpackMaskedRun<CONV>(vuMem, vuMemSize, addr, vcl, src, count, vsize, wl, skipBytes, data, mc)
++#define KZ_MASKED_RUN_USN(CONV)     if (usn)         KZ_MASKED_RUN(CONV<true>);     KZ_MASKED_RUN(CONV<false>)
++        switch (vnvl)
++        {
++        case 0: KZ_MASKED_RUN(ConvS_32);
++        case 1: KZ_MASKED_RUN_USN(ConvS_16);
++        case 2: KZ_MASKED_RUN_USN(ConvS_8);
++        case 4: KZ_MASKED_RUN(ConvV2_32);
++        case 5: KZ_MASKED_RUN_USN(ConvV2_16);
++        case 6: KZ_MASKED_RUN_USN(ConvV2_8);
++        case 8: KZ_MASKED_RUN(ConvV4_32);
++        case 9: KZ_MASKED_RUN_USN(ConvV4_16);
++        case 10: KZ_MASKED_RUN_USN(ConvV4_8);
++        case 12: KZ_MASKED_RUN(ConvV4_32);
++        case 13: KZ_MASKED_RUN_USN(ConvV4_16);
++        case 14: KZ_MASKED_RUN_USN(ConvV4_8);
++        case 15: KZ_MASKED_RUN(ConvV4_5);
++        default: return 0u;
++        }
++#undef KZ_MASKED_RUN_USN
++#undef KZ_MASKED_RUN
++    }
++
+     // VIF1 UNPACK with PCSX2's semantics (Vif_Unpack.cpp: vifUnpackSetup, _nVifUnpackLoop, UNPACK_S/V2/V4/V4_5,
+     // writeXYZW):
+     //  - WL = 0 means 256; fill mode is CL < WL. In fill mode the source pointer only advances for the first CL
+@@ -322,8 +425,13 @@ namespace
+         uint32_t src = 0u;  // byte offset of the current source vector
+         uint32_t vcl = 0u;  // write-cycle counter (PCSX2 vif.cl)
+         uint32_t n = 0u;
+-        if (allowFast && unpackFastEnabled() && !isFill && !doMask && mode == 0u)
+-            n = unpackPlain(vnvl, usn, vuMem, vuMemSize, addr, vcl, src, num, wl, skipBytes, data, dataBytes);
++        if (allowFast && unpackFastEnabled() && !isFill && mode == 0u)
++        {
++            if (!doMask)
++                n = unpackPlain(vnvl, usn, vuMem, vuMemSize, addr, vcl, src, num, wl, skipBytes, data, dataBytes);
++            else if (unpackMaskedFastEnabled())
++                n = unpackMasked(vnvl, usn, vuMem, vuMemSize, addr, vcl, src, num, wl, skipBytes, data, dataBytes, regs);
++        }
+         for (; n < num; ++n)
+         {
+             uint32_t in[4];

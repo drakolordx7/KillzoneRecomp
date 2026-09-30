@@ -156,6 +156,7 @@ void kzvuShutdown()
 {
 	if (!s_init)
 		return;
+	kzvuVu1MemoFlush();
 	CpuMicroVU0.Shutdown();
 	CpuMicroVU1.Shutdown();
 	kzvu::FreeCodeCache();
@@ -175,6 +176,7 @@ void kzvuSetConfig(const KzvuConfig& cfg)
 	ApplyConfig(cfg);
 	if (s_init && codegen_changed)
 	{
+		kzvuVu1MemoFlush();
 		CpuMicroVU0.Reset();
 		CpuMicroVU1.Reset();
 	}
@@ -190,6 +192,7 @@ void kzvuReset()
 	if (!s_init)
 		return;
 	ResetRegs();
+	kzvuVu1MemoFlush();
 	CpuMicroVU0.Reset();
 	CpuIntVU0.Reset();
 	CpuMicroVU1.Reset();
@@ -212,7 +215,7 @@ static void WriteMicroPart(u32 offset, const u8* src, u32 size)
 	if (size == 0 || std::memcmp(s_vu1_micro + offset, src, size) == 0)
 		return;
 	std::memcpy(s_vu1_micro + offset, src, size);
-	CpuMicroVU1.Clear(offset, size);
+	kzvuVu1CodeChanged(offset, size);
 }
 
 void kzvuWriteMicro(uint32_t offset, const void* src, uint32_t size)
@@ -229,7 +232,7 @@ void kzvuWriteMicro(uint32_t offset, const void* src, uint32_t size)
 void kzvuMicroWritten(uint32_t offset, uint32_t size)
 {
 	if (s_init)
-		CpuMicroVU1.Clear(offset & VU1_PROGMASK, size);
+		kzvuVu1CodeChanged(offset & VU1_PROGMASK, size);
 }
 
 // ---- VIF1 / VU0 control -------------------------------------------------------------------------------------------------

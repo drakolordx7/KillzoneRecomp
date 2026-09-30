@@ -154,6 +154,10 @@ The public calls work as producers:
 - `kzgsOpen`, `kzgsClose`, `kzgsSync` and `kzgsReadback` block until the GS thread has handled them.
 - `kzgsVsync` blocks only when more than `maxQueuedFrames` frames are still queued. This is frame pacing, as in
   PCSX2's MTGS.
+- Wake-ups use a flag hand-shake instead of one atomic notify per command: the GS thread announces that it is about to
+  sleep, and the producer only calls `notify_one` after a publish when that flag is set (and the other way round for a
+  producer waiting for ring space). The VIF1 worker publishes ~4000 GIF packets per frame, and a `WakeByAddress` call
+  per packet cost ~5 % of its time. `KZGS_NOTIFY_ALWAYS=1` restores the unconditional notifies.
 - A transfer larger than 1 MB is split into several ring commands. That is safe because PCSX2's GIF path state
   machine resumes partial packets. The test sends every packet in 7-qword pieces to check this.
 

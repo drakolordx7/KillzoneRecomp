@@ -272,14 +272,16 @@ namespace
             traceRecord(1, static_cast<uint32_t>(path), data, sizeBytes);
         if (path >= 1 && path <= 3)
         {
-            g_pathPackets[path].fetch_add(1, std::memory_order_relaxed);
-            g_pathQwords[path].fetch_add(sizeBytes / 16u, std::memory_order_relaxed);
+            // One thread feeds kzgs at a time (the VIF1 worker, or the EE thread with the worker idle): plain
+            // load+store instead of a locked add.
+            g_pathPackets[path].store(g_pathPackets[path].load(std::memory_order_relaxed) + 1u, std::memory_order_relaxed);
+            g_pathQwords[path].store(g_pathQwords[path].load(std::memory_order_relaxed) + sizeBytes / 16u, std::memory_order_relaxed);
             static const bool dbg = std::getenv("KZ_GS_DEBUG") && std::getenv("KZ_GS_DEBUG")[0] == '1';
             if (dbg)
                 inspectGif(data, sizeBytes);
         }
         kzgsGifTransfer(path, data, sizeBytes / 16u);
-        g_packetsSinceVsync.fetch_add(1, std::memory_order_relaxed);
+        g_packetsSinceVsync.store(g_packetsSinceVsync.load(std::memory_order_relaxed) + 1u, std::memory_order_relaxed);
     }
 
     // KZ_GS_DEBUG=1: one line per ~second with display registers, fade level and GIF traffic.

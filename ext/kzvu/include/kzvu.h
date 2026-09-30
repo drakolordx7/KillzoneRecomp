@@ -115,8 +115,18 @@ struct KzvuVu1CodeStats
 	uint64_t cacheBytes;      // size of the cache before it resets
 	uint32_t programsCreated; // microPrograms created since the last cache reset
 	uint32_t programsCached;  // microPrograms currently in the per-startPC lists
+	// Program-search cost (only counted when kzvu is built with KZVU_SEARCH_STATS, else 0): memcmp calls made by
+	// microVU's program lookup (one per compiled range of every candidate program), bytes compared, TSC cycles spent.
+	uint64_t cmpCalls;
+	uint64_t cmpBytes;
+	uint64_t cmpCycles;
+	// Code-state memo (KZVU_STATE_MEMO, see KzvuMicroVU.cpp): micro-memory changes announced since start, how many of them
+	// restored a known state's program table, found a known state whose table was stale, met a new state, entries restored,
+	// and (KZVU_STATE_MEMO_VERIFY=1) restored/saved entries that failed the range check.
+	uint64_t memoSwitches, memoHits, memoStale, memoNew, memoRestored, memoVerifyBad, memoStates, memoCycles; // memoCycles: TSC cycles spent in kzvuVu1CodeChanged
 };
-void kzvuVu1CodeStats(KzvuVu1CodeStats* out);
+void kzvuVu1CodeStats(KzvuVu1CodeStats* out); // walks all program lists: call rarely
+void kzvuVu1CodeCounters(uint64_t* codeBytes, uint32_t* programsCreated); // the two cheap counters, for per-call use
 struct KzvuVu1ProgDiff
 {
 	uint32_t programs;  // programs cached for this start PC
@@ -127,6 +137,11 @@ struct KzvuVu1ProgDiff
 };
 // Compares VU1 micro memory with cached program number `which` (0 = most recently used) for `startPcBytes`, over the
 // ranges it was compiled for. False if there is no such program.
+// VU1 micro memory changed (used by kzvuMicroWritten/kzvuWriteMicro): invalidates microVU1's current-program table, or
+// swaps in the table remembered for the same memory content. kzvuVu1MemoFlush() forgets the remembered tables (microVU1's
+// programs were freed: reset, config change, shutdown).
+void kzvuVu1CodeChanged(uint32_t offset, uint32_t size);
+void kzvuVu1MemoFlush();
 bool kzvuVu1DiffCachedProgram(uint32_t startPcBytes, uint32_t which, KzvuVu1ProgDiff* out);
 // Number of GIF packets delivered to the XGKICK callback since kzvuInit.
 uint64_t kzvuXgkickCount();
