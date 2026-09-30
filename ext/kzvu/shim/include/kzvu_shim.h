@@ -95,6 +95,10 @@ struct KzvuVuThreadStub
 };
 extern KzvuVuThreadStub kzvu_vu1Thread;
 
+// ---- VU0 alias (see kzvu_prefix.h): vuRegs[0] on every thread except the one bound as the VU1 thread ------------------
+extern thread_local VURegs* kzvu_vu0;
+extern VURegs kzvu_vu0_vu1thread;
+
 // ---- glue between the API (src/kzvu.cpp) and the shims ------------------------------------------------------------------
 namespace kzvu
 {

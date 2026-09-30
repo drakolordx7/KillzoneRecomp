@@ -22,6 +22,9 @@ KzvuVuThreadStub kzvu_vu1Thread;
 BaseVUmicroCPU* CpuVU0 = nullptr;
 BaseVUmicroCPU* CpuVU1 = nullptr;
 
+VURegs kzvu_vu0_vu1thread;
+thread_local VURegs* kzvu_vu0 = &vuRegs[0];
+
 // ---- CPU features (PCSX2 fills this from cpuinfo in GS/MultiISA.cpp) ------------------------------------------------------
 static ProcessorFeatures DetectProcessorFeatures()
 {
@@ -53,7 +56,7 @@ static ProcessorFeatures DetectProcessorFeatures()
 const ProcessorFeatures g_cpu = DetectProcessorFeatures();
 
 // ---- interrupts / EE events ---------------------------------------------------------------------------------------------
-static u32 s_pending_irq = 0;
+static thread_local u32 s_pending_irq = 0; // per thread: VU0 (EE thread) and VU1 (worker) each see their own
 
 void hwIntcIrq(int n)
 {
@@ -126,7 +129,7 @@ static void* s_xgkick_user = nullptr;
 static std::vector<u8> s_gif_buf;   // bytes of the packet being collected
 static u32 s_gif_start_qw = 0;      // VU1 data address (qwords) the collected packet started at
 static u64 s_gif_packets = 0;
-static FPControlRegister s_host_fpcr = FPControlRegister::GetCurrent();
+static thread_local FPControlRegister s_host_fpcr = FPControlRegister::GetCurrent();
 
 void kzvu::SetHostFPCR(FPControlRegister fpcr)
 {

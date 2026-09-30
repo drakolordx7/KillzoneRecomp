@@ -17,7 +17,7 @@ alignas(64) static u8 s_vu1_mem[VU1_MEMSIZE];
 
 static bool s_init = false;
 static KzvuConfig s_cfg;
-static u32 s_fbrst = 0;
+static thread_local u32 s_fbrst = 0; // per thread: VU0 calls (EE thread) and VU1 programs (VU1 thread) set their own
 static u64 s_total_cycles = 0;
 static u64 s_vu0_cycles = 0;
 static u64 s_vu0_calls = 0;
@@ -114,6 +114,13 @@ static u32 RunCycles(u32 budget)
 	const u64 used = VU1.cycle - start;
 	s_total_cycles += used;
 	return static_cast<u32>(used);
+}
+
+void kzvuBindVu1Thread()
+{
+	// This thread runs VU1 from now on: VU0.VI[VPU_STAT/FBRST] (kzvu_prefix.h) resolve to a private register file, so
+	// they do not share words with VU0 running on another thread.
+	kzvu_vu0 = &kzvu_vu0_vu1thread;
 }
 
 bool kzvuInit(const KzvuConfig& cfg, std::string* err)

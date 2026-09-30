@@ -45,12 +45,85 @@ namespace
             g_runtime->memory().submitGifPacket(GifPathId::Path1, packet, bytes);
     }
 
+    // KZ_VU_STATS=1: every 10 s one line about microVU1's recompiler activity (all on the VU1 thread): MSCAL/MSCNT calls,
+    // how many of them emitted JIT code and how much, code cache resets, new microPrograms, MPG generation changes.
+    // The first KZ_VU_STATS_DIFF (default 40) new programs also log which micro-memory word differs from the newest
+    // cached program for the same start PC (why the cached one did not match).
+    struct Vu1Stats
+    {
+        bool enabled = false;
+        int diffBudget = 40;
+        uint64_t calls = 0, emitting = 0, bytes = 0, resets = 0, created = 0, generations = 0, sameContentMpg = 0;
+        uint64_t lastCode = 0;
+        uint32_t lastCreated = 0;
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point start = last;
+    };
+    Vu1Stats g_vu1Stats;
+
+    void vu1StatsInit()
+    {
+        const char *v = std::getenv("KZ_VU_STATS");
+        g_vu1Stats.enabled = v && *v && *v != '0';
+        if (const char *d = std::getenv("KZ_VU_STATS_DIFF"))
+            g_vu1Stats.diffBudget = std::atoi(d);
+    }
+
+    void vu1StatsSample(uint32_t startPc)
+    {
+        Vu1Stats &s = g_vu1Stats;
+        KzvuVu1CodeStats st;
+        kzvuVu1CodeStats(&st);
+        ++s.calls;
+        if (st.codeBytes > s.lastCode)
+        {
+            ++s.emitting;
+            s.bytes += st.codeBytes - s.lastCode;
+        }
+        else if (st.codeBytes < s.lastCode)
+        {
+            ++s.resets;
+            s.bytes += st.codeBytes;
+        }
+        s.lastCode = st.codeBytes;
+        if (st.programsCreated != s.lastCreated)
+        {
+            const bool reset = st.programsCreated < s.lastCreated;
+            s.created += reset ? st.programsCreated : st.programsCreated - s.lastCreated;
+            if (!reset && s.diffBudget > 0 && startPc != 0xFFFFFFFFu)
+            {
+                --s.diffBudget;
+                KzvuVu1ProgDiff d{};
+                if (kzvuVu1DiffCachedProgram(startPc, 1, &d))
+                    std::fprintf(stderr, "[kz] VU1 new microProgram start=0x%03x (%u for this pc, previous one: %u ranges): %s word 0x%04x %08x -> %08x\n",
+                                 startPc, d.programs, d.ranges, d.wordIndex == ~0u ? "identical in its ranges;" : "first difference at",
+                                 d.wordIndex == ~0u ? 0u : d.wordIndex * 4, d.oldWord, d.newWord);
+                else
+                    std::fprintf(stderr, "[kz] VU1 new microProgram start=0x%03x (first program for this pc)\n", startPc);
+            }
+        }
+        s.lastCreated = st.programsCreated;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - s.last >= std::chrono::seconds(10))
+        {
+            std::fprintf(stderr,
+                         "[kz] VU1 t=%.0fs mscal=%llu emitted-code-in=%llu (%.1f KB) resets=%llu new-programs=%llu cached=%u code=%.1f/%.0f MB mpg-generations=%llu\n",
+                         std::chrono::duration<double>(now - s.start).count(), static_cast<unsigned long long>(s.calls),
+                         static_cast<unsigned long long>(s.emitting), s.bytes / 1024.0, static_cast<unsigned long long>(s.resets),
+                         static_cast<unsigned long long>(s.created), st.programsCached, st.codeBytes / 1048576.0,
+                         st.cacheBytes / 1048576.0, static_cast<unsigned long long>(s.generations));
+            s.calls = s.emitting = s.bytes = s.resets = s.created = s.generations = 0;
+            s.last = now;
+        }
+    }
+
     void prepare(uint32_t top, uint32_t itop, uint32_t fbrst, uint64_t codeGeneration)
     {
         if (codeGeneration != g_codeGeneration)
         {
             kzvuMicroWritten(0, kKzvuCodeSize);
             g_codeGeneration = codeGeneration;
+            ++g_vu1Stats.generations;
         }
         kzvuSetFBRST(fbrst);
         kzvuSetTop(top, itop);
@@ -72,6 +145,8 @@ namespace
         finish(vpuStat);
         if (ps2DmaStatsEnabled())
             ps2DmaStats().vu1Cycles.fetch_add(kzvuCycles() - c0, std::memory_order_relaxed);
+        if (g_vu1Stats.enabled)
+            vu1StatsSample(startPc);
     }
 
     void onMscnt(uint32_t top, uint32_t itop, uint32_t fbrst, uint64_t gen, uint32_t *vpuStat)
@@ -79,6 +154,8 @@ namespace
         prepare(top, itop, fbrst, gen);
         kzvuExecute(0xFFFFFFFFu, kBudget);
         finish(vpuStat);
+        if (g_vu1Stats.enabled)
+            vu1StatsSample(0xFFFFFFFFu);
     }
 
     // ---- VU0 micro mode (VCALLMS / VCALLMSR) -------------------------------------------------------------------------
@@ -344,6 +421,7 @@ bool kzVuInstall(std::string *error)
     if (vu1Builtin && vu0Builtin)
         return true;
 
+    vu1StatsInit();
     KzvuConfig vc; // Killzone GameIndex: vuClampMode 0 (both VUs), IbitHack on (the kzvu defaults)
     vc.useJit = !(mode && std::strcmp(mode, "interp") == 0);
     vc.vu0UseJit = !(mode0 && std::strcmp(mode0, "pcsx2interp") == 0);
@@ -365,6 +443,9 @@ bool kzVuInstall(std::string *error)
         hooks.dataMem = kzvuDataMem();
         hooks.mscal = &onMscal;
         hooks.mscnt = &onMscnt;
+        // With the runtime's VIF1 worker thread (PS2X_VIF1_THREAD, default on) VU1 runs on that thread; VU0 stays on the
+        // EE thread. bindWorkerThread makes kzvu keep the two VUs' VPU_STAT/FBRST words apart.
+        hooks.bindWorkerThread = &kzvuBindVu1Thread;
         ps2SetHostVu1(hooks);
         std::cout << "[kz] VU1: " << (vc.useJit ? "microVU recompiler" : "PCSX2 interpreter") << std::endl;
     }

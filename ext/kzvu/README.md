@@ -51,7 +51,8 @@ CMake options:
 ### What is compiled
 
 - **PCSX2 VU code, unmodified:**
-  - `x86/microVU.cpp`, which includes all `microVU_*.inl` files as one translation unit
+  - `x86/microVU.cpp`, which includes all `microVU_*.inl` files as one translation unit (compiled through
+    `shim/unity/KzvuMicroVU.cpp`, which `#include`s it unmodified and adds read-only diagnostics)
   - `VUops.cpp`, `VUflags.cpp` and `VU1microInterp.cpp`
 - **pcsx2/common:**
   - the x86 emitter (`common/emitter/*.cpp`)
@@ -231,9 +232,25 @@ The IbitHack (on for Killzone) changes what counts as a change:
 ## Threading
 
 - There is one VU1 per process.
-- Call kzvu from one host thread: the game thread that runs the VIF1 interpreter.
-- There is no MTVU thread and no internal locking.
+- kzvu has no internal locking and no MTVU machinery. By default call everything from one host thread.
+- VU1 may instead run on its own thread while VU0 micro mode runs on another (the game's VIF1 worker thread does this):
+  call `kzvuBindVu1Thread()` on the VU1 thread before its first VU1 call and before any VU1 program has run anywhere,
+  then call every VU1 function (`kzvuExecute`, `kzvuContinue`, `kzvuSetTop`, `kzvuSetFBRST` for VU1, `kzvuMicroWritten`,
+  the XGKICK callback, the register accessors) from that thread and every `kzvu0*` function from the other one. VU1 must
+  stay on that thread once VU1 code has been compiled.
+- What makes that safe: VU1 code reads and writes VU0's VPU_STAT and FBRST registers (busy and D/T-stop bits, D/T
+  enables) with unlocked read-modify-writes, and both VUs use them. `kzvu_prefix.h` redefines `VU0` (PCSX2's
+  `static VURegs& VU0 = vuRegs[0]`) as a per-thread pointer; the VU1 thread gets a private register file there, so the
+  two VUs never share those words (the JIT embeds the address at compile time on the compiling thread). The FBRST
+  value, the pending D/T interrupt bits and the host FPCR are `thread_local`. This replaces what PCSX2's THREAD_VU1
+  special cases do (VU1 skips those writes). Other state the two VUs touch concurrently is per-VU, or written by only
+  one of them (`cpuRegs.cycle` is written by both but nothing reads it).
+- Not synchronised: a VU0 program that reads or writes VU1's registers through VU0 memory (0x4000+). None of the
+  captured Killzone VU0 calls does (`kzvu0_test` reports it).
 - The emitter keeps its write pointer in `thread_local` variables, which microVU re-seats on every call.
+- `shim/unity/KzvuMicroVU.cpp` compiles PCSX2's `x86/microVU.cpp` unmodified (through `#include`) and adds
+  `kzvuVu1CodeStats` / `kzvuVu1DiffCachedProgram`: read-only views of microVU1's JIT cache use and program lists, used by
+  the game's `KZ_VU_STATS=1` diagnostics.
 
 ## Host integration sketch (not applied; ps2_runtime.cpp belongs to the main build)
 
@@ -398,7 +415,8 @@ GPL-3.0+. kzvu consists of PCSX2 code plus GPL shims. Anything that links kzvu i
 - **D bit:** ignored by the JIT, as in PCSX2 (see the findings above). The branch VI-delay edge case differs between
   the JIT and the interpreter.
 - **Memory:** VU1 memory must be kzvu's own buffers. See Memory ownership.
-- **Not provided:** no savestate support, and no MTVU (VU1 on its own thread).
+- **Not provided:** no savestate support, and no MTVU as such: VU1 can be moved to a host thread by the caller (see
+  Threading), kzvu does not run one itself.
 - **Configurations:** only Release and RelWithDebInfo are tested. A Debug build keeps references to code that the
   optimizer normally drops. Those references are stubbed, but Debug has not been exercised.
 - **Test data:** `kzvu_test` (VU1) uses synthetic microprograms only. VU0 has captured Killzone calls
