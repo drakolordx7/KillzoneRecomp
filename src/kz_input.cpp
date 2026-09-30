@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <mutex>
 #include <string>
@@ -68,8 +69,20 @@ namespace
         {"Space", "Cross"}, {"Return", "Cross"},
         {"W", "MoveForward"}, {"S", "MoveBack"}, {"A", "StrafeLeft"}, {"D", "StrafeRight"},
         {"Up", "LookUp"}, {"Down", "LookDown"}, {"Left", "LookLeft"}, {"Right", "LookRight"},
+        // Arrow keys and WASD also press the D-pad: the menus navigate with the D-pad only (measured: a left-stick push
+        // did not move the Create Profile selection, D-pad down did). No gameplay action is on the D-pad in the default
+        // controller map.
+        {"Up", "Up"}, {"Down", "Down"}, {"Left", "Left"}, {"Right", "Right"},
+        {"W", "Up"}, {"S", "Down"}, {"A", "Left"}, {"D", "Right"},
         {"Escape", "Start"}, {"Tab", "Select"}, {"Backspace", "Triangle"},
         {"1", "Up"}, {"2", "Right"}, {"3", "Down"}, {"4", "Left"},
+    };
+
+    // [Bindings] Version=<n>. Sections written before a version are upgraded by appending that version's additions.
+    constexpr int kBindingsVersion = 2;
+    constexpr std::pair<const char *, const char *> kBindingsV2Additions[] = {
+        {"Up", "Up"}, {"Down", "Down"}, {"Left", "Left"}, {"Right", "Right"},
+        {"W", "Up"}, {"S", "Down"}, {"A", "Left"}, {"D", "Right"},
     };
 
     constexpr uint64_t kWheelPulseMs = 60; // a wheel notch holds its button this long so the game sees one press
@@ -89,6 +102,10 @@ namespace
         float stickMouseDy = 0.0f;
         bool captured = false;
         bool aimPatchActive = false;
+        // text entry (on-screen keyboard open in the game)
+        uint64_t textEntryUntil = 0; // SDL ticks; active while now < this
+        std::deque<uint16_t> textQueue;
+        std::array<bool, SDL_SCANCODE_COUNT> consumed{}; // held keys that must not act as pad buttons until released
         SDL_Gamepad *gamepad = nullptr;
         // latest gamepad snapshot, taken on the window thread
         uint16_t padButtons = 0; // active-high
@@ -108,12 +125,17 @@ namespace
     // mx/my=counts inject one raw mouse motion (after sensitivity) at t, e.g. "70:mx=400".
     struct ScriptEvent
     {
-        double t, dur;
+        double t, dur; // t: seconds; "v<t>" items count from the first text-entry Enter instead (see g_textEnteredAt)
         uint16_t mask;
-        int axis; // 0 none, 1 lx, 2 ly, 3 rx, 4 ry, 5 mouse x, 6 mouse y
+        int axis; // 0 none, 1 lx, 2 ly, 3 rx, 4 ry, 5 mouse x, 6 mouse y, 7 text
         float value;
         bool fired = false;
+        std::string text; // axis 7: keys queued as text entry
+        bool afterText = false;
+        bool beforeText = false; // "b<t>": absolute time, dropped once the text entry Enter was handed over
     };
+
+    double g_textEnteredAt = -1.0; // script clock when the first queued Enter was handed to the game
 
     std::vector<ScriptEvent> &script()
     {
@@ -132,14 +154,29 @@ namespace
                 const size_t c1 = item.find(':');
                 if (c1 == std::string::npos)
                     continue;
-                ScriptEvent ev{std::atof(item.c_str()), 0.15, 0, 0, 0.0f};
+                const bool afterText = item[0] == 'v' || item[0] == 'V';
+                const bool beforeText = item[0] == 'b' || item[0] == 'B';
+                ScriptEvent ev{std::atof(item.c_str() + (afterText || beforeText ? 1 : 0)), 0.15, 0, 0, 0.0f};
+                ev.afterText = afterText;
+                ev.beforeText = beforeText;
                 std::string what = item.substr(c1 + 1);
                 if (const size_t c2 = what.find(':'); c2 != std::string::npos)
                 {
                     ev.dur = std::atof(what.c_str() + c2 + 1);
                     what.resize(c2);
                 }
-                if (const size_t eq = what.find('='); eq != std::string::npos)
+                if (_strnicmp(what.c_str(), "type=", 5) == 0)
+                {
+                    ev.axis = 7;
+                    ev.text = what.substr(5);
+                }
+                else if (_stricmp(what.c_str(), "textenter") == 0)
+                    ev.axis = 7, ev.text = std::string(1, static_cast<char>(KZ_TEXT_ENTER));
+                else if (_stricmp(what.c_str(), "textback") == 0)
+                    ev.axis = 7, ev.text = std::string(1, static_cast<char>(KZ_TEXT_BACKSPACE));
+                else if (_stricmp(what.c_str(), "textcancel") == 0)
+                    ev.axis = 7, ev.text = std::string(1, static_cast<char>(KZ_TEXT_CANCEL));
+                else if (const size_t eq = what.find('='); eq != std::string::npos)
                 {
                     static const char *axes[] = {"", "lx", "ly", "rx", "ry", "mx", "my"};
                     for (int a = 1; a <= 6; ++a)
@@ -167,7 +204,8 @@ namespace
         const double t = g_scriptClock ? g_scriptClock() : SDL_GetTicks() / 1000.0;
         for (const ScriptEvent &e : events)
         {
-            if (t < e.t || t >= e.t + e.dur || e.axis > 4)
+            const double start = e.afterText ? (g_textEnteredAt < 0.0 ? 1e30 : g_textEnteredAt + e.t) : e.t;
+            if (t < start || t >= start + e.dur || e.axis > 4 || (e.beforeText && g_textEnteredAt >= 0.0))
                 continue;
             pressed |= e.mask;
             float *axis[] = {nullptr, &lx, &ly, &rx, &ry};
@@ -233,6 +271,7 @@ namespace
         std::vector<std::pair<std::string, std::string>> pairs;
         std::ifstream in(ini);
         bool inSection = false, any = false;
+        int version = 1;
         std::string line;
         while (in && std::getline(in, line))
         {
@@ -247,12 +286,21 @@ namespace
             const auto eq = line.find('=');
             if (inSection && eq != std::string::npos)
             {
-                pairs.emplace_back(trim(line.substr(0, eq)), trim(line.substr(eq + 1)));
+                std::string key = trim(line.substr(0, eq));
+                if (_stricmp(key.c_str(), "Version") == 0)
+                {
+                    version = std::atoi(line.c_str() + eq + 1);
+                    continue;
+                }
+                pairs.emplace_back(std::move(key), trim(line.substr(eq + 1)));
                 any = true;
             }
         }
         if (!any)
             for (const auto &[k, v] : kDefaultBindings)
+                pairs.emplace_back(k, v);
+        else if (version < 2)
+            for (const auto &[k, v] : kBindingsV2Additions)
                 pairs.emplace_back(k, v);
         return pairs;
     }
@@ -276,12 +324,40 @@ namespace
     {
         switch (b.kind)
         {
-        case SourceKind::Key: return b.code > 0 && b.code < SDL_SCANCODE_COUNT && s.keys[b.code];
+        case SourceKind::Key: return b.code > 0 && b.code < SDL_SCANCODE_COUNT && s.keys[b.code] && !s.consumed[b.code];
         case SourceKind::MouseButton: return b.code > 0 && b.code < static_cast<int>(s.mouseButtons.size()) && s.mouseButtons[b.code];
         case SourceKind::WheelUp: return now < s.wheelUpUntil;
         case SourceKind::WheelDown: return now < s.wheelDownUntil;
         }
         return false;
+    }
+
+    // A key press while the game's on-screen keyboard is open -> text key (0 = not a text key). Killzone's name entry
+    // accepts letters, digits, space, '-', '_' and '.'.
+    uint16_t textKey(SDL_Scancode sc, SDL_Keymod mod)
+    {
+        const bool shift = (mod & SDL_KMOD_SHIFT) != 0;
+        const bool upper = shift != ((mod & SDL_KMOD_CAPS) != 0);
+        if (sc >= SDL_SCANCODE_A && sc <= SDL_SCANCODE_Z)
+            return static_cast<uint16_t>((upper ? 'A' : 'a') + (sc - SDL_SCANCODE_A));
+        if (sc >= SDL_SCANCODE_1 && sc <= SDL_SCANCODE_9)
+            return static_cast<uint16_t>('1' + (sc - SDL_SCANCODE_1));
+        if (sc >= SDL_SCANCODE_KP_1 && sc <= SDL_SCANCODE_KP_9)
+            return static_cast<uint16_t>('1' + (sc - SDL_SCANCODE_KP_1));
+        switch (sc)
+        {
+        case SDL_SCANCODE_0:
+        case SDL_SCANCODE_KP_0: return '0';
+        case SDL_SCANCODE_SPACE: return ' ';
+        case SDL_SCANCODE_MINUS: return shift ? '_' : '-';
+        case SDL_SCANCODE_PERIOD:
+        case SDL_SCANCODE_KP_PERIOD: return '.';
+        case SDL_SCANCODE_RETURN:
+        case SDL_SCANCODE_KP_ENTER: return KZ_TEXT_ENTER;
+        case SDL_SCANCODE_ESCAPE: return KZ_TEXT_CANCEL;
+        case SDL_SCANCODE_BACKSPACE: return KZ_TEXT_BACKSPACE;
+        default: return 0;
+        }
     }
 
     uint8_t toStickByte(float v)
@@ -387,6 +463,45 @@ void kzInputSetCaptured(bool captured)
     }
 }
 
+void kzInputSetTextEntryActive()
+{
+    State &s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    const uint64_t now = SDL_GetTicks();
+    if (now >= s.textEntryUntil)
+    {
+        // Just opened: keys still held from the menu (e.g. Return that selected "new profile") must not type or press.
+        for (size_t i = 0; i < s.keys.size(); ++i)
+            s.consumed[i] = s.keys[i];
+        s.textQueue.clear();
+    }
+    s.textEntryUntil = now + 250;
+}
+
+bool kzInputTakeTextKey(uint16_t &key)
+{
+    State &s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!script().empty())
+    {
+        const double t = g_scriptClock ? g_scriptClock() : SDL_GetTicks() / 1000.0;
+        for (ScriptEvent &e : script())
+            if (e.axis == 7 && !e.fired && t >= e.t)
+            {
+                e.fired = true;
+                for (char c : e.text)
+                    s.textQueue.push_back(static_cast<uint8_t>(c));
+            }
+    }
+    if (s.textQueue.empty())
+        return false;
+    key = s.textQueue.front();
+    if (key == KZ_TEXT_ENTER && g_textEnteredAt < 0.0)
+        g_textEnteredAt = g_scriptClock ? g_scriptClock() : SDL_GetTicks() / 1000.0;
+    s.textQueue.pop_front();
+    return true;
+}
+
 void kzInputSetAimPatchActive(bool active)
 {
     State &s = state();
@@ -403,7 +518,20 @@ void kzInputOnEvent(const SDL_Event &e)
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP:
         if (e.key.scancode < SDL_SCANCODE_COUNT)
-            s.keys[e.key.scancode] = e.type == SDL_EVENT_KEY_DOWN;
+        {
+            const bool down = e.type == SDL_EVENT_KEY_DOWN;
+            s.keys[e.key.scancode] = down;
+            if (!down)
+                s.consumed[e.key.scancode] = false;
+            else if (SDL_GetTicks() < s.textEntryUntil)
+            {
+                if (const uint16_t k = textKey(e.key.scancode, e.key.mod))
+                {
+                    s.textQueue.push_back(k); // key repeat events are queued too
+                    s.consumed[e.key.scancode] = true;
+                }
+            }
+        }
         s.usingKbm = true;
         break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
@@ -521,7 +649,7 @@ KzMouseDelta kzInputTakeMouseDelta()
         const KzConfig &cfg = kzConfig();
         const double t = g_scriptClock ? g_scriptClock() : SDL_GetTicks() / 1000.0;
         for (ScriptEvent &e : script())
-            if (e.axis > 4 && !e.fired && t >= e.t)
+            if ((e.axis == 5 || e.axis == 6) && !e.fired && t >= e.t)
             {
                 e.fired = true;
                 (e.axis == 5 ? d.dx : d.dy) += e.value * cfg.mouseSensitivity * (e.axis == 6 && cfg.invertY ? -1.0f : 1.0f);
@@ -577,6 +705,15 @@ int kzInputSelfTest()
     check((static_cast<uint16_t>(~(d[2] | (d[3] << 8))) & KZ_PAD_CIRCLE) == 0, "WheelUp pulse expires");
     s.keys.fill(false);
     s.mouseButtons.fill(false);
+    s.keys[SDL_SCANCODE_UP] = true;
+    compose(s, d, 300);
+    check((static_cast<uint16_t>(~(d[2] | (d[3] << 8))) & KZ_PAD_UP) != 0, "Up arrow -> D-pad up (menus)");
+    check(d[5] == 0x00, "Up arrow -> right stick up (look)");
+    s.consumed[SDL_SCANCODE_UP] = true;
+    compose(s, d, 300);
+    check((static_cast<uint16_t>(~(d[2] | (d[3] << 8))) & KZ_PAD_UP) == 0, "key consumed by text entry is not a pad button");
+    s.consumed.fill(false);
+    s.keys.fill(false);
     s.wheelUpUntil = 0;
     s.bindings = saved;
     return failures;

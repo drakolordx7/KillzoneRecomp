@@ -236,6 +236,9 @@ int main(int argc, char *argv[])
         if (automation)
         {
             // Automation still renders into a real (hidden) window: kzgs is exercised the same way as in the game.
+            // KZ_WINDOW_SIZE=WxH sets its size (e.g. 2560x1440 to reproduce a 1440p monitor).
+            if (const char *v = std::getenv("KZ_WINDOW_SIZE"))
+                std::sscanf(v, "%dx%d", &winW, &winH);
             if (SDL_InitSubSystem(SDL_INIT_VIDEO))
             {
                 window = SDL_CreateWindow("Killzone (automation)", winW, winH, SDL_WINDOW_HIDDEN);
@@ -306,6 +309,14 @@ int main(int argc, char *argv[])
             return 1;
         }
         kzAimInstall(runtime);
+        // Tests: a separate (e.g. empty) memory card folder. After loadELF, which resets the roots to the ELF folder.
+        if (const char *mc = std::getenv("KZ_MC_ROOT"); mc && *mc)
+        {
+            PS2Runtime::IoPaths mcPaths = PS2Runtime::getIoPaths();
+            mcPaths.mcRoot = std::filesystem::path(mc).lexically_normal();
+            PS2Runtime::setIoPaths(mcPaths);
+            std::cout << "[kz] memory card root: " << mcPaths.mcRoot.string() << std::endl;
+        }
 
         // Guest vblank rate = target frame rate (kz_timing.h). Automation can force it with KZ_FPS.
         int displayHz = 60;

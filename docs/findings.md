@@ -804,3 +804,37 @@ something on host time (CD, IOP): it has less host time at 0.5. None was seen; l
 numbers too), and (b) heavy frames, where the EE has the least headroom (awake p90 7.2 ms; 0.2 % of the frames are over one vblank). At 240 Hz
 (4.17 ms vblank) the stages no longer fit: 2-vblank frames have EE awake 6.4 ms and a 5.0 ms worker job (178.7 fps). Further gains at higher rates
 are the EE's guest code (clang-cl PGO took ~1.2 ms per frame off it, see "clang-cl build") and the VU1 side of the worker, not the hand-off.
+
+## Play-test fixes: mouse yaw, button order, profile name, menu keys (2026-09-30)
+User report on the packaged build: mouse look only moved vertically and felt smoothed, C fired, no way to type the profile
+name, no keyboard input in menus. All four reproduced headless and fixed.
+- **Mouse yaw.** `FUN_0021c550` (ApplyLook) adds the yaw delta to player+0x148, but in normal walking (entity flag +0x31)
+  the body heading is rebuilt from the look *rate* and +0x148 is reset to the lag/sway offset at the end of the call, so
+  a yaw added to f13 is lost. Measured: a scripted 90-degree mouse turn (`mx=1800`) left the view unchanged while `rx=1`
+  turned it. Mouse yaw now goes in as a rate on the controller (ctrl+0xA8 and its copy ctrl+0x3C): rate = yaw /
+  (maxYaw * dt). maxYaw is measured from every ApplyLook with a non-zero rate (f13 / (rate * dt)); 2.793 rad/s unzoomed.
+  dt is the frame timer at the controller update (*(0x559178)+0x64 ticks * +0x50 s/tick), which equalled ApplyLook's
+  f12 in all 1468 logged frames (1-tick, 2-tick and clamped 0.108-0.133 s hitch frames). Result: `mx=1800/-1800/900` ->
+  applied 1.5705 / -1.5708 / 0.7854 rad, the view turns 90 / back / 45 degrees in the captures. Pitch stays on f14.
+- **Smoothing.** ApplyLook runs a camera lag (player+0x2A8/0x2AC: the view trails the aim by up to 10 degrees and eases
+  back) and idle sway (+0x170/0x174), both gated by byte player+0x16C. With keyboard/mouse the byte is cleared for the
+  duration of the call (view follows the mouse 1:1); pad play keeps both.
+- **C fired / Mouse1 crouched.** Runtime `fillPadStatus` wrote the DS2 pressure bytes 16..19 as L1, L2, R1, R2; the real
+  order is L1, R1, L2, R2. Killzone reads every button from the pressure bytes (`FUN_001b33b8`: byte pad+0x34+id), so R1
+  and L2 were swapped for keyboard *and* gamepad. `KZ_PAD_LOG=1` (hooks 0x1B33B8): scripted R1/L2/R2/L1/triangle read as
+  ids 10/9/11/8/4 before, R1 -> 9 (fire) after. Runtime patch 0026. Controller map in RAM (settings+0xEC): walk -101,
+  strafe 100, pitch 102, turn -103, allowlook -1, sprint 14, fire 9, secondary 11, action 6, switch 5, grenade 8,
+  special 7, reload 4, stance 10, zoom mode 15, zoom 105.
+- **Profile name.** The on-screen keyboard (`FUN_001b0ee0`, state obj+0x21C: 1 open, 2 confirm, 4 cancel) is preceded
+  every frame by `FUN_001b0df0`, the game's own USB keyboard reader (HID 0x28 enter -> state 2, 0x29 escape -> 4, 0x2A
+  backspace -> `FUN_001b18d8`, else `FUN_001b17a0(obj, ch)` add char); no USB keyboard is emulated. That function is
+  hooked: while state == 1, typed keys (letters with Shift/Caps, digits, space, - _ .) go to the game's add-char /
+  backspace as tail calls (a yield inside resumes in guest code), Enter/Escape set the state. Keys used for typing do
+  not reach the pad (held keys are marked consumed until released). Checked on an empty card (`KZ_MC_ROOT`): No profiles
+  -> Create -> Edit -> "Drako" typed -> Create profile -> saved (BASCUS-97402655FB312 written) -> level, difficulty,
+  character -> gameplay.
+- **Menus.** The front end navigates with the D-pad only (left stick `ly=1` did not move the Create Profile selection;
+  D-pad down did). Arrow keys and WASD now also press the D-pad (bindings Version=2; older [Bindings] sections get the
+  additions appended). No D-pad id is read during gameplay (`KZ_PAD_LOG`, each direction held 2 s).
+- Test hooks: `KZ_MC_ROOT=<dir>` memory card folder; `KZ_INPUT_SCRIPT` items `t:type=text`, `t:textenter|textback|
+  textcancel`, `b<t>:...` (dropped once the name is entered) and `v<t>:...` (seconds after the name is entered).

@@ -644,3 +644,6 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
     VU0 calls and 101 k timer comparisons, 0 mismatches; frames (menus, intro movie and menu video backgrounds with `KZ_IPU` unset, loading screen, level, weapon,
     HUD, explosions, death screen) as in the old clock; SPU2 WAV over 130 s: 130.01 s (old clock) vs 130.00 s (new), equal per-10 s RMS and peaks, same music (correlation 0.95 at
     the usual constant offset); no `TIMED OUT` or new warning lines.
+- **0026-pad-pressure-order.patch** - DualShock 2 pressure bytes 16..19 are L1, R1, L2, R2 (the runtime wrote L1, L2, R1, R2). Killzone reads every
+  button through the pressure bytes (FUN_001b33b8: byte pad+0x34+id), so R1 and L2 were swapped for keyboard and gamepad: fire (id 9) came from L2
+  and crouch (id 10) from R1. Measured with `KZ_PAD_LOG=1` (scripted R1, L2, R2, L1, triangle -> ids 10, 9, 11, 8, 4 before the fix).
