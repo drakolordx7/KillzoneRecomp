@@ -46,8 +46,8 @@ Uncheck "Show this launcher at startup" to boot straight into the game. To get t
 "killzone.exe --launcher" (or set Show=1 under [Launcher] in killzone.ini).
 
 Status (test build)
-- Gameplay runs at roughly 70-80 fps with the frame rate set to "Match monitor refresh" on a 120/144 Hz monitor.
-  A locked 120 fps is still being worked on.
+- Frame rate: "Match monitor refresh" (default) runs the game at your monitor's rate. Measured in gameplay:
+  about 117-120 fps on 120 Hz, about 130-140 fps on 144 Hz.
 - The game plays its full intro movies before the main menu, as on the PS2.
 - The virtual memory card (profiles, saves) is kept in the killzone.exe folder.
 - If something goes wrong, run with the launcher and check the Display tab, or delete killzone.ini to reset.
