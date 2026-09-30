@@ -394,3 +394,74 @@ decode per instruction) and the SPU2 register hooks; speeding those up would shr
 measured). (2) Blocking calls (32 per run) and HLE-served RPCs stay inline. (3) A game that calls a nowait RPC and reads the reply
 before the completion (`sceSifCheckStatRpc`, end function, semaphore) now sees the reply up to ~1 ms late, as on hardware; no
 symptom of that was seen in Killzone (menus, loading, movies, gameplay, sound).
+
+## Guest memory/IO and DMA chain copies (2026-09-30, patch 0020)
+Measured with the switches below (same binary, A/B by environment). The machine was shared with 2-3 other game instances and
+builds, so absolute numbers are 10-20 % worse than a quiet machine; every comparison is a concurrent pair. "EE ms/frame" is
+the EE thread's non-sleeping host time per displayed frame (`tools/scripts/perf_metric.py`: (1000 ms - pacing sleep) / fps,
+`PS2X_SCHED_STATS=1`), or, for the profile pairs, EE busy samples / frames in the 40 s window.
+
+- **What leaves the inline RAM window** (`KZ_MEMSTATS=1`: every 10 s the loads/stores that reach `PS2Runtime::Load*/Store*`,
+  by class and the 40 hottest addresses). Gameplay window, 4 windows of a 235 s run: 7.9-9.0 M accesses/s (with the stats
+  mutex, ~50 fps), of which **99.93-99.96 % scratchpad** (0x70000000..0x70003FFF: the guest's stack and hot working set;
+  hottest 0x70003D3C, then 0x70000000..0x7000006F and 0x700002AC..0x700002BC, 8-bit loads at 0x70000220..223; the 40 hottest
+  addresses are 32-47 % of the accesses, and of those 82-94 % are loads (62-73 % 32-bit, 8-32 % 8-bit) and 6-18 % 32-bit
+  stores). Everything else together is < 0.06 %: DMA channel registers 0.03-0.05 % (~4 k/s),
+  GS privileged registers 0.009 % (~730/s), timers 0.003 % (~250/s), VIF/DMAC control 0.001 %. So there is no hot IO register
+  worth an array or a hash-free dispatch: `m_ioRegisters` lookups are ~5 k/s in total. (Accesses that take the out-of-line
+  `ps2CgRd*Slow/Wr*Slow` but are not special, i.e. kseg0/uncached RAM mirrors, cannot be counted from the runtime; the
+  `ps2CgWr32Slow` profile entries are the scratchpad stores.)
+- **Completed-DMAC drain (the big one).** `PS2Runtime::Store32` ran `drainCompletedDmacHandlers` after every special-address
+  store, and `consumeCompletedDmacCauses` took `m_completedDmacMutex` twice each time (at least 0.5 M scratchpad stores/s):
+  `PS2Runtime::Store32 -> consumeCompletedDmacCauses` was **5.2 % of the EE thread's busy samples** (Mtx_lock/unlock 2.2/2.1 %,
+  SRW lock acquire/release 1.6/1.7 % self). Now a global `g_ps2CompletedDmacPending` (set by `queueCompletedDmacCause`, cleared
+  by the consumer, both under the mutex) lets the consumer return without the lock while nothing is queued
+  (`PS2X_DMAC_DRAIN_FAST=0` = old). After: no lock entry above 0.1 % on the EE thread. A cause queued at the moment of the check is
+  drained by the next store or scheduler event, as if the drain had run a moment earlier.
+- **Scratchpad fast path in `PS2Runtime::Load*/Store*`.** Aligned accesses inside 0x70000000..0x70003FFF go straight to the host
+  scratchpad pointer (`PS2X_SPR_FAST=0` = old path through `PS2Memory::read*/write*`: GS-priv test, scratchpad test twice,
+  `translateAddress`, `loadScalar` range checks). Profile self shares (concurrent pair, same window): `PS2Memory::read32` 1.4 %
+  -> 0, `translateAddress` 0.5 -> 0.1, `write32` 0.4 -> 0, `Load32` 0.6 -> 1.2, `Store32` 0.3 -> 0.7 (the work moved into
+  them). Alone it is below the noise of a paired run (EE ms/frame -1.08, +0.41, +0.01 for `PS2X_SPR_FAST=0` -> on).
+- **Together** (`PS2X_SPR_FAST=0 PS2X_DMAC_DRAIN_FAST=0` -> defaults), 3 concurrent pairs with the sched-stats metric: EE ms/frame
+  15.46 / 13.38 / 14.53 -> 14.15 / 12.24 / 12.92 (median -1.31 ms, -9 %; 3 of 3 pairs lower), fps 55.2 / 62.4 / 57.3 ->
+  55.6 / 62.0 / 57.3. 3 more pairs with the profiler on, made when the pooled-memcpy chain copy below was still switched on (EE busy ms/frame): 11.37 / 13.28 / 12.57 -> 9.96 / 11.23 / 11.86
+  (median -1.41 ms), fps 64.3 / 59.3 / 57.4 -> 66.6 / 64.7 / 60.4. The EE thread sleeps more (pacing sleep 147-167 ->
+  213-259 ms/s in the first set) but fps only moves when frames cross a vblank boundary, see the patch 0019 section above.
+  Drain alone with the scratchpad path on (`PS2X_DMAC_DRAIN_FAST=0` only): 14.52 / 14.51 / 13.64 -> n/a (boot flake) / 14.35 /
+  13.63, i.e. not resolvable on its own; the profile share above is the direct evidence for it.
+- **DMA chain snapshot copy** (`KZ_CHAINSTATS=1`; per VIF1 kick in gameplay: 2.86 MB in ~3 600 segments: REF (tag id 3)
+  2.06 MB in 1 807 segments of ~1.1 KB, RET (id 6) 0.73 MB in 880, CNT (id 1) 0.18 MB in 921, tag words 8 B each).
+  The walk costs 0.55-0.8 ms per kick (`PS2X_VIF1_STATS=1` walk time / jobs; 3-4 % of the EE thread). What did **not** help (each measured as walk ms per job in concurrent runs, or EE ms/frame):
+  a pre-sized pooled buffer written with `memcpy` and no zero-fill (0.668 -> 0.660 and 1.117 -> 1.020 ms/job; EE ms/frame
+  12.18 / 11.24 / 12.96 -> 12.52 / 11.80 / 12.70), non-temporal AVX2 stores (0.72-0.87 vs 0.71-0.82), a two-phase walk
+  that collects the segments and copies them with software prefetch 3 segments ahead (0.79 vs 0.67, worse), both together
+  (0.90). Skipping only the copy of REF segments (measurement hack, the pooled buffer then holds an older chain) took the
+  walk from 0.533 to 0.211 ms/job, so REF is ~60 % of the walk and the rest is tag parsing plus the small hot segments. The
+  copy is memory bound, and none of the kept switches changes it: nothing was kept.
+- **Zero-copy is not free of hazards** (`PS2X_CHAIN_VERIFY=1`: the walk registers each segment's source pointer; when the job's
+  buffer is recycled the copy is compared with the live source). IPU off, boot + menus + gameplay, 235 s: 24 670 jobs, **0
+  with a changed source**, kick-to-done latency avg 0.1-12 ms (max 209 ms under load). IPU on (movies), 10 013 jobs: 170 jobs
+  (1.7 %) had changed sources, 3 737 REF segments / 107 MB in total, all REF (tag id 3), none in CNT/RET/REFE: the FMV player
+  overwrites a frame buffer that is still referenced by an unfinished job. So handing the worker pointers into RDRAM would
+  corrupt movie frames unless the movie path waits for completion, and `PS2Memory::processVIF1Data` needs one contiguous
+  chain (an UNPACK command in a CNT segment and its data in the next REF segment straddle segment borders; only DIRECT
+  continuation is resumable), so a scatter list also needs interpreter work. Neither was attempted.
+- **Inline scratchpad window in `ps2_cg.h`: prototyped, no gain, not adopted.** After the fixes above the guest scratchpad
+  accesses still go through `ps2CgRd32Slow`/`ps2CgWr32Slow`/... (noinline, `isSpecialAddress`) and `PS2Runtime::Load*/Store*`:
+  6.7 % of the EE thread's busy samples in one gameplay profile (`ps2CgWr32Slow` 1.1, `Load32` 1.2, `ps2CgWr128Slow` 1.0,
+  `Store32` 0.7, `ps2CgRd32Slow` 0.6, `ps2CgRd128Slow` 0.4, the rest < 0.4). A second inline window
+  `(a - 0x70000000) <= 0x4000 - size` with an alignment check, reading `ps2GetScratchpadHostPtr()`, added to `PS2CG_RD/PS2CG_WR`
+  and `ps2CgRd128/Wr128` (a private copy of `ps2_cg.h` placed in a copy of `generated/`, whose quoted include wins over the
+  runtime's, built in its own build dir so nobody's incremental build was touched;
+  `patches/ps2recomp/experimental/ps2_cg-scratchpad-window.diff`) takes those entries down to 1.7 % (`ps2CgWr32Slow` 0.7 and
+  `ps2CgWr128Slow` 0.7 remain: stores that are neither in the RAM window nor scratchpad, presumably kseg0/uncached RAM
+  aliases, which the runtime cannot count). But the paired EE ms/frame did not move: prototype vs current build, 3 concurrent
+  pairs, 12.79 / 11.17 / 10.89 -> 12.16 / 11.78 / 11.04 (differences -0.63, +0.61, +0.15 ms, fps 64.1 / 73.6 / 71.4 -> 68.5 /
+  71.1 / 71.8), and a profiled pair 11.36 -> 11.99 ms/frame (fps 69.8 vs 68.2). The extra branches in ~100 k generated
+  functions cost about what the calls saved; a full rebuild for this is not worth it.
+- **What is left on the EE thread in this area.** The guest-code side (about 80 % of the thread) and the scheduler/VU0 work
+  owned elsewhere. The remaining memory/IO items are each below 1.5 % of the EE thread: chain walk + snapshot (3-4 %, memory
+  bound, see above), the two slow-path store entries above (1.4 %), `PS2Runtime::Load32/Store32` themselves (1.2 / 0.7 %).
+  Worker-side note from the same runs (`PS2X_VIF1_STATS=1`): the VIF1 worker is busy 4.2-5.2 s per 10 s at 45-55 fps
+  (about 10 ms per job, of which VU1 ~8 ms), so at 120 fps the worker, not only the EE thread, is a limit.
