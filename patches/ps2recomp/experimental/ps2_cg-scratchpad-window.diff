@@ -1,0 +1,62 @@
+diff --git a/ps2xRuntime/include/ps2_cg.h b/ps2xRuntime/include/ps2_cg.h
+index 19f30f1..b8a4f49 100644
+--- a/ps2xRuntime/include/ps2_cg.h
++++ b/ps2xRuntime/include/ps2_cg.h
+@@ -97,6 +97,11 @@ PS2CG_NOINLINE inline void ps2CgWr128Slow(uint8_t *rdram, R5900Context *ctx, PS2
+     if (PS2Runtime::isSpecialAddress(a)) rt->Store128(rdram, ctx, a, v); else Ps2FastWrite128(rdram, a, v);
+ }
+ 
++// Scratchpad window (0x70000000, 16 KB): the guest keeps its stack and hot working set there (~99.9 % of the accesses
++// that leave the RAM window), so it gets its own inline path. Aligned accesses only.
++constexpr uint32_t PS2CG_SPR_BASE = 0x70000000u;
++constexpr uint32_t PS2CG_SPR_SIZE = 0x4000u;
++
+ #define PS2CG_RD(NAME, TYPE, BYTES)                                                                                  \
+     PS2CG_FORCEINLINE TYPE ps2Cg##NAME(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt, uint32_t a)                 \
+     {                                                                                                                \
+@@ -104,6 +109,10 @@ PS2CG_NOINLINE inline void ps2CgWr128Slow(uint8_t *rdram, R5900Context *ctx, PS2
+         {                                                                                                            \
+             return *reinterpret_cast<const TYPE *>(rdram + a);                                                       \
+         }                                                                                                            \
++        if ((a - PS2CG_SPR_BASE) <= PS2CG_SPR_SIZE - (BYTES) && (a & ((BYTES) - 1u)) == 0u) [[likely]]                \
++        {                                                                                                             \
++            return *reinterpret_cast<const TYPE *>(ps2GetScratchpadHostPtr() + (a - PS2CG_SPR_BASE));                 \
++        }                                                                                                             \
+         return ps2Cg##NAME##Slow(rdram, ctx, rt, a);                                                                 \
+     }
+ PS2CG_RD(Rd8, uint8_t, 1u)
+@@ -118,6 +127,10 @@ PS2CG_FORCEINLINE __m128i ps2CgRd128(uint8_t *rdram, R5900Context *ctx, PS2Runti
+     {
+         return _mm_loadu_si128(reinterpret_cast<const __m128i *>(rdram + a));
+     }
++    if ((a - PS2CG_SPR_BASE) <= PS2CG_SPR_SIZE - 16u && (a & 15u) == 0u) [[likely]]
++    {
++        return _mm_loadu_si128(reinterpret_cast<const __m128i *>(ps2GetScratchpadHostPtr() + (a - PS2CG_SPR_BASE)));
++    }
+     return ps2CgRd128Slow(rdram, ctx, rt, a);
+ }
+ 
+@@ -129,6 +142,11 @@ PS2CG_FORCEINLINE __m128i ps2CgRd128(uint8_t *rdram, R5900Context *ctx, PS2Runti
+             *reinterpret_cast<TYPE *>(rdram + a) = v;                                                                \
+             return;                                                                                                  \
+         }                                                                                                            \
++        if ((a - PS2CG_SPR_BASE) <= PS2CG_SPR_SIZE - (BYTES) && (a & ((BYTES) - 1u)) == 0u) [[likely]]                \
++        {                                                                                                             \
++            *reinterpret_cast<TYPE *>(ps2GetScratchpadHostPtr() + (a - PS2CG_SPR_BASE)) = v;                          \
++            return;                                                                                                   \
++        }                                                                                                             \
+         ps2Cg##NAME##Slow(rdram, ctx, rt, a, v);                                                                     \
+     }
+ PS2CG_WR(Wr8, uint8_t, 1u)
+@@ -144,6 +162,11 @@ PS2CG_FORCEINLINE void ps2CgWr128(uint8_t *rdram, R5900Context *ctx, PS2Runtime
+         _mm_storeu_si128(reinterpret_cast<__m128i *>(rdram + a), v);
+         return;
+     }
++    if ((a - PS2CG_SPR_BASE) <= PS2CG_SPR_SIZE - 16u && (a & 15u) == 0u) [[likely]]
++    {
++        _mm_storeu_si128(reinterpret_cast<__m128i *>(ps2GetScratchpadHostPtr() + (a - PS2CG_SPR_BASE)), v);
++        return;
++    }
+     ps2CgWr128Slow(rdram, ctx, rt, a, v);
+ }
+ 

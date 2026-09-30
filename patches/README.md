@@ -473,3 +473,34 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
     avg 1.5 ms, max 112 ms).
   - **Debug.** `PS2X_IOP_RPC_STATS=1` (the table, plus the EE-side `SifCallRpc` totals, calls on a still-busy client and the queue
     latency of offloaded calls), `PS2X_IOP_RPC_ASYNC=0`.
+
+- `0020-guest-io-copies.patch` (runtime library only: `ps2_memory.cpp`, `ps2_runtime.cpp`, `ps2_vif1_worker.cpp/.h`; no header that
+  generated code includes, so no full rebuild; made against the tree with 0019 applied, and 0019's `ps2_memory.cpp` hunk carries
+  this patch's drain comment as context, so apply the two together or use `git apply --3way`). Guest memory/IO slow paths and the
+  DMA chain snapshot, measured in the gameplay window (`KZ_FPS=120`, concurrent A/B pairs; details, numbers and what did not help:
+  docs/findings.md, "Guest memory/IO and DMA chain copies").
+  - **Completed-DMAC drain without the mutex.** `PS2Runtime::Store32` drains completed DMAC handlers after every special-address
+    store, and `PS2Memory::consumeCompletedDmacCauses` took `m_completedDmacMutex` twice per call: 5.2 % of the EE thread's busy
+    samples. A global `g_ps2CompletedDmacPending` (declared in `ps2_vif1_worker.h`, defined in `ps2_memory.cpp`) lets it return
+    without the lock while nothing is queued. `PS2X_DMAC_DRAIN_FAST=0` = old.
+  - **Scratchpad fast path.** ~99.9 % of the guest loads/stores that leave the inline RDRAM window are scratchpad (7.9-9.0 M/s);
+    aligned accesses in 0x70000000..0x70003FFF are served from the host scratchpad pointer in `PS2Runtime::Load*/Store*`.
+    `PS2X_SPR_FAST=0` = old. All other IO together is < 0.06 % of those accesses (DMA channel registers ~4 k/s, GS privileged ~730/s,
+    timers ~250/s), so no IO register got a special path.
+  - Result: EE ms/frame (non-sleeping EE host time per displayed frame) with `PS2X_SPR_FAST=0 PS2X_DMAC_DRAIN_FAST=0` -> defaults,
+    3 concurrent pairs: 15.46 / 13.38 / 14.53 -> 14.15 / 12.24 / 12.92 (median -1.31 ms, -9 %); 3 profiled pairs (that set still had the
+    pooled-memcpy chain copy switched on, not kept) 11.37 / 13.28 / 12.57 -> 9.96 / 11.23 / 11.86. fps did not move (55.2 / 62.4 / 57.3 -> 55.6 / 62.0 / 57.3): frames land on vblank boundaries.
+    Each half alone is below the noise of a pair; the profile shows the lock entries (`consumeCompletedDmacCauses` 5.2 % inclusive,
+    SRW/Mtx 1.6-2.2 % each) gone and `PS2Memory::read32`/`translateAddress` off the top.
+  - **Measurement switches** (env-gated, off by default): `KZ_MEMSTATS=1` (10 s histogram of the guest accesses that reach
+    `PS2Runtime::Load*/Store*`, by class and the 40 hottest addresses), `KZ_CHAINSTATS=1` (bytes and segments per DMAtag id of the
+    VIF1 chain walk), `PS2X_CHAIN_VERIFY=1` (compares every chain snapshot with the live source when the job's buffer is recycled:
+    counts sources the guest overwrote between the CHCR store and job completion; 0 of 24 670 jobs in boot + menus + gameplay
+    with IPU off, 170 of 10 013 with movies on, all in REF segments = FMV frame buffers, so a zero-copy chain would corrupt movies).
+  - **Not kept (measured, no gain):** pre-sized pooled chain buffer + `memcpy` (walk 0.668 -> 0.660 and 1.117 -> 1.020 ms/job),
+    non-temporal stores, two-phase gather with prefetch (worse: 0.79 vs 0.67 ms/job). The copy is memory bound; REF segments are
+    ~60 % of the 0.55-0.8 ms per kick (skipping their copy: 0.533 -> 0.211 ms/job).
+  - `experimental/ps2_cg-scratchpad-window.diff` (not applied by the `*.patch` glob): an inline scratchpad window in `ps2_cg.h`.
+    Built in a private build dir (a copy of `generated/` whose own `ps2_cg.h` wins the quoted include): the slow-path entries fall
+    from 6.7 % to 1.7 % of the EE thread's samples, but EE ms/frame did not move (12.79 / 11.17 / 10.89 -> 12.16 / 11.78 / 11.04),
+    so it is not adopted.
