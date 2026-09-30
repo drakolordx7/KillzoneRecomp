@@ -565,6 +565,14 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
     patches 0020/0021 (both in the runtime of `dsp0`/`dsp2`), and `=1` reads the host clock and does rdtsc/counter work on every
     dispatch (`RtlQueryPerformanceCounter` 2.9 % + `schedStatsReport` 1.5 % of the EE thread in the profile), which taxes exactly the
     build with 1 M dispatches per second.
+    Second set, three builds at once (`dsp0` before, `dsp2` final, `dsp3` = `PS2X_CODEGEN_FOLD=0`: trampolines and local returns
+    but no folding), 4 rounds, all rebuilt from the same runtime sources: EE ms/frame before 11.01 / 11.96 / 12.04 / 11.81 (median
+    11.89), final 10.68 / 11.28 / 11.28 / 11.23 (median 11.26: -0.63 ms, -5 %), no folding 10.61 / 11.93 / 11.29 / 10.92 (median 11.11);
+    fps before 69.3 / 66.5 / 65.7 / 68.8, final 70.3 / 66.9 / 67.9 / 70.7, no folding 71.2 / 64.9 / 66.7 / 72.1. Folding is not
+    measurably faster than the trampolines alone (differences within the +-0.3 ms noise of the rounds); it removes the ~0.73 M followed
+    tail jumps per second (1.2 k/s left) and is kept on for the code size (-27 % exe), compile time (-48 % CPU) and because a resume
+    can no longer land in a fragment that loops through the scheduler. Over all 8 comparisons with the final build: -0.32 / -0.29 / -0.59 /
+    -0.31 / -0.33 / -0.68 / -0.76 / -0.58 ms, median -0.45 ms (-4 %).
   - **Correctness evidence.** See docs/findings.md "Guest control flow without the scheduler".
   - **Left.** ~190 yields/s x ~40 unwound frames = the remaining ~8 k dispatches/s (needs stack switching or fibers to remove); the
     memory slow paths (`ps2CgWr32Slow`/`ps2CgRd32Slow`/`Load32`/`Store32`, ~6 % of the EE thread in the profile: scratchpad and

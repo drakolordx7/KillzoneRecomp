@@ -478,6 +478,7 @@ absolute frame rates are 56-64 and only concurrent pairs compare.
   |---|---|---|---|---|---|---|---|---|
   | before (generated code of `build\RelWithDebInfo`, instrumented runtime) | 922 657 | 16 041 | 364 | 166 | 365 255 | 556 872 | 0 | 0 |
   | call-site trampolines + local recursive returns (no scheduler follow, no folding) | 214 483 | 3 675 | 355 | 180 | 9 486 | 204 462 | 370 593 | 125 329 |
+  | + scheduler follow, no folding (`PS2X_CODEGEN_FOLD=0`; this run at 73 fps on a quiet machine) | 9 947 | 136 | 358 | 198 | 9 391 | 0 | 726 864 | 158 136 |
   | final (+ scheduler follow + fragment folding) | 8 440 | 146 | 347 | 186 | 7 907 | 0 | 1 190 | 123 720 |
 
   *Yield* = a checkpoint gave control back (166-186/s). *Return-resume* = the guest returned through
@@ -511,7 +512,23 @@ absolute frame rates are 56-64 and only concurrent pairs compare.
   | 3 | 71.6 / 71.8 | 10.83 / 10.24 | -0.59 |
   | 4 | 69.8 / 70.0 | 11.45 / 11.14 | -0.31 |
 
-  Median fps 72.6 -> 72.8 (no change: the frame list is kicked at a vblank, so the frame rate only moves when a frame crosses a
+  Second set, three builds run at once for 4 rounds (before = `dsp0`, final = `dsp2`, no folding = `dsp3`, `PS2X_CODEGEN_FOLD=0`;
+  all three relinked from the same runtime sources right before):
+
+  | round | fps before / final / no folding | EE ms/frame before / final / no folding |
+  |---|---|---|
+  | 1 | 69.3 / 70.3 / 71.2 | 11.01 / 10.68 / 10.61 |
+  | 2 | 66.5 / 66.9 / 64.9 | 11.96 / 11.28 / 11.93 |
+  | 3 | 65.7 / 67.9 / 66.7 | 12.04 / 11.28 / 11.29 |
+  | 4 | 68.8 / 70.7 / 72.1 | 11.81 / 11.23 / 10.92 |
+
+  Median EE ms/frame 11.89 / 11.26 / 11.11 (final -0.63 ms = -5 %). Folding is not measurably faster than the trampolines alone
+  (the rounds differ by more than the two builds do, +-0.3 ms); what it removes is the 0.73 M followed tail jumps per second, and it is kept
+  on for the code size (-27 % exe), compile time (-48 % CPU) and because a resume can no longer land in a fragment that loops
+  through the scheduler. Over all 8 comparisons of the final build with the old code: -0.32 / -0.29 / -0.59 / -0.31 (first set) and
+  -0.33 / -0.68 / -0.76 / -0.58 ms (second), median -0.45 ms (-4 %); fps moves by 0-2 (the frame rate steps with the vblank).
+
+  First set: median fps 72.6 -> 72.8 (no change: the frame list is kicked at a vblank, so the frame rate only moves when a frame crosses a
   vblank boundary; docs/findings.md "EE thread frame budget"), EE ms/frame median -0.31 ms, mean -0.38 ms (-3 %). Profile of the EE
   thread without stats (KZ_PROFILE=160,40, one pair of runs): `EeScheduler::run` self 3.6 % -> 0.1 %. What is left in the profile is
   spread thinly (no guest function above ~1.2 %) plus the memory paths outside the RAM window (`ps2CgWr32Slow`, `ps2CgRd32Slow`,
@@ -531,6 +548,7 @@ absolute frame rates are 56-64 and only concurrent pairs compare.
     HUD, weapon, explosions, mission-failed screen at the end, in the same order and looking like the baseline (frames compared side by
     side: work/dsp_c_hist vs work/dsp_b0_hist); no `guest-branch` / `sched-trace` / `[error]` line in any run, `missing tail targets=0`
     in all 23 windows of every run.
+  - The `PS2X_CODEGEN_FOLD=0` variant (`dsp3`) passed the same checks in its `=2` run and the 4 rounds above (no error line, no missing tail target).
   - With `KZ_IPU` unset (movies): Guerrilla logo, intro cinematic, menu with the movie background, mission (work/dspChk_ipu).
   - `PS2X_STRESS_YIELD=97` (a checkpoint yield every 97th check, unwinding and resuming the whole stack at every kind of label):
     the final build reaches the main menu in 9 of 9 boots (3 in pairs with the baseline, run to t=100 s: also the campaign submenu
