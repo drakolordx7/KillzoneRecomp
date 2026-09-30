@@ -1,0 +1,833 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_host_spu2.h b/ps2xIOP/include/ps2x/iop/iop_host_spu2.h
+index 502197b..598cab6 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_host_spu2.h
++++ b/ps2xIOP/include/ps2x/iop/iop_host_spu2.h
+@@ -11,7 +11,9 @@
+ //  - time: advance() after every IOP time slice and at the end of each runCycles(), and nextEvent() bounds how far
+ //    the IOP skips ahead while all threads sleep.
+ // Every call passes the IOP cycle counter (36.864 MHz). It is monotonic across IOP resets.
+-// All hooks run on the thread that runs the IOP (the EE thread). Without hooks, the old stub behaviour is unchanged.
++// All hooks run on the thread that runs the IOP: the EE thread, or with PS2X_IOP_THREAD the IOP thread (and, while
++// it holds the IOP lock, the EE thread inside an RPC / module load). Calls are always serialised, never concurrent.
++// Without hooks, the old stub behaviour is unchanged.
+ namespace ps2x::iop
+ {
+     struct IopHostSpu2
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+index 68fec81..89bdd9d 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -10,6 +10,9 @@
+ 
+ namespace ps2x::iop
+ {
++    // True on the thread that runs the IOP in threaded mode.
++    [[nodiscard]] bool onIopThread() noexcept;
++
+     class IopSubsystem
+     {
+     public:
+@@ -43,6 +46,31 @@ namespace ps2x::iop
+ 
+         [[nodiscard]] DebugSnapshot debugSnapshot() const;
+ 
++        // ---- Threaded mode ------------------------------------------------------------------------------------------
++        // enableThread(true) serialises every public entry point above with one recursive lock and lets a host thread
++        // run the IOP (and, through the host SPU2 hooks, SPU2 mixing) off the caller's thread. The thread is started
++        // by the first publishEeCycles(). It consumes the published EE cycles (IOP time = EE / 8, exactly as
++        // runEeCycles) and never runs ahead of them. runEeCycles() must not be used while the thread runs.
++        // Everything the IOP does that touches the host runs on the IOP thread (or, inside handleRpc/loadModule/...,
++        // on the calling thread while it holds the lock), so hosts must make IopHost callbacks thread-safe.
++        // Without enableThread() every entry point is unlocked and unchanged.
++        void enableThread(bool enable);
++        [[nodiscard]] bool threadEnabled() const noexcept;
++        // Total EE cycles elapsed so far (monotonic). Cheap: one atomic store; may be called from the hot path.
++        void publishEeCycles(uint64_t totalEeCycles) noexcept;
++
++        struct ThreadStats
++        {
++            uint64_t published = 0;     // EE cycles published
++            uint64_t consumed = 0;      // EE cycles run by the IOP thread
++            uint64_t maxLagCycles = 0;  // largest published - consumed seen when the IOP thread woke (EE cycles)
++            uint64_t runNs = 0;         // wall time the IOP thread spent running the IOP (lock held)
++            uint64_t eeCalls = 0;       // EE-side entry points that took the lock
++            uint64_t eeWaitNs = 0;      // ... and the time they waited for it (only measured with PS2X_IOP_THREAD_STATS)
++            uint64_t eeMaxWaitNs = 0;
++        };
++        [[nodiscard]] ThreadStats threadStats() const;
++
+     private:
+         class Impl;
+         std::unique_ptr<Impl> m_impl;
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index b498155..c6a8ed1 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -6,13 +6,66 @@
+ #include "module_factories.h"
+ #include "ps2x/iop/ps2_path.h"
+ 
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
+ #include <sstream>
++#include <thread>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <utility>
+ 
++#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
++#include <xmmintrin.h>
++#endif
++
++#if defined(_WIN32)
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#include <process.h>
++#endif
++
+ namespace ps2x::iop
+ {
++    namespace
++    {
++        thread_local bool t_onIopThread = false;
++
++        uint64_t nowNs()
++        {
++            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                             std::chrono::steady_clock::now().time_since_epoch())
++                                             .count());
++        }
++
++        bool envFlag(const char *name, bool defaultValue)
++        {
++            const char *v = std::getenv(name);
++            if (!v || !*v)
++                return defaultValue;
++            return !(v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F');
++        }
++
++        // Threaded mode granularity. The IOP thread runs the IOP in chunks of kChunkEeCycles (4096 IOP cycles, ~110 us
++        // of IOP time) so EE-side callers waiting for the lock get in quickly, and only wakes for work when at least
++        // kMinBacklogEeCycles (2048 IOP cycles, ~55 us) of EE time are unconsumed.
++        constexpr uint64_t kChunkEeCycles = 4096u * 8u;
++        constexpr uint64_t kMinBacklogEeCycles = 2048u * 8u;
++    }
++
++    bool onIopThread() noexcept
++    {
++        return t_onIopThread;
++    }
++
+     class IopSubsystem::Impl
+     {
+     public:
+@@ -20,6 +73,7 @@ namespace ps2x::iop
+             : host(hostRef),
+               emulator(hostRef)
+         {
++            statsEnabled = envFlag("PS2X_IOP_THREAD_STATS", false);
+             coreServices.emplace_back(detail::createMcservService(host));
+             coreServices.emplace_back(detail::createDbcmanService(host));
+             coreServices.emplace_back(detail::createLibSdService(host));
+@@ -78,6 +132,242 @@ namespace ps2x::iop
+             host.log(hle ? LogLevel::Info : LogLevel::Warning, message);
+         }
+ 
++        ~Impl()
++        {
++            stopThread();
++        }
++
++        // ---- threaded mode ------------------------------------------------------------------------------------------
++        // Every public IopSubsystem entry point takes execMutex (recursive: handleRpc -> HLE service -> host ->
++        // readIopMemory re-enters). The IOP thread holds it while it runs the IOP. execWaiters lets the IOP thread
++        // hand the lock over between chunks: std::mutex is not fair, and without it a tight unlock/lock loop would
++        // starve the EE thread.
++        struct ExecGuard
++        {
++            Impl *impl = nullptr;
++            explicit ExecGuard(const Impl &owner) noexcept
++            {
++                if (owner.threaded.load(std::memory_order_relaxed))
++                {
++                    impl = const_cast<Impl *>(&owner);
++                    impl->lockExec();
++                }
++            }
++            ~ExecGuard()
++            {
++                if (impl)
++                    impl->execMutex.unlock();
++            }
++            ExecGuard(const ExecGuard &) = delete;
++            ExecGuard &operator=(const ExecGuard &) = delete;
++        };
++
++        void lockExec()
++        {
++            eeCalls.fetch_add(1, std::memory_order_relaxed);
++            execWaiters.fetch_add(1, std::memory_order_acq_rel);
++            if (statsEnabled)
++            {
++                const uint64_t t0 = nowNs();
++                execMutex.lock();
++                const uint64_t waited = nowNs() - t0;
++                eeWaitNs.fetch_add(waited, std::memory_order_relaxed);
++                if (waited > 1000000u)
++                    eeWaitsOver1ms.fetch_add(1, std::memory_order_relaxed);
++                uint64_t prev = eeMaxWaitNs.load(std::memory_order_relaxed);
++                while (waited > prev && !eeMaxWaitNs.compare_exchange_weak(prev, waited, std::memory_order_relaxed))
++                {
++                }
++            }
++            else
++            {
++                execMutex.lock();
++            }
++            execWaiters.fetch_sub(1, std::memory_order_acq_rel);
++        }
++
++        void startThread()
++        {
++            std::lock_guard<std::mutex> lock(threadStartMutex);
++            if (threadStarted.load(std::memory_order_acquire) || !threaded.load(std::memory_order_acquire))
++                return;
++            stopRequested.store(false, std::memory_order_release);
++#if defined(_WIN32)
++            struct Start
++            {
++                static unsigned __stdcall entry(void *arg)
++                {
++                    static_cast<Impl *>(arg)->threadMain();
++                    return 0;
++                }
++            };
++            // 4 MB: IOP guest callbacks nest (callFunction re-entrancy) and the emulator keeps CPU states on the stack.
++            threadHandle = reinterpret_cast<void *>(_beginthreadex(nullptr, 4u << 20, &Start::entry, this, 0, nullptr));
++            threadStarted.store(threadHandle != nullptr, std::memory_order_release);
++#else
++            worker = std::thread([this]() { threadMain(); });
++            threadStarted.store(true, std::memory_order_release);
++#endif
++        }
++
++        void stopThread()
++        {
++            std::lock_guard<std::mutex> lock(threadStartMutex);
++            if (!threadStarted.load(std::memory_order_acquire))
++                return;
++            stopRequested.store(true, std::memory_order_release);
++#if defined(_WIN32)
++            if (threadHandle)
++            {
++                WaitForSingleObject(static_cast<HANDLE>(threadHandle), INFINITE);
++                CloseHandle(static_cast<HANDLE>(threadHandle));
++                threadHandle = nullptr;
++            }
++#else
++            if (worker.joinable())
++                worker.join();
++#endif
++            threadStarted.store(false, std::memory_order_release);
++        }
++
++        // Sleep ~100 us (a high-resolution waitable timer on Windows; the default timer tick is 15.6 ms).
++        static void idleWait(void *timer)
++        {
++#if defined(_WIN32)
++            if (timer)
++            {
++                LARGE_INTEGER due;
++                due.QuadPart = -1000; // 100 us, relative, in 100 ns units
++                if (SetWaitableTimer(static_cast<HANDLE>(timer), &due, 0, nullptr, nullptr, FALSE))
++                {
++                    WaitForSingleObject(static_cast<HANDLE>(timer), 20);
++                    return;
++                }
++            }
++            Sleep(1);
++#else
++            (void)timer;
++            std::this_thread::sleep_for(std::chrono::microseconds(200));
++#endif
++        }
++
++        void threadMain()
++        {
++            t_onIopThread = true;
++#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
++            // The EE thread runs with FTZ|DAZ (denormals flushed, like the PS2's FPU); SPU2 mixing moved here from
++            // there, so keep its floating-point behaviour identical.
++            _mm_setcsr(_mm_getcsr() | 0x8040u);
++#endif
++            void *timer = nullptr;
++#if defined(_WIN32)
++            if (const HMODULE kernel = GetModuleHandleW(L"kernel32.dll"))
++            {
++                using SetDesc = HRESULT(WINAPI *)(HANDLE, PCWSTR);
++                if (const auto setDesc = reinterpret_cast<SetDesc>(GetProcAddress(kernel, "SetThreadDescription")))
++                    setDesc(GetCurrentThread(), L"ps2x IOP+SPU2");
++            }
++            // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x2 (Windows 10 1803+); falls back to Sleep(1) if unsupported.
++            timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002u, TIMER_ALL_ACCESS);
++#endif
++            uint64_t consumedLocal = 0;
++            uint64_t lastStatNs = nowNs();
++            uint64_t statRunNs = 0;
++            while (!stopRequested.load(std::memory_order_acquire))
++            {
++                const uint64_t target = published.load(std::memory_order_acquire);
++                const uint64_t backlog = target - consumedLocal;
++                if (backlog < kMinBacklogEeCycles)
++                {
++                    idleWait(timer);
++                    continue;
++                }
++                uint64_t maxLag = maxLagCycles.load(std::memory_order_relaxed);
++                while (backlog > maxLag && !maxLagCycles.compare_exchange_weak(maxLag, backlog, std::memory_order_relaxed))
++                {
++                }
++                while (consumedLocal < target && !stopRequested.load(std::memory_order_acquire))
++                {
++                    const uint64_t chunk = std::min<uint64_t>(target - consumedLocal, kChunkEeCycles);
++                    {
++                        std::lock_guard<std::recursive_mutex> lock(execMutex);
++                        const uint64_t t0 = nowNs();
++                        emulator.runEeCycles(chunk);
++                        const uint64_t dt = nowNs() - t0;
++                        runNs.fetch_add(dt, std::memory_order_relaxed);
++                        statRunNs += dt;
++                    }
++                    consumedLocal += chunk;
++                    consumed.store(consumedLocal, std::memory_order_release);
++                    // Let EE-side callers that queued for the lock in before taking it again.
++                    while (execWaiters.load(std::memory_order_acquire) > 0 &&
++                           !stopRequested.load(std::memory_order_acquire))
++                    {
++#if defined(_WIN32)
++                        SwitchToThread();
++#else
++                        std::this_thread::yield();
++#endif
++                    }
++                }
++                if (statsEnabled)
++                {
++                    const uint64_t now = nowNs();
++                    if (now - lastStatNs >= 5000000000ull)
++                    {
++                        const double wall = static_cast<double>(now - lastStatNs);
++                        const uint64_t pub = published.load(std::memory_order_relaxed);
++                        // IOP time already run ahead of the consumed EE clock (outside-thread waits inside RPCs and
++                        // module starts advance the IOP on the EE thread), in ms of IOP time.
++                        int64_t leadCycles = 0;
++                        {
++                            std::lock_guard<std::recursive_mutex> lock(execMutex);
++                            leadCycles = static_cast<int64_t>(emulator.cycles()) -
++                                         static_cast<int64_t>(consumedLocal / 8u);
++                        }
++                        std::fprintf(stderr,
++                                     "[iop-thread] busy %.1f%% of wall, lag now %.2f ms (max %.2f ms), IOP lead %.2f ms, "
++                                     "EE calls %llu, EE lock wait total %.2f ms max %.3f ms, waits >1 ms: %llu\n",
++                                     100.0 * static_cast<double>(statRunNs) / wall,
++                                     static_cast<double>(pub - consumedLocal) / 294912.0,
++                                     static_cast<double>(maxLagCycles.load(std::memory_order_relaxed)) / 294912.0,
++                                     static_cast<double>(leadCycles) / 36864.0,
++                                     static_cast<unsigned long long>(eeCalls.load(std::memory_order_relaxed)),
++                                     static_cast<double>(eeWaitNs.load(std::memory_order_relaxed)) / 1.0e6,
++                                     static_cast<double>(eeMaxWaitNs.load(std::memory_order_relaxed)) / 1.0e6,
++                                     static_cast<unsigned long long>(eeWaitsOver1ms.load(std::memory_order_relaxed)));
++                        lastStatNs = now;
++                        statRunNs = 0;
++                    }
++                }
++            }
++#if defined(_WIN32)
++            if (timer)
++                CloseHandle(static_cast<HANDLE>(timer));
++#endif
++        }
++
++        mutable std::recursive_mutex execMutex;
++        std::atomic<int> execWaiters{0};
++        std::atomic<bool> threaded{false};
++        std::atomic<bool> threadStarted{false};
++        std::atomic<bool> stopRequested{false};
++        std::mutex threadStartMutex;
++        std::atomic<uint64_t> published{0};
++        std::atomic<uint64_t> consumed{0};
++        std::atomic<uint64_t> maxLagCycles{0};
++        std::atomic<uint64_t> runNs{0};
++        std::atomic<uint64_t> eeCalls{0};
++        std::atomic<uint64_t> eeWaitNs{0};
++        std::atomic<uint64_t> eeMaxWaitNs{0};
++        std::atomic<uint64_t> eeWaitsOver1ms{0};
++        bool statsEnabled = false;
++#if defined(_WIN32)
++        void *threadHandle = nullptr;
++#else
++        std::thread worker;
++#endif
++
+         IopHost &host;
+         detail::ServiceList coreServices;
+         std::unordered_map<uint32_t, detail::IopService *> routes;
+@@ -99,6 +389,7 @@ namespace ps2x::iop
+ 
+     void IopSubsystem::reset()
+     {
++        const Impl::ExecGuard guard(*m_impl);
+         m_impl->moduleManager.reset();
+         m_impl->loadOutcomes.clear();
+         m_impl->loggedLoadPaths.clear();
+@@ -116,6 +407,7 @@ namespace ps2x::iop
+ 
+     ModuleLoadResult IopSubsystem::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
+     {
++        const Impl::ExecGuard guard(*m_impl);
+         const ParsedPs2Path parsed = parsePs2Path(path);
+         if (!parsed)
+             return {true, -1, -1};
+@@ -147,11 +439,13 @@ namespace ps2x::iop
+ 
+     ModuleLoadResult IopSubsystem::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
+     {
++        const Impl::ExecGuard guard(*m_impl);
+         return m_impl->emulator.loadModuleBuffer(guestAddress, arguments, argumentSize);
+     }
+ 
+     bool IopSubsystem::stopModule(int32_t moduleId, int32_t *result)
+     {
++        const Impl::ExecGuard guard(*m_impl);
+         if (m_impl->moduleManager.stopHle(moduleId, result))
+         {
+             m_impl->rebuildRoutes();
+@@ -166,11 +460,13 @@ namespace ps2x::iop
+ 
+     void IopSubsystem::runEeCycles(uint64_t eeCycles) noexcept
+     {
++        const Impl::ExecGuard guard(*m_impl);
+         m_impl->emulator.runEeCycles(eeCycles);
+     }
+ 
+     RpcAbi IopSubsystem::selectRpcAbi(const RpcAbiRequest &request) const
+     {
++        const Impl::ExecGuard guard(*m_impl);
+         for (const auto &service : m_impl->coreServices)
+         {
+             if (service && m_impl->serviceActive(*service))
+@@ -187,6 +483,7 @@ namespace ps2x::iop
+ 
+     bool IopSubsystem::canBindRpc(uint32_t sid) const noexcept
+     {
++        const Impl::ExecGuard guard(*m_impl);
+         if (m_impl->routes.find(sid) != m_impl->routes.end())
+         {
+             return true;
+@@ -196,6 +493,7 @@ namespace ps2x::iop
+ 
+     RpcResult IopSubsystem::handleRpc(const RpcRequest &request)
+     {
++        const Impl::ExecGuard guard(*m_impl);
+         const auto route = m_impl->routes.find(request.sid);
+         detail::IopService *hle = route != m_impl->routes.end() ? route->second : nullptr;
+ 
+@@ -209,6 +507,7 @@ namespace ps2x::iop
+ 
+     void IopSubsystem::onSifTransfer(const SifTransfer &transfer)
+     {
++        const Impl::ExecGuard guard(*m_impl);
+         for (auto &service : m_impl->coreServices)
+         {
+             if (service && m_impl->serviceActive(*service))
+@@ -221,26 +520,31 @@ namespace ps2x::iop
+ 
+     uint32_t IopSubsystem::allocateMemory(uint32_t size, uint32_t alignment)
+     {
++        const Impl::ExecGuard guard(*m_impl);
+         return m_impl->emulator.allocateMemory(size, alignment);
+     }
+ 
+     bool IopSubsystem::freeMemory(uint32_t address)
+     {
++        const Impl::ExecGuard guard(*m_impl);
+         return m_impl->emulator.freeMemory(address);
+     }
+ 
+     bool IopSubsystem::readMemory(uint32_t address, void *destination, size_t size) const
+     {
++        const Impl::ExecGuard guard(*m_impl);
+         return m_impl->emulator.readMemory(address, destination, size);
+     }
+ 
+     bool IopSubsystem::writeMemory(uint32_t address, const void *source, size_t size)
+     {
++        const Impl::ExecGuard guard(*m_impl);
+         return m_impl->emulator.writeMemory(address, source, size);
+     }
+ 
+     bool IopSubsystem::zeroMemory(uint32_t address, size_t size)
+     {
++        const Impl::ExecGuard guard(*m_impl);
+         return m_impl->emulator.zeroMemory(address, size);
+     }
+ 
+@@ -251,6 +555,7 @@ namespace ps2x::iop
+ 
+     DebugSnapshot IopSubsystem::debugSnapshot() const
+     {
++        const Impl::ExecGuard guard(*m_impl);
+         DebugSnapshot snapshot;
+         snapshot.emulatorCycles = m_impl->emulator.cycles();
+         snapshot.emulatorInstructions = m_impl->emulator.instructions();
+@@ -274,4 +579,42 @@ namespace ps2x::iop
+         }
+         return snapshot;
+     }
++
++    void IopSubsystem::enableThread(bool enable)
++    {
++        if (enable)
++        {
++            m_impl->threaded.store(true, std::memory_order_release);
++            return;
++        }
++        m_impl->stopThread();
++        m_impl->threaded.store(false, std::memory_order_release);
++    }
++
++    bool IopSubsystem::threadEnabled() const noexcept
++    {
++        return m_impl->threaded.load(std::memory_order_acquire);
++    }
++
++    void IopSubsystem::publishEeCycles(uint64_t totalEeCycles) noexcept
++    {
++        if (!m_impl->threaded.load(std::memory_order_relaxed))
++            return;
++        m_impl->published.store(totalEeCycles, std::memory_order_release);
++        if (!m_impl->threadStarted.load(std::memory_order_relaxed))
++            m_impl->startThread();
++    }
++
++    IopSubsystem::ThreadStats IopSubsystem::threadStats() const
++    {
++        ThreadStats stats;
++        stats.published = m_impl->published.load(std::memory_order_relaxed);
++        stats.consumed = m_impl->consumed.load(std::memory_order_relaxed);
++        stats.maxLagCycles = m_impl->maxLagCycles.load(std::memory_order_relaxed);
++        stats.runNs = m_impl->runNs.load(std::memory_order_relaxed);
++        stats.eeCalls = m_impl->eeCalls.load(std::memory_order_relaxed);
++        stats.eeWaitNs = m_impl->eeWaitNs.load(std::memory_order_relaxed);
++        stats.eeMaxWaitNs = m_impl->eeMaxWaitNs.load(std::memory_order_relaxed);
++        return stats;
++    }
+ }
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 73e5c8f..d877671 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -4,6 +4,7 @@
+ #include "runtime/ee_scheduler.h"
+ 
+ #include "ps2_log.h"
++#include "../ps2_iop_post.h"
+ #include "ps2_runtime_macros.h"
+ 
+ #include <algorithm>
+@@ -2031,6 +2032,9 @@ void EeScheduler::processEvent(const EeEvent &event)
+         dispatchIrq(false, 3u);
+         break;
+     case EeEventType::Dmac:
++        // Wake-up for work the IOP thread posted (threaded IOP mode): apply it here, on the EE thread.
++        if (event.id == kIopPostedWorkEventId)
++            ps2IopDrainPosted(m_runtime);
+         break;
+     case EeEventType::Alarm:
+     {
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 8d46e03..043e255 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -1,6 +1,8 @@
+ #include "ps2_iop_host.h"
++#include "ps2_iop_post.h"
+ 
+ #include "ps2_runtime.h"
++#include "ps2x/iop/iop_subsystem.h"
+ #include "ps2_stubs.h"
+ #include "Kernel/Stubs/SIF.h"
+ #include "runtime/ps2_memory.h"
+@@ -8,6 +10,8 @@
+ #include "Kernel/Syscalls/Common.h"
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cstdlib>
+ #include <cstring>
+ #include <filesystem>
+ #include <iostream>
+@@ -18,6 +22,19 @@
+ #include <sys/types.h>
+ #endif
+ 
++namespace
++{
++    // The adapter whose posted-work queue EeScheduler drains (ps2_iop_post.h). One runtime per process.
++    std::atomic<PS2IopHostAdapter *> g_postAdapter{nullptr};
++}
++
++void PS2IopHostAdapter::setPostSifCommands(bool enable)
++{
++    m_postSifCommands.store(enable, std::memory_order_release);
++    if (enable)
++        g_postAdapter.store(this, std::memory_order_release);
++}
++
+ PS2IopHostAdapter::CallScope::CallScope(PS2IopHostAdapter &owner, R5900Context *context, uint8_t *rdram)
+     : m_lock(owner.m_callMutex),
+       m_owner(&owner),
+@@ -83,6 +100,8 @@ PS2IopHostAdapter::PS2IopHostAdapter(PS2Runtime &runtime)
+ 
+ PS2IopHostAdapter::~PS2IopHostAdapter()
+ {
++    PS2IopHostAdapter *self = this;
++    g_postAdapter.compare_exchange_strong(self, nullptr);
+     std::lock_guard<std::mutex> lock(m_hostFileMutex);
+     for (auto &[handle, file] : m_hostFiles)
+     {
+@@ -103,7 +122,8 @@ PS2IopHostAdapter::CallScope PS2IopHostAdapter::enterCall(R5900Context *context,
+ bool PS2IopHostAdapter::guestRange(uint32_t address, size_t size, uint8_t *&begin) const
+ {
+     begin = nullptr;
+-    uint8_t *const rdram = m_activeRdram
++    // The IOP thread never runs inside an EE call scope (m_activeRdram belongs to the EE thread).
++    uint8_t *const rdram = (m_activeRdram && !ps2x::iop::onIopThread())
+                                ? m_activeRdram
+                                : m_runtime.memory().getRDRAM();
+     if (!rdram)
+@@ -507,6 +527,31 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
+                                        const void *packet,
+                                        size_t packetSize)
+ {
++    if (m_postSifCommands.load(std::memory_order_acquire))
++    {
++        // Threaded IOP: queue the packet (in order) for the EE thread; dispatchSifCommand allocates guest memory and
++        // queues an EE invocation, which only the EE thread may do. Returns true like a delivered command (the IOP
++        // ignores the result: a command without an EE handler is still a completed DMA).
++        if (!packet || packetSize < 16u || packetSize > 112u)
++            return false;
++        bool wake = false;
++        {
++            std::lock_guard<std::mutex> lock(m_postMutex);
++            PostedSifCommand posted;
++            posted.commandId = commandId;
++            posted.packet.assign(static_cast<const uint8_t *>(packet), static_cast<const uint8_t *>(packet) + packetSize);
++            m_posted.push_back(std::move(posted));
++            if (!m_postWakeQueued)
++            {
++                m_postWakeQueued = true;
++                wake = true;
++            }
++        }
++        m_postedTotal.fetch_add(1, std::memory_order_relaxed);
++        if (wake)
++            m_runtime.postEeEvent(EeEvent{EeEventType::Dmac, kIopPostedWorkEventId, 0u});
++        return true;
++    }
+     uint8_t *const rdram = m_activeRdram
+                                ? m_activeRdram
+                                : m_runtime.memory().getRDRAM();
+@@ -517,6 +562,55 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
+                                          packetSize);
+ }
+ 
++void PS2IopHostAdapter::drainPosted()
++{
++    // EE thread. Commands posted while this runs get their own wake-up event.
++    std::vector<PostedSifCommand> batch;
++    {
++        std::lock_guard<std::mutex> lock(m_postMutex);
++        batch.swap(m_posted);
++        m_postWakeQueued = false;
++    }
++    if (batch.empty())
++        return;
++    static const bool stats = []() {
++        const char *v = std::getenv("PS2X_IOP_THREAD_STATS");
++        return v && *v && v[0] != '0';
++    }();
++    if (stats)
++    {
++        static uint64_t drains = 0, commands = 0, maxBatch = 0;
++        static auto last = std::chrono::steady_clock::now();
++        ++drains;
++        commands += batch.size();
++        maxBatch = std::max<uint64_t>(maxBatch, batch.size());
++        const auto now = std::chrono::steady_clock::now();
++        if (now - last >= std::chrono::seconds(5))
++        {
++            last = now;
++            std::fprintf(stderr, "[iop-thread] EE drains %llu, SIF commands %llu, max batch %llu\n",
++                         static_cast<unsigned long long>(drains), static_cast<unsigned long long>(commands),
++                         static_cast<unsigned long long>(maxBatch));
++        }
++    }
++    uint8_t *const rdram = m_runtime.memory().getRDRAM();
++    for (const PostedSifCommand &command : batch)
++    {
++        (void)ps2_stubs::dispatchSifCommand(rdram,
++                                            &m_runtime,
++                                            command.commandId,
++                                            command.packet.data(),
++                                            command.packet.size());
++    }
++}
++
++void ps2IopDrainPosted(PS2Runtime &runtime)
++{
++    (void)runtime;
++    if (PS2IopHostAdapter *adapter = g_postAdapter.load(std::memory_order_acquire))
++        adapter->drainPosted();
++}
++
+ void PS2IopHostAdapter::log(ps2x::iop::LogLevel level, std::string_view message)
+ {
+     const char *prefix = "[ps2xIOP]";
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index 89d8576..a5afa30 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -2,10 +2,12 @@
+ 
+ #include "ps2x/iop/iop_host.h"
+ 
++#include <atomic>
+ #include <cstdint>
+ #include <cstdio>
+ #include <mutex>
+ #include <unordered_map>
++#include <vector>
+ 
+ class PS2Runtime;
+ struct R5900Context;
+@@ -86,12 +88,29 @@ public:
+ 
+     void log(ps2x::iop::LogLevel level, std::string_view message) override;
+ 
++    // Threaded IOP mode: sendSifCommand queues instead of touching the EE scheduler; drainPosted() (EE thread) applies
++    // the queue in order. See ps2_iop_post.h.
++    void setPostSifCommands(bool enable);
++    void drainPosted();
++    [[nodiscard]] uint64_t postedCount() const { return m_postedTotal.load(std::memory_order_relaxed); }
++
+ private:
+     friend class CallScope;
+ 
+     bool guestRange(uint32_t address, size_t size, uint8_t *&begin) const;
+ 
++    struct PostedSifCommand
++    {
++        uint32_t commandId = 0;
++        std::vector<uint8_t> packet;
++    };
++
+     PS2Runtime &m_runtime;
++    std::atomic<bool> m_postSifCommands{false};
++    std::mutex m_postMutex;
++    std::vector<PostedSifCommand> m_posted;
++    bool m_postWakeQueued = false;
++    std::atomic<uint64_t> m_postedTotal{0};
+     std::recursive_mutex m_callMutex;
+     R5900Context *m_activeContext = nullptr;
+     uint8_t *m_activeRdram = nullptr;
+diff --git a/ps2xRuntime/src/lib/ps2_iop_post.h b/ps2xRuntime/src/lib/ps2_iop_post.h
+new file mode 100644
+index 0000000..2e4ef9e
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_iop_post.h
+@@ -0,0 +1,13 @@
++#pragma once
++
++#include <cstdint>
++
++class PS2Runtime;
++
++// IOP thread -> EE thread work (threaded IOP mode, PS2X_IOP_THREAD). The IOP thread must not touch EE scheduler state,
++// so what it wants the EE to do (today: SIF commands to the EE's registered handlers) is queued by the host adapter and
++// a wake-up event with this id (EeEventType::Dmac, otherwise a no-op) is posted; EeScheduler::processEvent then calls
++// ps2IopDrainPosted() on the EE thread, which applies the queue in order.
++constexpr uint32_t kIopPostedWorkEventId = 0x494F5000u; // 'IOP\0'
++
++void ps2IopDrainPosted(PS2Runtime &runtime);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 5fffbca..7b61314 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -570,10 +570,36 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+     s_hasUploadedFrame = true;
+ }
+ 
++namespace
++{
++    // PS2X_IOP_THREAD=1 (default): the IOP emulator and SPU2 mixing run on their own host thread (ps2x::iop::IopSubsystem
++    // threaded mode); =0: the deterministic synchronous path, run from EeScheduler::accountCycles on the EE thread.
++    bool iopThreadRequested()
++    {
++        static const bool enabled = []() {
++            const char *v = std::getenv("PS2X_IOP_THREAD");
++            if (!v || !*v)
++                return true; // default: threaded (PS2X_IOP_THREAD=0 = synchronous)
++            return !(v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F');
++        }();
++        return enabled;
++    }
++
++    // Read on every EE checkpoint by advanceIopEeCycles: a plain global (set once by the constructor), not the
++    // function-local static above, whose init guard costs a check on every call.
++    bool g_iopThreaded = false;
++}
++
+ PS2Runtime::PS2Runtime()
+ {
+     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
+     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
++    if (iopThreadRequested())
++    {
++        m_iopHost->setPostSifCommands(true);
++        m_iopSubsystem->enableThread(true);
++        g_iopThreaded = true;
++    }
+ 
+     m_eeScheduler = std::make_unique<EeScheduler>(*this);
+ 
+@@ -700,6 +726,20 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
+ 
+ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+ {
++    if (g_iopThreaded)
++    {
++        // Threaded IOP: publish the EE clock; the IOP thread follows it (IOP time = EE / 8) and never runs ahead.
++        // Publish in quanta (a store per checkpoint would be needless cache-line traffic): 2048 EE cycles ~ 7 us.
++        static uint64_t total = 0;
++        static uint64_t published = 0;
++        total += eeCycles;
++        if (total - published >= 2048u)
++        {
++            published = total;
++            m_iopSubsystem->publishEeCycles(total);
++        }
++        return;
++    }
+     // Called on every EE checkpoint (nearly every guest call) with a few cycles; each IOP run pays a fixed cost
+     // (SPU2 advance, interrupt/callback service, thread selection). Batch into quanta of PS2X_IOP_BATCH EE cycles
+     // (default 4096, ~14 us of emulated time), well below any IOP timing the games can observe.

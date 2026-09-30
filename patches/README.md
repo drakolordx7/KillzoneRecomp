@@ -225,6 +225,29 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
     pacing is unchanged.
   - **Debug.** `PS2X_IOP_THREAD_STATS=1` prints `[iop-thread]` lines every 5 s: IOP thread busy %, published-consumed lag,
     IOP time lead over EE/8, EE lock calls/wait, and EE-side drain counts.
+  - **Measured** (headless, `KZ_FPS=60 KZ_IPU=off`, scripted input, in-game frames/s = `vif=` counter delta over
+    t=170..230 s; the machine is shared with other builds/runs, so absolute numbers move by +-20 % between runs and only
+    interleaved pairs are compared):
+    - Pristine pre-patch binary vs threaded, same source otherwise, 3 pairs: 30.8 / 27.8 / 28.0 (mean 28.9) ->
+      31.4 / 32.2 / 32.0 (mean 31.9), +10 %. With `KZ_FPS=240` (vblank quantisation of the frame rate is 4x finer),
+      2 pairs: 28.2 / 25.9 -> 37.8 / 31.9 (mean 27.1 -> 34.9, +29 %). At 60 Hz the frame rate is quantised by the
+      vblank (a frame that saved 5 ms but still misses the next vblank gains nothing), which hides part of the gain.
+    - Same binary, `PS2X_IOP_THREAD=0` vs default, built with the VIF1 worker of patch 0016 also active, 3 pairs:
+      41.1 / 39.1 / 39.9 -> 41.8 / 42.2 / 50.1 (mean +12 %).
+    - The IOP thread itself is busy ~7-11 % of one core in gameplay (SPU2 mixing is ~29 % of that); the game thread
+      keeps only the RPC server functions it runs inline (`handleRpc` 2.3 % inclusive in a 1 kHz profile).
+    - Boot: 24 headless 50 s boots, none hung (`dma=` advances in every heartbeat), 8 of them with 4 instances
+      running at once. Gameplay: 9 full 235 s runs across the builds, all render the level; 2 more with the final
+      build (patches 0015+0016) run side by side. SPU2 WAV (`KZ_AUDIO_WAV`) vs the pre-patch build over the first
+      230 s: silent until t=20 s, then music/UI as before; identical sample peaks in 10 of 11 ten-second menu
+      segments (t=20..120 s), per-10 s RMS within 1 dB in the four final-build runs (the first threaded run had one UI
+      sound land in the neighbouring 10 s window), overall RMS -13.7 dBFS (pre-patch) vs -13.8 / -14.1 / -13.9 / -13.9
+      (four threaded runs); menu-music waveform correlation with the pre-patch run 0.998-0.999 at 5-13 ms offset (the
+      synchronous path has the same offset). In-game levels differ by scene timing (explosions), as they do between
+      two synchronous runs.
+    - The IOP runs ~6 % ahead of EE/8 (14 s in a 230 s run, `PS2X_IOP_THREAD_STATS`): outside-thread waits inside
+      RPCs and module starts advance IOP time on the EE thread and are not paid back. This was already true for the
+      synchronous path (kz_audio's pacing factor exists for it).
 
 - `0017-codegen-register-locals.patch` (recompiler + new header `ps2xRuntime/include/ps2_cg.h`; needs `build_ps2recomp.bat`,
   a regen with `PS2X_CODEGEN=locals`, and a full rebuild). An alternative code generator; the classic output is unchanged
