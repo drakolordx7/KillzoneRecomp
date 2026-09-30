@@ -17,6 +17,7 @@
 #include "GS/GS.h"
 #include "GS/Renderers/Common/GSDevice.h"
 #include "GS/Renderers/Common/GSRenderer.h"
+#include "GS/Renderers/HW/GSTextureCache.h"
 
 #include "common/RedtapeWindows.h"
 #include <dbghelp.h>
@@ -26,6 +27,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -177,6 +179,56 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
 	return EXCEPTION_EXECUTE_HANDLER;
 }
 
+
+// Debug: the GS texture cache's render targets (protected member, reached through a derived class).
+struct TcAccess : GSTextureCache
+{
+	using GSTextureCache::m_dst;
+};
+
+static bool DownloadColor(GSTexture* tex, std::vector<uint8_t>& rgba, int& w, int& h)
+{
+	if (!tex || tex->GetFormat() != GSTexture::Format::Color)
+		return false;
+	w = tex->GetWidth();
+	h = tex->GetHeight();
+	std::unique_ptr<GSDownloadTexture> dl(g_gs_device->CreateDownloadTexture(w, h, GSTexture::Format::Color));
+	if (!dl)
+		return false;
+	const GSVector4i rc(0, 0, w, h);
+	dl->CopyFromTexture(rc, tex, rc, 0);
+	dl->Flush();
+	if (!dl->Map(rc))
+		return false;
+	rgba.resize(size_t(w) * h * 4);
+	for (int y = 0; y < h; y++)
+		std::memcpy(rgba.data() + size_t(y) * w * 4, dl->GetMapPointer() + size_t(y) * dl->GetMapPitch(), size_t(w) * 4);
+	dl->Unmap();
+	return true;
+}
+
+static void DumpTargets(const std::filesystem::path& dir, uint64_t frame)
+{
+	TcAccess& tc = static_cast<TcAccess&>(*g_texture_cache);
+	int idx = 0;
+	for (GSTextureCache::Target* t : tc.m_dst[GSTextureCache::RenderTarget])
+	{
+		std::printf("  target #%d: TBP0 %05x TBW %u PSM %02x tex %dx%d scale %.1f age %d valid (%d,%d,%d,%d) drawn (%d,%d,%d,%d) used %d frame %d lastdraw %llu\n", idx,
+			t->m_TEX0.TBP0, t->m_TEX0.TBW, t->m_TEX0.PSM, t->m_texture ? t->m_texture->GetWidth() : 0, t->m_texture ? t->m_texture->GetHeight() : 0,
+			t->m_scale, t->m_age, t->m_valid.x, t->m_valid.y, t->m_valid.z, t->m_valid.w, t->m_drawn_since_read.x, t->m_drawn_since_read.y,
+			t->m_drawn_since_read.z, t->m_drawn_since_read.w, t->m_used, t->m_is_frame, (unsigned long long)t->m_last_draw);
+		std::vector<uint8_t> px;
+		int w = 0, h = 0;
+		if (DownloadColor(t->m_texture, px, w, h))
+		{
+			char n[96];
+			std::snprintf(n, sizeof(n), "target_%04llu_%02d_bp%05x.png", (unsigned long long)frame, idx, t->m_TEX0.TBP0);
+			WritePNG((dir / n).string(), px, w, h);
+		}
+		idx++;
+	}
+}
+
 int main(int argc, char** argv)
 {
 	std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -188,8 +240,11 @@ int main(int argc, char** argv)
 	}
 	const std::string trace = argv[1];
 	const std::filesystem::path out = argv[2];
-	int every = 100, last = 0, dump_frame = -1, dump_count = 0;
-	bool pcrtc = false;
+	int every = 100, from = 0, last = 0, sleep_ms = 0, sleep_from = 0, dump_frame = -1, dump_count = 0;
+	bool pcrtc = false, targets = false;
+	FILE* thumbs = nullptr;
+	bool nopng = false;
+	int present_w = 0, present_h = 0;
 	std::vector<VramReq> vram;
 	std::vector<TexReq> texs;
 	std::string defrost, save_vram;
@@ -201,8 +256,23 @@ int main(int argc, char** argv)
 		const std::string a = argv[i];
 		if (a == "--every" && i + 1 < argc) every = std::atoi(argv[++i]);
 		else if (a == "--upscale" && i + 1 < argc) cfg.upscale = std::atoi(argv[++i]);
+		else if (a == "--sleep-from" && i + 1 < argc) sleep_from = std::atoi(argv[++i]);
+		else if (a == "--sleep" && i + 1 < argc) sleep_ms = std::atoi(argv[++i]);
+		else if (a == "--from" && i + 1 < argc) from = std::atoi(argv[++i]);
+		else if (a == "--adapter" && i + 1 < argc) cfg.adapter = argv[++i];
+		else if (a == "--hpo" && i + 1 < argc) cfg.halfPixelOffset = std::atoi(argv[++i]);
+		else if (a == "--native" && i + 1 < argc) cfg.nativeScaling = std::atoi(argv[++i]);
+		else if (a == "--antiblur" && i + 1 < argc) cfg.pcrtcAntiBlur = std::atoi(argv[++i]) != 0;
+		else if (a == "--interlace" && i + 1 < argc) cfg.interlaceMode = std::atoi(argv[++i]);
+		else if (a == "--fxaa") cfg.fxaa = true;
+		else if (a == "--crop" && i + 1 < argc) std::sscanf(argv[++i], "%d,%d,%d,%d", &cfg.crop[0], &cfg.crop[1], &cfg.crop[2], &cfg.crop[3]);
 		else if (a == "--last" && i + 1 < argc) last = std::atoi(argv[++i]);
 		else if (a == "--pcrtc") pcrtc = true;
+		else if (a == "--targets") targets = true;
+		else if (a == "--nopng") nopng = true;
+		else if (a == "--aspect" && i + 1 < argc) { const std::string v = argv[++i]; cfg.aspect = v == "16:9" ? KzgsAspect::Ratio16_9 : v == "stretch" ? KzgsAspect::Stretch : KzgsAspect::Ratio4_3; }
+		else if (a == "--present" && i + 1 < argc) std::sscanf(argv[++i], "%dx%d", &present_w, &present_h);
+		else if (a == "--thumbs" && i + 1 < argc) thumbs = std::fopen(argv[++i], "wb");
 		else if (a == "--dump-draws" && i + 1 < argc) std::sscanf(argv[++i], "%d:%d", &dump_frame, &dump_count);
 		else if (a == "--renderer" && i + 1 < argc)
 		{
@@ -310,6 +380,8 @@ int main(int argc, char** argv)
 		std::memcpy(regs, buf.data(), std::min<size_t>(sizeof(regs), buf.size()));
 		kzgsVsync(int(hdr[1]), true);
 		frame++;
+		if (sleep_ms > 0 && frame >= uint64_t(sleep_from))
+			Sleep(sleep_ms);
 		if (dump_frame >= 0 && frame == uint64_t(dump_frame))
 		{
 			// PCSX2's own draw dumping (context registers, vertices, transfers per draw) for the next dump_count draws.
@@ -329,19 +401,50 @@ int main(int argc, char** argv)
 				std::printf("  dumping %d draws from s_n=%llu to %s\n", dump_count, (unsigned long long)GSState::s_n, dir.c_str());
 			});
 		}
-		if (every > 0 && frame % every == 0)
+		if (every > 0 && frame % every == 0 && frame >= uint64_t(from))
 		{
 			std::vector<uint8_t> px;
 			int w = 0, h = 0;
 			const bool ok = kzgsReadback(px, w, h);
+			if (present_w > 0 && present_h > 0)
+			{
+				std::vector<uint8_t> pp;
+				int pw = 0, ph = 0;
+				if (kzgsReadback(pp, pw, ph, present_w, present_h))
+				{
+					char pn[64];
+					std::snprintf(pn, sizeof(pn), "present_%04llu.png", (unsigned long long)frame);
+					WritePNG((out / pn).string(), pp, pw, ph);
+				}
+			}
+			if (thumbs && ok)
+			{
+				// frame number + 64x56 box-filtered RGB thumbnail (binary), for frame-by-frame comparison of runs
+				const uint32_t fr = uint32_t(frame);
+				std::fwrite(&fr, 4, 1, thumbs);
+				for (int ty = 0; ty < 56; ty++)
+					for (int tx = 0; tx < 64; tx++)
+					{
+						uint32_t acc[3] = {};
+						const int bw = w / 64, bh = h / 56;
+						for (int yy = 0; yy < bh; yy++)
+							for (int xx = 0; xx < bw; xx++)
+							{
+								const uint8_t* q = &px[(size_t(ty * bh + yy) * w + tx * bw + xx) * 4];
+								acc[0] += q[0]; acc[1] += q[1]; acc[2] += q[2];
+							}
+						for (int c = 0; c < 3; c++)
+							std::fputc(int(acc[c] / (bw * bh)), thumbs);
+					}
+			}
 			char name[64];
 			std::snprintf(name, sizeof(name), "out_%04llu.png", (unsigned long long)frame);
-			if (ok)
+			if (ok && !nopng)
 				WritePNG((out / name).string(), px, w, h);
 			std::printf("frame %llu: readback %s %dx%d nonblack %.1f%%\n", (unsigned long long)frame, ok ? "ok" : "FAILED", w,
 				h, NonBlack(px));
 
-			if (pcrtc || !vram.empty() || !texs.empty())
+			if (pcrtc || targets || !vram.empty() || !texs.empty())
 			{
 				kzgs::RunOnGSThread([&]() {
 					GSRenderer* r = g_gs_renderer.get();
@@ -364,6 +467,8 @@ int main(int argc, char** argv)
 						std::printf("  current output texture: %s %dx%d\n", cur ? "yes" : "none", cur ? cur->GetWidth() : 0,
 							cur ? cur->GetHeight() : 0);
 					}
+					if (targets)
+						DumpTargets(out, frame);
 					if (!texs.empty())
 					{
 						r->ReadbackTextureCache();
