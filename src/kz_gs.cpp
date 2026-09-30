@@ -86,8 +86,12 @@ namespace
         case KzRenderer::D3D12: k.renderer = KzgsRenderer::D3D12; break;
         case KzRenderer::Vulkan: k.renderer = KzgsRenderer::Vulkan; break;
         }
+        if (const char *r = std::getenv("KZ_RENDERER")) // automation override: d3d11 | d3d12 | vulkan
+            k.renderer = _stricmp(r, "d3d12") == 0 ? KzgsRenderer::D3D12 : _stricmp(r, "vulkan") == 0 ? KzgsRenderer::Vulkan : KzgsRenderer::D3D11;
         // Auto: smallest multiple of 448 lines that covers the window height.
         k.upscale = c.upscale > 0 ? c.upscale : std::clamp((std::max(windowHeight, 448) + 447) / 448, 1, 8);
+        if (const char *u = std::getenv("KZ_UPSCALE")) // automation override
+            k.upscale = std::clamp(std::atoi(u), 1, 8);
         k.textureFiltering = c.bilinear ? KzgsTextureFilter::PS2 : KzgsTextureFilter::Nearest;
         k.anisotropy = c.anisotropy;
         k.fxaa = c.fxaa;
@@ -134,21 +138,43 @@ namespace
         put(0x1080, r.siglblid);
     }
 
-    void saveShot(GsState &s, long long seconds)
+    bool savePng(const char *path, std::vector<uint8_t> &rgba, int w, int h)
     {
-        std::vector<uint8_t> rgba;
-        int w = 0, h = 0;
-        if (!kzgsReadback(rgba, w, h) || w <= 0 || h <= 0)
-            return;
         for (size_t i = 3; i < rgba.size(); i += 4)
             rgba[i] = 0xFF;
         SDL_Surface *surf = SDL_CreateSurfaceFrom(w, h, SDL_PIXELFORMAT_RGBA32, rgba.data(), w * 4);
         if (!surf)
-            return;
-        char name[64];
-        std::snprintf(name, sizeof(name), "/gs_%03d_t%llds.png", s.shotIndex++, seconds);
-        SDL_SavePNG(surf, (s.shotDir + name).c_str());
+            return false;
+        const bool ok = SDL_SavePNG(surf, path);
         SDL_DestroySurface(surf);
+        return ok;
+    }
+
+    // KZ_SHOT_DIR frames. gs_*.png = the GS output at internal resolution. KZ_SHOT_PRESENT=1 also writes gp_*.png = the
+    // image as presented in the window (aspect-corrected and scaled to the window size, KZ_WINDOW_SIZE=WxH in automation).
+    void saveShot(GsState &s, long long seconds)
+    {
+        std::vector<uint8_t> rgba;
+        int w = 0, h = 0;
+        char name[96];
+        const int index = s.shotIndex++;
+        if (kzgsReadback(rgba, w, h) && w > 0 && h > 0)
+        {
+            std::snprintf(name, sizeof(name), "/gs_%03d_t%llds_f%llu.png", index, seconds, static_cast<unsigned long long>(s.frames.load(std::memory_order_relaxed)));
+            savePng((s.shotDir + name).c_str(), rgba, w, h);
+        }
+        static const bool present = std::getenv("KZ_SHOT_PRESENT") && std::getenv("KZ_SHOT_PRESENT")[0] == '1';
+        if (present)
+        {
+            int ww = 1280, wh = 896;
+            if (const char *v = std::getenv("KZ_WINDOW_SIZE"))
+                std::sscanf(v, "%dx%d", &ww, &wh);
+            if (kzgsReadback(rgba, w, h, ww, wh) && w > 0 && h > 0)
+            {
+                std::snprintf(name, sizeof(name), "/gp_%03d_t%llds_f%llu.png", index, seconds, static_cast<unsigned long long>(s.frames.load(std::memory_order_relaxed)));
+                savePng((s.shotDir + name).c_str(), rgba, w, h);
+            }
+        }
     }
 
     // GIF packets since the last presented vsync (runVsync skips presenting unchanged frames, see there).
