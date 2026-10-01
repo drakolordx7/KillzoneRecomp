@@ -241,7 +241,7 @@ int main(int argc, char** argv)
 	const std::string trace = argv[1];
 	const std::filesystem::path out = argv[2];
 	int every = 100, from = 0, last = 0, sleep_ms = 0, sleep_from = 0, dump_frame = -1, dump_count = 0; bool dump_rt = false; int dump_skip = 0;
-	bool pcrtc = false, targets = false;
+	bool pcrtc = false, targets = false, use_window = false;
 	FILE* thumbs = nullptr;
 	bool nopng = false;
 	int present_w = 0, present_h = 0;
@@ -265,6 +265,11 @@ int main(int argc, char** argv)
 		else if (a == "--antiblur" && i + 1 < argc) cfg.pcrtcAntiBlur = std::atoi(argv[++i]) != 0;
 		else if (a == "--interlace" && i + 1 < argc) cfg.interlaceMode = std::atoi(argv[++i]);
 		else if (a == "--fxaa") cfg.fxaa = true;
+		else if (a == "--window") use_window = true;
+		else if (a == "--sharp" && i + 1 < argc) cfg.sharpPresent = std::atoi(argv[++i]) != 0;
+		else if (a == "--bilinear" && i + 1 < argc) cfg.bilinearPresent = std::atoi(argv[++i]) != 0;
+		else if (a == "--cas" && i + 1 < argc) cfg.casSharpness = std::atoi(argv[++i]);
+		else if (a == "--filter" && i + 1 < argc) cfg.textureFiltering = static_cast<KzgsTextureFilter>(std::atoi(argv[++i]));
 		else if (a == "--smaa") cfg.smaa = true;
 		else if (a == "--dump-textures") cfg.dumpTextures = true;
 		else if (a == "--replace-textures") cfg.loadTextureReplacements = true;
@@ -324,7 +329,10 @@ int main(int argc, char** argv)
 			std::fprintf(stderr, "[gs] %s\n", msg);
 	});
 	std::string err;
-	if (!kzgsOpen(nullptr, cfg, regs, &err))
+	HWND hidden_window = nullptr; // --window: a hidden window of the --present size, so the swap chain and the final-scale path (Bilinear Sharp pre-scale) match the game
+	if (use_window && present_w > 0 && present_h > 0)
+		hidden_window = CreateWindowExW(0, L"STATIC", L"kzgs_replay", WS_POPUP, 0, 0, present_w, present_h, nullptr, nullptr, nullptr, nullptr);
+	if (!kzgsOpen(hidden_window, cfg, regs, &err))
 	{
 		std::fprintf(stderr, "kzgsOpen failed: %s\n", err.c_str());
 		return 1;

@@ -13,6 +13,7 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -69,6 +70,13 @@ namespace
         std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
         std::chrono::steady_clock::time_point nextShot = std::chrono::steady_clock::now();
         int shotIndex = 0;
+        // KZ_SHOT_BURST=N: at every shot time the GS thread captures the next N presented frames (gb_*.png, internal resolution, or
+        // as presented in KZ_WINDOW_SIZE with KZ_SHOT_BURST_PRESENT=1) without stalling the game, plus gb_*.csv with one line per
+        // guest vblank during the capture (field, whether a frame was presented or skipped as unchanged, wall time).
+        bool burstArmed = false;
+        int burstIndex = 0;
+        uint64_t presentedSeq = 0;
+        std::vector<std::array<long long, 11>> vblankLog; // frame, field, presented, presentedSeq, ns, pmode, smode2, dispfb1, display1, dispfb2, display2
     };
 
     GsState &gs()
@@ -118,6 +126,10 @@ namespace
         case KzAspect::Stretch: k.aspect = KzgsAspect::Stretch; break;
         }
         k.vsync = c.vsync;
+        if (const char *v = std::getenv("KZ_VSYNC")) // automation: force the present mode (latency measurements)
+            k.vsync = std::atoi(v) != 0;
+        if (const char *v = std::getenv("KZ_GS_QUEUE")) // automation: frames the game may run ahead of the GS thread
+            k.maxQueuedFrames = std::clamp(std::atoi(v), 1, 8);
         // The game's GameIndex setting (halfPixelOffset=Native) leaves the top/left half native pixel of an upscaled frame
         // unwritten, so it shows stale VRAM as a dotted line (docs/findings.md, "Display edge artifacts"). The picture
         // starts 2 lines below the top edge (DISPLAY.DY), so the rim is on merged line 2 and column 0. Crop 4 columns
@@ -206,6 +218,39 @@ namespace
                 savePng((s.shotDir + name).c_str(), rgba, w, h);
             }
         }
+    }
+
+    uint64_t rd64(const uint8_t *b, uint32_t off)
+    {
+        uint64_t v;
+        std::memcpy(&v, b + off, 8);
+        return v;
+    }
+
+    void burstFinish(GsState &s)
+    {
+        std::vector<KzgsBurstFrame> frames;
+        if (!kzgsBurstTake(frames))
+            return;
+        s.burstArmed = false;
+        const int index = s.burstIndex++;
+        char name[128];
+        for (auto &b : frames)
+        {
+            std::snprintf(name, sizeof(name), "/gb_%02d_%04llu_fld%d%s.png", index, static_cast<unsigned long long>(b.seq), b.field, b.gameDeint ? "_deint" : "");
+            savePng((s.shotDir + name).c_str(), b.rgba, b.width, b.height);
+        }
+        std::snprintf(name, sizeof(name), "/gb_%02d.csv", index);
+        if (FILE *f = std::fopen((s.shotDir + name).c_str(), "w"))
+        {
+            std::fprintf(f, "vblank_frame,field,presented,present_seq,ns,pmode,smode2,dispfb1,display1,dispfb2,display2\n");
+            for (auto &l : s.vblankLog)
+                std::fprintf(f, "%lld,%lld,%lld,%lld,%lld,%llx,%llx,%llx,%llx,%llx,%llx\n", l[0], l[1], l[2], l[3], l[4],
+                             static_cast<unsigned long long>(l[5]), static_cast<unsigned long long>(l[6]), static_cast<unsigned long long>(l[7]),
+                             static_cast<unsigned long long>(l[8]), static_cast<unsigned long long>(l[9]), static_cast<unsigned long long>(l[10]));
+            std::fclose(f);
+        }
+        s.vblankLog.clear();
     }
 
     // GIF packets since the last presented vsync (runVsync skips presenting unchanged frames, see there).
@@ -447,11 +492,25 @@ namespace
         static bool presentedOnce = false;
         const bool newPackets = g_packetsSinceVsync.exchange(0, std::memory_order_relaxed) != 0;
         const bool regsChanged = std::memcmp(lastDisplayRegs, s.privRegs, sizeof(lastDisplayRegs)) != 0;
+        bool didPresent = false;
         if (presentAll || !presentedOnce || newPackets || regsChanged)
         {
+            didPresent = true;
             std::memcpy(lastDisplayRegs, s.privRegs, sizeof(lastDisplayRegs));
             presentedOnce = true;
             kzgsVsync(field, regsChanged || !presentedOnce);
+        }
+        if (didPresent)
+            ++s.presentedSeq;
+        if (s.burstArmed)
+        {
+            s.vblankLog.push_back({static_cast<long long>(s.frames.load(std::memory_order_relaxed)), field, didPresent ? 1 : 0,
+                                   static_cast<long long>(s.presentedSeq),
+                                   std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - s.start).count(),
+                                   static_cast<long long>(rd64(s.privRegs, 0x00)), static_cast<long long>(rd64(s.privRegs, 0x20)),
+                                   static_cast<long long>(rd64(s.privRegs, 0x70)), static_cast<long long>(rd64(s.privRegs, 0x80)),
+                                   static_cast<long long>(rd64(s.privRegs, 0x90)), static_cast<long long>(rd64(s.privRegs, 0xA0))});
+            burstFinish(s);
         }
         s.frames.fetch_add(1, std::memory_order_relaxed);
         debugLine(s);
@@ -461,7 +520,26 @@ namespace
             if (now >= s.nextShot)
             {
                 s.nextShot = now + std::chrono::seconds(s.shotInterval);
-                saveShot(s, std::chrono::duration_cast<std::chrono::seconds>(now - s.start).count());
+                static const int burstN = std::getenv("KZ_SHOT_BURST") ? std::atoi(std::getenv("KZ_SHOT_BURST")) : 0;
+                static const long long burstFrom = std::getenv("KZ_SHOT_BURST_FROM") ? std::atoll(std::getenv("KZ_SHOT_BURST_FROM")) : 0;
+                static const long long burstTo = std::getenv("KZ_SHOT_BURST_TO") ? std::atoll(std::getenv("KZ_SHOT_BURST_TO")) : 1000000;
+                const long long nowSec = std::chrono::duration_cast<std::chrono::seconds>(now - s.start).count();
+                if (burstN > 0 && !s.burstArmed && nowSec >= burstFrom && nowSec <= burstTo)
+                {
+                    static const bool burstPresent = std::getenv("KZ_SHOT_BURST_PRESENT") && std::getenv("KZ_SHOT_BURST_PRESENT")[0] == '1';
+                    int ww = 0, wh = 0;
+                    if (burstPresent)
+                    {
+                        ww = 1280, wh = 896;
+                        if (const char *v = std::getenv("KZ_WINDOW_SIZE"))
+                            std::sscanf(v, "%dx%d", &ww, &wh);
+                    }
+                    s.vblankLog.clear();
+                    s.burstArmed = true;
+                    kzgsBurstArm(burstN, ww, wh);
+                }
+                if (burstN <= 0)
+                    saveShot(s, std::chrono::duration_cast<std::chrono::seconds>(now - s.start).count());
             }
         }
     }

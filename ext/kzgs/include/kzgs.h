@@ -154,3 +154,17 @@ void kzgsSetLogCallback(KzgsLogFn fn);
 // begin/end, 9 frames queued (a) after a vsync was pushed. nullptr = off.
 using KzgsTraceFn = void (*)(int id, uint32_t a);
 void kzgsSetTraceHook(KzgsTraceFn fn);
+
+// Measurement aid: after the next `count` kzgsVsync() frames that reach the GS thread, the GS thread copies the output
+// (internal resolution, presentWidth/presentHeight 0; or as presented in such a window) into memory right after the
+// frame is merged, without making the caller wait. kzgsBurstTake() returns them once all are captured.
+struct KzgsBurstFrame
+{
+	std::vector<uint8_t> rgba;
+	int width = 0, height = 0;
+	int field = 0;
+	int gameDeint = 0; // PCSX2 'game_deinterlacing' (selects the MAD/bob path in Merge)
+	uint64_t seq = 0; // count of vsync commands the GS thread has processed
+};
+void kzgsBurstArm(int count, int presentWidth = 0, int presentHeight = 0);
+bool kzgsBurstTake(std::vector<KzgsBurstFrame>& out); // true once the armed burst is complete (and moves it out)
