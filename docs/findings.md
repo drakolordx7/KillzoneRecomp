@@ -1272,3 +1272,66 @@ loaded machine (video 0.95-1.0x real time there). Neither clock is slaved to the
 taken whenever the scheduler is not executing guest code. A second movie with audio (created around 142 s at mission start) was created in every run but never started its audio
 before the level began; it runs the same code. In-level cutscenes were not exercised. `tools/ghidra_scripts/KzRefs.java` lists the functions that reference a data address (used to
 find the player's state accessors).
+
+
+## Menu jitter and blur (2026-10-01, play-test report)
+Report: "the loading screen and many menus have vertical jitter", "menus and other spots look blurry" (2560x1440, borderless, D3D11, auto upscale,
+VSync off). Gameplay not affected. Everything below was measured headless with a hidden 2560x1440 window (the port's own window path), movies on.
+
+### Tools added
+- `KZ_SHOT_BURST=N` (+ `KZ_SHOT_BURST_FROM/TO` seconds, `KZ_SHOT_BURST_PRESENT=1|2`): at every shot time the GS thread copies the next N *presented* frames
+  into memory without stalling the game (`gb_<burst>_<seq>_fld<field>_sm<scanmask>_fb...png`, `gb_<burst>.csv` = one line per guest vblank: field, presented or
+  skipped as unchanged, display registers, wall time; `*.tc.txt` = PCSX2 texture-cache targets). `=2` hooks the swap chain's `Present` (`ext/kzgs/src/kz_present11.cpp`)
+  and saves back buffer 0, i.e. the exact final pixels (Bilinear Sharp, crop, CAS). The old per-second `gs_*.png`/`gp_*.png` readbacks stall the GS thread and
+  `GSSaveSnapshotToMemory` recycles pool targets; neither can show per-frame behaviour. `KZGS_PRESENT_LOG=file` logs GS vsync completion times.
+- `kzgs_replay --window --backbuffer --skip-idle --single-circuit --sharp --bilinear --cas --filter`; `tools/scripts/burst_analyze.py` (shift / text-detail analysis).
+
+### 1. What is NOT the cause: interlace, field parity, present-skip
+- Display registers in every scene of every run (boot logos, cinematics, front end, loading screen, pause menu, gameplay; 1,480 logged presented vblanks): only two states,
+  PMODE=0x8063 (both circuits, MMOD=1, ALP=0x80), SMODE2 INT=1 FFMD=0, DISPFB1.DBY=0 / DISPFB2.DBY=1 (circuit 2 one line lower, one line shorter: the game's own
+  flicker filter), the two frame buffers FBP 0 and 0x70 alternating. Field alternates every vblank and is not used: PCSX2's `Merge` calls `Interlace(..., mode)` with mode -1
+  in Automatic for these registers, i.e. no deinterlacing. Replay of menu frames 4500..4503: Automatic == Off == Weave to 0.02 mean abs diff and 0.00 shift;
+  `game_deinterlacing` (the only way to reach the MAD path) was false in 1,020 of 1,020 live presented frames.
+  For comparison the modes that would act: Bob TFF/BFF shift the image **+-1 line each field** (frame-to-frame -1.00 +1.00 -1.00, exactly a one-line vertical shake);
+  Blend lowers text detail 23 % (Laplacian variance 12506 -> 9618).
+- Vertical shift between consecutive presented frames of static content (LK estimate, mean abs diff < 0.1): 342 pairs at 60 Hz, 538 at 120 Hz, 293 at 144 Hz (1x internal),
+  171 at 120 Hz on the real back buffer (4x, 1440p): max 0.000 px each (1 native line = 3.2-5 px). So the picture does not move.
+- Present-skip: a static screen presents nothing after the first frame (all following vblanks skipped), so it cannot change.
+  VS expand is off for D3D11 in the port (the earlier fix); in replays it is deterministic (expand on: doubled text 6 of 6 runs, Laplacian variance 95 vs 158; off: 6 of 6 clean).
+
+### 2. The cause: the second read circuit (Killzone's flicker filter) renders wrong frames (measured)
+First-pass mistake: the static-pair statistic above ignores pairs with mean abs diff >= 0.1, which is exactly where this bug lives; periodic mad spikes of equal size in menu
+bursts (3.5, 3.5, 0, 0, 0, 3.4 ...) were first read as video. A fixed text region of the live front-end menu ("Campaign", back buffer, 4x) shows it:
+- Presented frames alternate between clean text (Laplacian variance ~180-190) and frames where the text and the highlight bar are a **50 % blend of two game frames**
+  (text doubled 1-3 native lines apart, variance ~120). Runs of 1-8 bad frames between clean ones, no relation to the field. Picture:
+  `work/fix_proof/jitter_menu_before_top_after_bottom_2560x1440.png` (top row: two consecutive presented frames, clean then blended; bottom: after the fix).
+- Bad frames among comparable front-end frames before the fix: 20 of 72 (3/7/10 per burst of 24; 120 Hz, final run), 30 of 48 (120 Hz control), 11 of 24 (60 Hz), 15+ of 24 (144 Hz).
+- Mechanism (partly shown): both circuits are enabled and read the same buffer; PCSX2's anti-blur (default on) realigns circuit 2 (framebufferRect y 0..448 and 0..447; verified:
+  merged output == frame buffer rows exactly, diff 0.000; with anti-blur off the text detail is 16 % lower), but `Merge` still does one `GetOutput` render-target lookup per circuit
+  with different sizes (448 vs 447 rows). The two Killzone frame buffers are contiguous (FBP 0 and 0x70 = TBP 0 and 0xE00, 3584 blocks each); the bad frame looks like the second lookup
+  returning the other buffer / an older copy. Not shown: why a replay of the same GIF stream (including `--skip-idle`, `--sleep`, hidden window, back-buffer capture, 3 paced runs) is clean while the live GS thread
+  produces bad frames; the trigger is timing in the live GS thread (same family as the NVIDIA D3D11 timing-dependent frames in "Doubled / bugged menus").
+- **Fix (src/kz_gs.cpp `snapshotPrivRegs`):** when both circuits are enabled, read the same FB/DBX and circuit 2 is at most one line lower and one line shorter than circuit 1 (Killzone's filter),
+  circuit 2 is set equal to circuit 1. The merge then has one source and no second lookup. This is the same picture the anti-blur path gives: replay of a gameplay frame (failed.trace f40),
+  a front-end frame (menu.trace f4500) and a movie-menu frame (f1935), 4x, back buffer: mean abs diff 0.0000, max 0 (`--single-circuit` vs default). `KZ_FLICKER_FILTER=1` passes the registers unchanged.
+- Result, live, 4x, 2560x1440 back buffer, same scene (front-end "Campaign" menu): 120 Hz 20 of 72 bad before, **0 of 72 after**; 120 Hz control pair 30 of 48 -> 0 of 48; 60 Hz 11 of 24 -> 0 of 24; 144 Hz 15+ of 24 -> 0 of 24.
+- Also set: `interlaceMode = Off` in `toKzgs` (`KZ_INTERLACE=n` restores a PCSX2 mode). Bit-identical to Automatic for this game, but removes the field from the output by construction.
+
+### 3. Blur
+- No flicker-filter blur: anti-blur gives frame-buffer rows exactly (above). The wrong blended frames (above) were a real source of soft/doubled menu text; gone.
+- Text detail (Laplacian variance of "Battlefields", front-end menu frame 4500, presented 2560x1440, VS expand off): shipped 4x/PS2 filter/SMAA 158; SMAA off 156 (SMAA does not soften text);
+  1x 1233, 2x 747, 3x 284 (GS bilinear magnification of the 512-px text atlas softens more the higher the internal scale; nearest filtering 1318 but blocky); half-pixel offset / native scaling: no effect (158-165).
+  Visual comparison favoured the shipped 4x look (smooth strokes) over the pixel-blocky 1x/nearest, so no change.
+- **SMAA does soften textures** (the launcher text "without blurring textures" is wrong at the HIGH preset). Gameplay frame (failed.trace f40, 4x): whole-frame Laplacian variance 84 -> 54 with SMAA, 37 % of
+  pixels change by more than 4/255. Against an 8x supersampled reference: detail kept 73 % (HIGH, threshold 0.1) / 81 % (0.15) / 86 % (0.2) / 98 % (0.3); error to the reference is not reduced at any internal
+  scale (2x -0.5..-0.9 %, 3x-5x +0..+7 % worse with SMAA, texture error +0.4..+2.3 %). Now `[Graphics] SmaaThreshold` (0.05..0.5, default **0.2**, env `KZ_SMAA_THRESHOLD`, `kzgsSetSmaaThreshold`).
+- **CAS sharpening works** (the launcher says "Not verified yet"): on the real back buffer Laplacian variance of "Campaign" 180 -> 280 (30 %) -> 291-305 (50 %), gameplay frame 52 -> 84 (30) -> 109 (50) -> 128 (80),
+  no clipping, no visible halos in crops. Default `Sharpen=30` (existing ini files with Sharpen=0 and no SmaaThreshold key take it once). Frame-time cost not measured.
+- Inherent: the game's UI/loading art is 512x448 (the loading-screen panels are visibly low-resolution textures), the pause menu background is blurred by the game, front-end glow/bloom smears text edges
+  ("OPTIONS" in menu.trace f4500), and the menu movie is MPEG-compressed. None of that can be fixed without replacement art (texture replacement exists).
+
+### Not verified
+- The real visible window / monitor (hidden-window back-buffer captures only), tearing with VSync off, the player's exact GPU driver state.
+- The exact trigger of the live-only blended frames (see above); the fix removes the code path rather than the trigger.
+- CAS frame-time cost; gameplay was verified by replay equality (0.0000 diff) rather than a fresh live gameplay burst after the fix.
+- Not edited (owned by others): the launcher's SMAA/Sharpening descriptions (`src/kz_launcher.cpp`).

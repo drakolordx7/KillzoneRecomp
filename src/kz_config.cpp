@@ -108,12 +108,15 @@ KzConfig kzLoadConfig(const std::filesystem::path &path)
     if (auto v = get("Graphics.Anisotropy")) c.anisotropy = std::clamp(std::atoi(v->c_str()), 0, 16);
     if (auto v = get("Graphics.FXAA")) c.fxaa = parseBool(*v, c.fxaa);
     if (auto v = get("Graphics.SMAA")) c.smaa = parseBool(*v, c.smaa);
+    if (auto v = get("Graphics.SmaaThreshold")) c.smaaThreshold = std::clamp(static_cast<float>(std::atof(v->c_str())), 0.05f, 0.5f);
     if (auto v = get("Graphics.TextureReplacement")) c.textureReplacement = parseBool(*v, c.textureReplacement);
     if (auto v = get("Graphics.Bilinear")) c.bilinear = parseBool(*v, c.bilinear);
     if (auto v = get("Graphics.SharpScaling")) c.sharpScaling = parseBool(*v, c.sharpScaling);
     if (auto v = get("Graphics.Sharpen")) c.sharpen = std::clamp(std::atoi(v->c_str()), 0, 100);
     // Files written before the sharp defaults (no SharpScaling key) had FXAA on by default: switch it off once.
     if (!get("Graphics.SharpScaling")) c.fxaa = false;
+    // Files written before sharpening was verified and defaulted on (no SmaaThreshold key yet) carry the old default 0: take the new default once.
+    if (!get("Graphics.SmaaThreshold") && c.sharpen == 0) c.sharpen = 30;
     if (auto v = get("Graphics.NoiseFilter")) c.noiseFilter = parseBool(*v, c.noiseFilter);
     if (auto v = get("Graphics.MotionBlur")) c.motionBlur = parseBool(*v, c.motionBlur);
     if (auto v = get("Graphics.Glow")) c.glow = parseBool(*v, c.glow);
@@ -138,7 +141,7 @@ bool kzSaveConfig(const std::filesystem::path &path, const KzConfig &c)
       << "[Display]\nWindowMode=" << toName(kWindowModes, c.windowMode) << "\nWidth=" << c.width << "\nHeight=" << c.height
       << "\nVSync=" << (c.vsync ? 1 : 0) << "\nFpsLimit=" << c.fpsLimit << "\n\n"
       << "[Graphics]\nRenderer=" << toName(kRenderers, c.renderer) << "\nUpscale=" << c.upscale
-      << "\nAspect=" << toName(kAspects, c.aspect) << "\nAnisotropy=" << c.anisotropy << "\nFXAA=" << (c.fxaa ? 1 : 0) << "\nSMAA=" << (c.smaa ? 1 : 0) << "\nTextureReplacement=" << (c.textureReplacement ? 1 : 0)
+      << "\nAspect=" << toName(kAspects, c.aspect) << "\nAnisotropy=" << c.anisotropy << "\nFXAA=" << (c.fxaa ? 1 : 0) << "\nSMAA=" << (c.smaa ? 1 : 0) << "\nSmaaThreshold=" << c.smaaThreshold << "\nTextureReplacement=" << (c.textureReplacement ? 1 : 0)
       << "\nBilinear=" << (c.bilinear ? 1 : 0) << "\nSharpScaling=" << (c.sharpScaling ? 1 : 0) << "\nSharpen=" << c.sharpen
       << "\nNoiseFilter=" << (c.noiseFilter ? 1 : 0) << "\nMotionBlur=" << (c.motionBlur ? 1 : 0)
       << "\nGlow=" << (c.glow ? 1 : 0) << "\nLensBlur=" << (c.lensBlur ? 1 : 0)

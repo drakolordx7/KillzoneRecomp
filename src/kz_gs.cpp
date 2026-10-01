@@ -104,11 +104,20 @@ namespace
         k.anisotropy = c.anisotropy;
         k.fxaa = c.fxaa;
         k.smaa = c.smaa;
+        kzgsSetSmaaThreshold(c.smaaThreshold);
+        if (const char *v = std::getenv("KZ_SMAA_THRESHOLD")) // automation override
+            kzgsSetSmaaThreshold(static_cast<float>(std::atof(v)));
         k.loadTextureReplacements = c.textureReplacement;
         k.sharpPresent = c.sharpScaling;
         k.casSharpness = c.sharpen;
         if (const char *v = std::getenv("KZ_FXAA")) // automation overrides
             k.fxaa = std::atoi(v) != 0;
+        // Interlace handling off: the game outputs full 448-line frames (FFMD=0) and PCSX2 Automatic mode never deinterlaces them
+        // (bit-identical to Off, docs/findings.md "Menu jitter and blur"), but every other mode would: Bob shifts the image by one
+        // line per field, Blend softens it. Off makes the field parity irrelevant by construction. KZ_INTERLACE=n restores a PCSX2 mode.
+        k.interlaceMode = 1;
+        if (const char *v = std::getenv("KZ_INTERLACE"))
+            k.interlaceMode = std::clamp(std::atoi(v), 0, 9);
         if (const char *v = std::getenv("KZ_SMAA"))
             k.smaa = std::atoi(v) != 0;
         if (const char *v = std::getenv("KZ_TEX_DUMP")) // automation: dump every texture to textures/SCUS-97402/dumps
@@ -169,8 +178,29 @@ namespace
         put(0x060, r.syncv ? r.syncv : kNtscSyncv);
         put(0x070, r.dispfb1);
         put(0x080, r.display1);
-        put(0x090, r.dispfb2);
-        put(0x0A0, r.display2);
+        // Killzone's own interlace flicker filter: read circuit 2 starts one line below circuit 1 (DBY 1 instead of 0, one line less)
+        // and PMODE blends the two 50/50. PCSX2's PCRTCAntiBlur removes the blend by realigning circuit 2, but then PCSX2 keeps two
+        // render-target lookups for the same buffer (one per circuit) and some frames come out as a 50 % blend of two frames
+        // (text doubled 1 to 3 lines apart; docs/findings.md "Menu jitter and blur"). Presenting circuit 1 alone is the same picture
+        // without the second lookup. KZ_FLICKER_FILTER=1 passes the registers through unchanged.
+        uint64_t dispfb2 = r.dispfb2, display2 = r.display2;
+        static const bool keepFilter = std::getenv("KZ_FLICKER_FILTER") && std::getenv("KZ_FLICKER_FILTER")[0] == '1';
+        if (!keepFilter && (r.pmode & 3u) == 3u)
+        {
+            const uint64_t fbLow = 0xFFFFFFFFull, dbxMask = 0x7FFull << 32, dbyMask = 0x7FFull << 43;
+            const uint64_t dby1 = (r.dispfb1 & dbyMask) >> 43, dby2 = (r.dispfb2 & dbyMask) >> 43;
+            const uint64_t dhMask = 0x7FFull << 44;
+            const bool sameFb = (r.dispfb1 & (fbLow | dbxMask)) == (r.dispfb2 & (fbLow | dbxMask)) && dby2 >= dby1 && dby2 - dby1 <= 1;
+            const uint64_t dh1 = (r.display1 & dhMask) >> 44, dh2 = (r.display2 & dhMask) >> 44;
+            const bool sameWindow = (r.display1 & ~dhMask) == (r.display2 & ~dhMask) && dh1 >= dh2 && dh1 - dh2 <= 1;
+            if (sameFb && sameWindow)
+            {
+                dispfb2 = r.dispfb1;
+                display2 = r.display1;
+            }
+        }
+        put(0x090, dispfb2);
+        put(0x0A0, display2);
         put(0x0B0, r.extbuf);
         put(0x0C0, r.extdata);
         put(0x0D0, r.extwrite);
@@ -234,11 +264,21 @@ namespace
             return;
         s.burstArmed = false;
         const int index = s.burstIndex++;
-        char name[128];
+        char name[160];
         for (auto &b : frames)
         {
-            std::snprintf(name, sizeof(name), "/gb_%02d_%04llu_fld%d%s.png", index, static_cast<unsigned long long>(b.seq), b.field, b.gameDeint ? "_deint" : "");
+            std::snprintf(name, sizeof(name), "/gb_%02d_%04llu_fld%d_sm%d_fb%d-%d-%d-%d%s.png", index, static_cast<unsigned long long>(b.seq), b.field, b.scanmask, b.rc[0], b.rc[1], b.rc[2], b.rc[3],
+                          b.gameDeint ? "_deint" : "");
             savePng((s.shotDir + name).c_str(), b.rgba, b.width, b.height);
+        }
+        for (auto &b : frames)
+        {
+            std::snprintf(name, sizeof(name), "/gb_%02d_%04llu.tc.txt", index, static_cast<unsigned long long>(b.seq));
+            if (FILE *f = std::fopen((s.shotDir + name).c_str(), "w"))
+            {
+                std::fputs(b.tcInfo.c_str(), f);
+                std::fclose(f);
+            }
         }
         std::snprintf(name, sizeof(name), "/gb_%02d.csv", index);
         if (FILE *f = std::fopen((s.shotDir + name).c_str(), "w"))
