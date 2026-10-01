@@ -526,9 +526,11 @@ namespace
                 const long long nowSec = std::chrono::duration_cast<std::chrono::seconds>(now - s.start).count();
                 if (burstN > 0 && !s.burstArmed && nowSec >= burstFrom && nowSec <= burstTo)
                 {
-                    static const bool burstPresent = std::getenv("KZ_SHOT_BURST_PRESENT") && std::getenv("KZ_SHOT_BURST_PRESENT")[0] == '1';
+                    static const int burstPresent = std::getenv("KZ_SHOT_BURST_PRESENT") ? std::atoi(std::getenv("KZ_SHOT_BURST_PRESENT")) : 0; // 1: snapshot at the window size, 2: the swap chain back buffer at Present
                     int ww = 0, wh = 0;
-                    if (burstPresent)
+                    if (burstPresent == 2)
+                        ww = -1, wh = -1;
+                    else if (burstPresent == 1)
                     {
                         ww = 1280, wh = 896;
                         if (const char *v = std::getenv("KZ_WINDOW_SIZE"))

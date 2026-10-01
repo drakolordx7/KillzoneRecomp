@@ -200,7 +200,21 @@ float4 ps_blend(VSOut i) : SV_Target
 		{
 			char metrics[160];
 			std::snprintf(metrics, sizeof(metrics), "float4(%.12f, %.12f, %d.0, %d.0)", 1.0 / w, 1.0 / h, w, h);
-			const D3D_SHADER_MACRO macros[] = {{"SMAA_HLSL_4_1", "1"}, {"SMAA_PRESET_HIGH", "1"}, {"SMAA_RT_METRICS", metrics}, {nullptr, nullptr}};
+			// HIGH preset by default; KZGS_SMAA_THRESHOLD / _STEPS / _DIAG / _CORNER override it (measurement, docs/findings.md)
+			const auto envf = [](const char* n, double def) { const char* v = std::getenv(n); return v && *v ? std::atof(v) : def; };
+			char thr[32], steps[32], stepsDiag[32], corner[32];
+			std::snprintf(thr, sizeof(thr), "%.4f", envf("KZGS_SMAA_THRESHOLD", 0.1));
+			std::snprintf(steps, sizeof(steps), "%d", static_cast<int>(envf("KZGS_SMAA_STEPS", 16)));
+			std::snprintf(stepsDiag, sizeof(stepsDiag), "%d", static_cast<int>(envf("KZGS_SMAA_DIAG", 8)));
+			std::snprintf(corner, sizeof(corner), "%d", static_cast<int>(envf("KZGS_SMAA_CORNER", 25)));
+			std::vector<D3D_SHADER_MACRO> macroList = {{"SMAA_HLSL_4_1", "1"}, {"SMAA_RT_METRICS", metrics}, {"SMAA_THRESHOLD", thr},
+			                                           {"SMAA_MAX_SEARCH_STEPS", steps}, {"SMAA_MAX_SEARCH_STEPS_DIAG", stepsDiag}, {"SMAA_CORNER_ROUNDING", corner}};
+			if (static_cast<int>(envf("KZGS_SMAA_DIAG", 8)) <= 0)
+				macroList.push_back({"SMAA_DISABLE_DIAG_DETECTION", "1"});
+			if (static_cast<int>(envf("KZGS_SMAA_CORNER", 25)) >= 100)
+				macroList.push_back({"SMAA_DISABLE_CORNER_DETECTION", "1"});
+			macroList.push_back({nullptr, nullptr});
+			const D3D_SHADER_MACRO* macros = macroList.data();
 			const std::string code = s_res.source + "\n" + kPasses;
 			wil::com_ptr_nothrow<ID3DBlob> vsb, pe, pw, pb;
 			if (!Compile(d, code, macros, "vs_tri", "vs_5_0", vsb) || !Compile(d, code, macros, "ps_edge", "ps_5_0", pe) ||

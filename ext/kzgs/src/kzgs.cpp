@@ -441,9 +441,26 @@ namespace
 	static std::vector<KzgsBurstFrame> s_burst_frames;
 	static std::mutex s_burst_mutex;
 	static u64 s_vsync_seq = 0;
+	static int s_cur_field = 0;
 	// KZGS_PRESENT_LOG=<file>: one line per frame that reached the GS thread: time the GS vsync finished (QPC ns), field, GS vsync duration (us).
 	static std::vector<std::array<long long, 3>> s_present_log;
 	static const char* const s_present_log_path = std::getenv("KZGS_PRESENT_LOG");
+
+	// Present-time capture (kzgsBurstArm with presentWidth < 0): called from the swap chain's Present hook on the GS thread.
+	static void BurstPresentSink(const uint8_t* rgba, int w, int h)
+	{
+		if (s_burst_left.load(std::memory_order_acquire) <= 0)
+			return;
+		KzgsBurstFrame f;
+		f.field = s_cur_field;
+		f.seq = s_vsync_seq + 1;
+		f.width = w;
+		f.height = h;
+		f.rgba.assign(rgba, rgba + static_cast<size_t>(w) * h * 4);
+		std::lock_guard<std::mutex> lock(s_burst_mutex);
+		s_burst_frames.push_back(std::move(f));
+		s_burst_left.fetch_sub(1, std::memory_order_release);
+	}
 
 	static void BurstCaptureAfterVsync(int field)
 	{
@@ -534,6 +551,7 @@ namespace
 					Trace(3);
 					LARGE_INTEGER t0, t1, fq;
 					if (s_present_log_path) QueryPerformanceCounter(&t0);
+					s_cur_field = static_cast<int>(hdr.a);
 					GSvsync(hdr.a, hdr.b != 0);
 					if (s_present_log_path)
 					{
@@ -543,7 +561,7 @@ namespace
 					}
 					FakeFifoPresent();
 					++s_vsync_seq;
-					if (s_burst_left.load(std::memory_order_acquire) > 0)
+					if (s_burst_pw >= 0 && s_burst_left.load(std::memory_order_acquire) > 0)
 						BurstCaptureAfterVsync(static_cast<int>(hdr.a));
 					Trace(4);
 					s_queued_frames.fetch_sub(1, std::memory_order_acq_rel);
@@ -866,12 +884,16 @@ void kzgsBurstArm(int count, int presentWidth, int presentHeight)
 	s_burst_pw = presentWidth;
 	s_burst_ph = presentHeight;
 	s_burst_left.store(std::max(count, 0), std::memory_order_release);
+	if (presentWidth < 0 && count > 0)
+		kzgs::RunOnGSThread([] { kzgs::PresentCapture(&BurstPresentSink); });
 }
 
 bool kzgsBurstTake(std::vector<KzgsBurstFrame>& out)
 {
 	if (s_burst_left.load(std::memory_order_acquire) > 0)
 		return false;
+	if (s_burst_pw < 0)
+		kzgs::RunOnGSThread([] { kzgs::PresentCapture(nullptr); });
 	std::lock_guard<std::mutex> lock(s_burst_mutex);
 	out = std::move(s_burst_frames);
 	s_burst_frames.clear();
