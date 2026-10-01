@@ -179,8 +179,11 @@ namespace
     // previous run's log is kept as killzone.prev.log. Returns true when the log file is in use.
     bool openLogFile()
     {
+        // Redirected to a file or pipe (development, automation): leave it. A console counts as "nowhere": started
+        // from Explorer the game gets its own console window, which is closed below once the log file is open.
         const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
-        if (out != nullptr && out != INVALID_HANDLE_VALUE && GetFileType(out) != FILE_TYPE_UNKNOWN)
+        const DWORD type = (out != nullptr && out != INVALID_HANDLE_VALUE) ? GetFileType(out) : FILE_TYPE_UNKNOWN;
+        if (type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE)
             return false;
         const std::filesystem::path log = kzConfigPath().parent_path() / "killzone.log";
         std::error_code ec;
@@ -191,6 +194,10 @@ namespace
         std::setvbuf(stdout, nullptr, _IOLBF, 4096);
         std::setvbuf(stderr, nullptr, _IONBF, 0);
         std::ios::sync_with_stdio(true);
+        // A console that exists only for this process (double-click start) is not needed any more.
+        DWORD pids[2];
+        if (GetConsoleProcessList(pids, 2) == 1)
+            FreeConsole();
         return true;
     }
 }
@@ -310,7 +317,7 @@ int main(int argc, char *argv[])
             return 1;
         }
         kzIpuInstall();
-        kzAudioInstall();
+        kzAudioInstall(!automation);
         PS2Runtime runtime;
         kzVuBindRuntime(runtime);
         kzIpuBindRuntime(runtime);

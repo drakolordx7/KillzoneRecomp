@@ -321,7 +321,7 @@ namespace
     }
 }
 
-bool kzAudioInstall()
+bool kzAudioInstall(bool outputDevice)
 {
     if (!envFlag("KZ_AUDIO", true))
     {
@@ -370,11 +370,15 @@ bool kzAudioInstall()
     if (const char *s = std::getenv("KZ_AUDIO_STATS"); s && *s)
         g_statsInterval = std::atof(s);
 
-    const bool headless = envFlag("PS2X_HEADLESS", false);
-    if (envFlag("KZ_AUDIO_DEVICE", !headless))
-        openDevice();
+    // Not derived from PS2X_HEADLESS: kz_main sets that for the runtime in every run (the runtime's own window is
+    // never used), which is why the device was never opened in real play.
+    if (envFlag("KZ_AUDIO_DEVICE", outputDevice))
+    {
+        if (!openDevice())
+            std::cout << "[kz_audio] NO SOUND: the audio device could not be opened" << std::endl;
+    }
     else
-        std::cout << "[kz_audio] no output device (headless or KZ_AUDIO_DEVICE=0); SPU2 still emulated" << std::endl;
+        std::cout << "[kz_audio] no output device (automated run or KZ_AUDIO_DEVICE=0); SPU2 still emulated" << std::endl;
 
     std::atexit(shutdown);
     g_active = true;
