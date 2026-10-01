@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cfloat>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -28,8 +29,8 @@ namespace
 
 namespace
 {
-    constexpr int kWidth = 760;
-    constexpr int kHeight = 620;
+    constexpr int kWidth = 900;
+    constexpr int kHeight = 760;
 
     struct Resolution
     {
@@ -134,6 +135,62 @@ namespace
         return changed;
     }
 
+    // ---- layout helpers: every setting is one row, "label + one-line explanation" on the left, control on the right
+    constexpr float kLabelWidth = 380.0f;
+
+    bool beginRows(const char *id)
+    {
+        if (!ImGui::BeginTable(id, 2, ImGuiTableFlags_None))
+            return false;
+        ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, kLabelWidth);
+        ImGui::TableSetupColumn("control", ImGuiTableColumnFlags_WidthStretch);
+        return true;
+    }
+
+    // Starts a row and leaves the cursor in the control column, with the next item filling its width.
+    void row(const char *label, const char *help = nullptr)
+    {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(label);
+        if (help)
+        {
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + kLabelWidth - 16.0f);
+            ImGui::TextDisabled("%s", help);
+            ImGui::PopTextWrapPos();
+        }
+        ImGui::TableSetColumnIndex(1);
+        ImGui::SetNextItemWidth(-FLT_MIN);
+    }
+
+    // On/off row; `onText` / `offText` say what each state means.
+    void toggleRow(const char *label, const char *help, bool &value, const char *onText = "On", const char *offText = "Off")
+    {
+        row(label, help);
+        ImGui::PushID(label);
+        ImGui::Checkbox("##v", &value);
+        ImGui::SameLine();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(value ? onText : offText);
+        ImGui::PopID();
+    }
+
+    void section(const char *title)
+    {
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.45f, 0.35f, 1.0f));
+        ImGui::SeparatorText(title);
+        ImGui::PopStyleColor();
+    }
+
+    // Scrolling body of a tab: stops above the footer, so long tabs never run under the buttons.
+    bool beginTabBody(const char *id)
+    {
+        const float footer = 64.0f;
+        return ImGui::BeginChild(id, ImVec2(0, std::max(80.0f, ImGui::GetContentRegionAvail().y - footer)), ImGuiChildFlags_None);
+    }
+
     void drawUi(LauncherState &st, SDL_Window *window)
     {
         KzConfig &cfg = st.cfg;
@@ -182,116 +239,215 @@ namespace
         ImGui::PopStyleColor();
         ImGui::Spacing();
 
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
         if (ImGui::BeginTabBar("tabs"))
         {
             if (ImGui::BeginTabItem("Display", nullptr, forcedTab("Display")))
             {
-                enumCombo<KzWindowMode>("Window mode", cfg.windowMode,
-                                        {{KzWindowMode::Borderless, "Borderless fullscreen"},
-                                         {KzWindowMode::Fullscreen, "Exclusive fullscreen"},
-                                         {KzWindowMode::Windowed, "Windowed"}});
-                std::string resLabel = cfg.width == 0 ? "Desktop" : std::to_string(cfg.width) + " x " + std::to_string(cfg.height);
-                if (ImGui::BeginCombo("Resolution", resLabel.c_str()))
+                if (beginTabBody("display"))
                 {
-                    if (ImGui::Selectable("Desktop", cfg.width == 0))
-                        cfg.width = cfg.height = 0;
-                    for (const Resolution &r : st.resolutions)
+                    if (beginRows("rows"))
                     {
-                        const std::string l = std::to_string(r.w) + " x " + std::to_string(r.h);
-                        if (ImGui::Selectable(l.c_str(), cfg.width == r.w && cfg.height == r.h))
+                        row("Window mode");
+                        enumCombo<KzWindowMode>("##mode", cfg.windowMode,
+                                                {{KzWindowMode::Borderless, "Borderless fullscreen"},
+                                                 {KzWindowMode::Fullscreen, "Exclusive fullscreen"},
+                                                 {KzWindowMode::Windowed, "Windowed"}});
+                        row("Resolution", "Desktop = your monitor's current resolution.");
+                        std::string resLabel = cfg.width == 0 ? "Desktop" : std::to_string(cfg.width) + " x " + std::to_string(cfg.height);
+                        if (ImGui::BeginCombo("##res", resLabel.c_str()))
                         {
-                            cfg.width = r.w;
-                            cfg.height = r.h;
+                            if (ImGui::Selectable("Desktop", cfg.width == 0))
+                                cfg.width = cfg.height = 0;
+                            for (const Resolution &r : st.resolutions)
+                            {
+                                const std::string l = std::to_string(r.w) + " x " + std::to_string(r.h);
+                                if (ImGui::Selectable(l.c_str(), cfg.width == r.w && cfg.height == r.h))
+                                {
+                                    cfg.width = r.w;
+                                    cfg.height = r.h;
+                                }
+                            }
+                            ImGui::EndCombo();
                         }
+                        row("Frame rate", "The game runs at this rate (the PS2 original ran at about 30).");
+                        static const int kFps[] = {0, 60, 120, 144, 165, 240, 360}; // 0 = monitor refresh
+                        std::string fpsLabel = cfg.fpsLimit == 0 ? "Match monitor refresh" : std::to_string(cfg.fpsLimit) + " fps";
+                        if (ImGui::BeginCombo("##fps", fpsLabel.c_str()))
+                        {
+                            for (int f : kFps)
+                                if (ImGui::Selectable(f == 0 ? "Match monitor refresh" : (std::to_string(f) + " fps").c_str(), cfg.fpsLimit == f))
+                                    cfg.fpsLimit = f;
+                            ImGui::EndCombo();
+                        }
+                        toggleRow("V-Sync", "Removes tearing; adds a little input delay.", cfg.vsync);
+                        ImGui::EndTable();
                     }
-                    ImGui::EndCombo();
                 }
-                static const int kFps[] = {0, 60, 120, 144, 165, 240, 360};  // 0 = monitor refresh
-                std::string fpsLabel = cfg.fpsLimit == 0 ? "Match monitor refresh" : std::to_string(cfg.fpsLimit) + " fps";
-                if (ImGui::BeginCombo("Frame rate", fpsLabel.c_str()))
-                {
-                    for (int f : kFps)
-                        if (ImGui::Selectable(f == 0 ? "Match monitor refresh" : (std::to_string(f) + " fps").c_str(), cfg.fpsLimit == f))
-                            cfg.fpsLimit = f;
-                    ImGui::EndCombo();
-                }
-                ImGui::Checkbox("V-Sync", &cfg.vsync);
-                ImGui::TextDisabled("The game simulates on real frame time, so it renders and plays at the chosen\n"
-                                    "rate (60 = original feel, 120 and up = high refresh).");
+                ImGui::EndChild();
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Graphics", nullptr, forcedTab("Graphics")))
             {
-                enumCombo<KzRenderer>("Renderer", cfg.renderer,
-                                      {{KzRenderer::D3D11, "Direct3D 11"}, {KzRenderer::D3D12, "Direct3D 12"}, {KzRenderer::Vulkan, "Vulkan"}});
-                const char *scales[] = {"Auto (match display)", "1x (native 640x448)", "2x", "3x (~1080p)", "4x (~1440p)",
-                                        "5x", "6x (~4K)", "7x", "8x"};
-                ImGui::Combo("Internal resolution", &cfg.upscale, scales, IM_ARRAYSIZE(scales));
-                enumCombo<KzAspect>("Aspect ratio", cfg.aspect,
-                                    {{KzAspect::Widescreen16x9, "16:9 widescreen (native)"},
-                                     {KzAspect::Classic4x3, "4:3 original"},
-                                     {KzAspect::Stretch, "Stretch to window"}});
-                const int anisoValues[] = {0, 2, 4, 8, 16};
-                const char *aniso[] = {"Off", "2x", "4x", "8x", "16x"};
-                int anisoIdx = static_cast<int>(std::find(std::begin(anisoValues), std::end(anisoValues), cfg.anisotropy) - std::begin(anisoValues));
-                if (anisoIdx >= 5) anisoIdx = 4;
-                if (ImGui::Combo("Anisotropic filtering", &anisoIdx, aniso, 5))
-                    cfg.anisotropy = anisoValues[anisoIdx];
-                ImGui::Checkbox("Bilinear texture filtering", &cfg.bilinear);
-                ImGui::Checkbox("Sharp display scaling (crisp pixels)", &cfg.sharpScaling);
-                ImGui::SliderInt("Sharpening (CAS)", &cfg.sharpen, 0, 100, cfg.sharpen == 0 ? "Off" : "%d%%");
-                ImGui::Checkbox("FXAA (blurs edges; higher internal resolution is the sharp anti-aliasing)", &cfg.fxaa);
-                ImGui::Checkbox("SMAA 1x (Direct3D 11; keeps edges sharper than FXAA)", &cfg.smaa);
-                ImGui::Checkbox("Load replacement textures (textures/SCUS-97402/replacements)", &cfg.textureReplacement);
-                ImGui::Checkbox("Film-grain noise filter (original look)", &cfg.noiseFilter);
-                ImGui::Checkbox("Motion blur (original look: previous frame blended over the current)", &cfg.motionBlur);
-                ImGui::Checkbox("Glow blur (original look: soft halo on emissive surfaces)", &cfg.glow);
-                ImGui::Checkbox("Lens blur (original look: rain-on-lens blur overlay)", &cfg.lensBlur);
-                ImGui::SliderFloat("Render distance (fog and far plane)", &cfg.renderDistance, 1.0f, 8.0f, "%.1fx", ImGuiSliderFlags_Logarithmic);
-                ImGui::SliderFloat("Model detail distance (LOD)", &cfg.lodScale, 0.5f, 8.0f, "%.1fx", ImGuiSliderFlags_Logarithmic);
+                if (beginTabBody("graphics"))
+                {
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextDisabled("Presets:");
+                    ImGui::SameLine();
+                    if (ImGui::Button("Sharp and clean"))
+                    {
+                        cfg.fxaa = false; cfg.smaa = true; cfg.sharpScaling = true; cfg.bilinear = true; cfg.anisotropy = 16;
+                        cfg.noiseFilter = false; cfg.motionBlur = false; cfg.glow = false; cfg.lensBlur = false;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Original PS2 look"))
+                    {
+                        cfg.fxaa = false; cfg.smaa = false; cfg.sharpScaling = false; cfg.bilinear = true;
+                        cfg.noiseFilter = true; cfg.motionBlur = true; cfg.glow = true; cfg.lensBlur = true;
+                        cfg.renderDistance = 1.0f; cfg.lodScale = 1.0f; cfg.sharpen = 0;
+                    }
+
+                    section("Output");
+                    if (beginRows("output"))
+                    {
+                        row("Renderer", "Direct3D 11 is the tested default.");
+                        enumCombo<KzRenderer>("##renderer", cfg.renderer,
+                                              {{KzRenderer::D3D11, "Direct3D 11"}, {KzRenderer::D3D12, "Direct3D 12"}, {KzRenderer::Vulkan, "Vulkan"}});
+                        row("Internal resolution", "Higher = sharper edges. Auto matches your display.");
+                        const char *scales[] = {"Auto (match display)", "1x (PS2 native 640x448)", "2x", "3x (about 1080p)", "4x (about 1440p)",
+                                                "5x", "6x (about 4K)", "7x", "8x"};
+                        ImGui::Combo("##upscale", &cfg.upscale, scales, IM_ARRAYSIZE(scales));
+                        row("Aspect ratio");
+                        enumCombo<KzAspect>("##aspect", cfg.aspect,
+                                            {{KzAspect::Widescreen16x9, "16:9 widescreen (native)"},
+                                             {KzAspect::Classic4x3, "4:3 original"},
+                                             {KzAspect::Stretch, "Stretch to window"}});
+                        row("Scaling to the screen", "How the picture is fitted to your display.");
+                        int scaling = cfg.sharpScaling ? 0 : 1;
+                        const char *scalings[] = {"Sharp (crisp pixels)", "Smooth (softer)"};
+                        if (ImGui::Combo("##scaling", &scaling, scalings, 2))
+                            cfg.sharpScaling = scaling == 0;
+                        ImGui::EndTable();
+                    }
+
+                    section("Anti-aliasing");
+                    if (beginRows("aa"))
+                    {
+                        toggleRow("SMAA", "Smooths jagged edges without blurring textures. Direct3D 11 only.", cfg.smaa);
+                        toggleRow("FXAA", "Softens the whole picture slightly.", cfg.fxaa, "On (softer)", "Off");
+                        ImGui::EndTable();
+                    }
+
+                    section("Textures");
+                    if (beginRows("textures"))
+                    {
+                        row("Texture filtering");
+                        int filtering = cfg.bilinear ? 0 : 1;
+                        const char *filterings[] = {"Bilinear (as the game intends)", "Nearest (blocky pixels)"};
+                        if (ImGui::Combo("##filtering", &filtering, filterings, 2))
+                            cfg.bilinear = filtering == 0;
+                        row("Anisotropic filtering", "Keeps ground and wall textures sharp at a distance.");
+                        const int anisoValues[] = {0, 2, 4, 8, 16};
+                        const char *aniso[] = {"Off", "2x", "4x", "8x", "16x"};
+                        int anisoIdx = static_cast<int>(std::find(std::begin(anisoValues), std::end(anisoValues), cfg.anisotropy) - std::begin(anisoValues));
+                        if (anisoIdx >= 5)
+                            anisoIdx = 4;
+                        if (ImGui::Combo("##aniso", &anisoIdx, aniso, 5))
+                            cfg.anisotropy = anisoValues[anisoIdx];
+                        toggleRow("Replacement textures", "Loads texture packs from the textures folder.", cfg.textureReplacement);
+                        ImGui::EndTable();
+                    }
+
+                    section("PS2 screen effects (off = cleaner picture)");
+                    if (beginRows("effects"))
+                    {
+                        toggleRow("Motion blur", "Smears the previous frame over the current one.", cfg.motionBlur, "On (as on PS2)", "Off (clean)");
+                        toggleRow("Film grain", "Moving noise over the whole picture.", cfg.noiseFilter, "On (as on PS2)", "Off (clean)");
+                        toggleRow("Glow", "Soft halo around bright surfaces.", cfg.glow, "On (as on PS2)", "Off (clean)");
+                        toggleRow("Rain-on-lens blur", "Blurs the view when rain hits the camera.", cfg.lensBlur, "On (as on PS2)", "Off (clean)");
+                        ImGui::EndTable();
+                    }
+
+                    section("Detail");
+                    if (beginRows("detail"))
+                    {
+                        row("View distance", "Pushes the fog back. 2x costs almost nothing.");
+                        ImGui::SliderFloat("##renderdist", &cfg.renderDistance, 1.0f, 4.0f, "%.1fx");
+                        row("Model detail distance", "Keeps detailed models further away. 4x costs about 8 % fps.");
+                        ImGui::SliderFloat("##lod", &cfg.lodScale, 1.0f, 4.0f, "%.1fx");
+                        row("Sharpening", "Extra edge contrast. Not verified yet.");
+                        ImGui::SliderInt("##sharpen", &cfg.sharpen, 0, 100, cfg.sharpen == 0 ? "Off" : "%d%%");
+                        ImGui::EndTable();
+                    }
+                }
+                ImGui::EndChild();
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Controls", nullptr, forcedTab("Controls")))
             {
-                ImGui::SliderFloat("Mouse sensitivity", &cfg.mouseSensitivity, 0.1f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-                ImGui::Checkbox("Invert mouse Y", &cfg.invertY);
-                ImGui::Checkbox("Raw mouse input", &cfg.rawMouse);
-                ImGui::Checkbox("Hold to aim (off: zoom key toggles, as on PS2)", &cfg.holdAim);
-                ImGui::SliderFloat("Controller stick deadzone", &cfg.stickDeadzone, 0.0f, 0.5f, "%.2f");
-                ImGui::Spacing();
-                ImGui::TextDisabled("Mouse aim is applied directly to the player's view (no stick acceleration).\n"
-                                    "Controllers are detected automatically. To rebind keys, edit [Bindings] in killzone.ini.");
-                static const auto bindings = kzInputDescribeBindings(kzConfigPath());
-                if (ImGui::BeginTable("bindings", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerV,
-                                      ImVec2(0, std::max(60.0f, ImGui::GetContentRegionAvail().y - 104.0f))))
+                if (beginTabBody("controls"))
                 {
-                    ImGui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthFixed, 140.0f);
-                    ImGui::TableSetupColumn("Action");
-                    for (const auto &[key, action] : bindings)
+                    section("Mouse");
+                    if (beginRows("mouse"))
                     {
-                        ImGui::TableNextRow();
-                        ImGui::TableSetColumnIndex(0);
-                        ImGui::TextUnformatted(key.c_str());
-                        ImGui::TableSetColumnIndex(1);
-                        ImGui::TextUnformatted(action.c_str());
+                        row("Sensitivity", "1.0 = 0.05 degrees per mouse count, same on both axes.");
+                        ImGui::SliderFloat("##sens", &cfg.mouseSensitivity, 0.1f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+                        toggleRow("Invert vertical look", nullptr, cfg.invertY);
+                        toggleRow("Aim", "Right mouse button by default.", cfg.holdAim, "Hold to aim", "Press to toggle (as on PS2)");
+                        ImGui::EndTable();
                     }
-                    ImGui::EndTable();
+                    section("Controller");
+                    if (beginRows("pad"))
+                    {
+                        row("Stick dead zone", "Controllers are detected automatically (PS2 layout).");
+                        ImGui::SliderFloat("##deadzone", &cfg.stickDeadzone, 0.0f, 0.5f, "%.2f");
+                        ImGui::EndTable();
+                    }
+                    section("Keys");
+                    static const auto bindings = kzInputDescribeBindings(kzConfigPath());
+                    if (ImGui::BeginTable("bindings", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV))
+                    {
+                        ImGui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthFixed, 160.0f);
+                        ImGui::TableSetupColumn("Action");
+                        for (const auto &[key, action] : bindings)
+                        {
+                            ImGui::TableNextRow();
+                            ImGui::TableSetColumnIndex(0);
+                            ImGui::TextUnformatted(key.c_str());
+                            ImGui::TableSetColumnIndex(1);
+                            ImGui::TextUnformatted(action.c_str());
+                        }
+                        ImGui::EndTable();
+                    }
+                    ImGui::Spacing();
+                    ImGui::TextDisabled("To change keys, edit the [Bindings] section of killzone.ini.");
+                    if (ImGui::Button("Open killzone.ini"))
+                    {
+                        kzSaveConfig(kzConfigPath(), cfg);
+                        const std::string url = "file:///" + kzConfigPath().generic_string();
+                        SDL_OpenURL(url.c_str());
+                    }
                 }
-                if (ImGui::Button("Open killzone.ini"))
-                {
-                    kzSaveConfig(kzConfigPath(), cfg);
-                    const std::string url = "file:///" + kzConfigPath().generic_string();
-                    SDL_OpenURL(url.c_str());
-                }
+                ImGui::EndChild();
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Audio", nullptr, forcedTab("Audio")))
             {
-                ImGui::SliderInt("Master volume", &cfg.masterVolume, 0, 100, "%d%%");
+                if (beginTabBody("audio"))
+                {
+                    if (beginRows("rows"))
+                    {
+                        row("Master volume", "Sound plays on the Windows default output device.");
+                        ImGui::SliderInt("##volume", &cfg.masterVolume, 0, 100, "%d%%");
+                        ImGui::EndTable();
+                    }
+                }
+                ImGui::EndChild();
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
         }
+        ImGui::PopStyleColor();
 
         // Footer
         const float footerY = ImGui::GetWindowHeight() - 56.0f;
