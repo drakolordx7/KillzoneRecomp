@@ -25,6 +25,11 @@ extern "C" int __llvm_profile_write_file(void);
 
 #include <SDL3/SDL.h>
 #include <xmmintrin.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <cstdio>
 
 #include <atomic>
 #include <cmath>
@@ -163,6 +168,29 @@ namespace
     }
 }
 
+namespace
+{
+    // A player starts the game without a console, so its output would be lost. When stdout is not already going
+    // somewhere (console, pipe or file), stdout and stderr are written to killzone.log next to the settings file; the
+    // previous run's log is kept as killzone.prev.log. Returns true when the log file is in use.
+    bool openLogFile()
+    {
+        const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (out != nullptr && out != INVALID_HANDLE_VALUE && GetFileType(out) != FILE_TYPE_UNKNOWN)
+            return false;
+        const std::filesystem::path log = kzConfigPath().parent_path() / "killzone.log";
+        std::error_code ec;
+        std::filesystem::rename(log, kzConfigPath().parent_path() / "killzone.prev.log", ec);
+        if (!std::freopen(log.string().c_str(), "w", stdout))
+            return false;
+        std::freopen(log.string().c_str(), "a", stderr);
+        std::setvbuf(stdout, nullptr, _IOLBF, 4096);
+        std::setvbuf(stderr, nullptr, _IONBF, 0);
+        std::ios::sync_with_stdio(true);
+        return true;
+    }
+}
+
 int main(int argc, char *argv[])
 {
     try
@@ -170,6 +198,11 @@ int main(int argc, char *argv[])
         const Options opts = parseArgs(argc, argv);
         if (opts.selfTest)
             return runSelfTest();
+        if (openLogFile())
+        {
+            _putenv_s("KZ_AUDIO_STATS", std::getenv("KZ_AUDIO_STATS") ? std::getenv("KZ_AUDIO_STATS") : "30");
+            std::cout << "[kz] log file opened (killzone.log)" << std::endl;
+        }
         kzConfig() = kzLoadConfig(kzConfigPath());
         KzConfig &cfg = kzConfig();
         if (!opts.iso.empty())

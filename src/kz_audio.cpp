@@ -28,6 +28,7 @@ namespace
     PS2Runtime *g_runtime = nullptr;
     SDL_AudioStream *g_stream = nullptr;
     std::atomic<uint64_t> g_underrunFrames{0};
+    std::atomic<uint64_t> g_feedCalls{0}, g_feedFrames{0}; // SDL audio callback activity (device diagnostics)
     std::atomic<uint64_t> g_skippedFrames{0};
     bool g_pace = true; // see "pacing" below
     double g_factor = 1.0;
@@ -93,12 +94,13 @@ namespace
         const KzSpu2Status st = kzspu2GetStatus();
         std::fprintf(stderr,
                      "[kz_audio] t=%.0fs frames=%llu (%.3fx real time) rms L/R %.0f/%.0f (%.1f/%.1f dBFS) peak %d/%d "
-                     "voices %u/%u irq %u dma %u/%u dropped %llu underrun %llu skipped %llu pace %.3f\n",
+                     "voices %u/%u irq %u dma %u/%u dropped %llu underrun %llu skipped %llu pace %.3f device calls %llu frames %llu\n",
                      now, static_cast<unsigned long long>(g_statsFrames), secs > 0 ? g_statsFrames / (kRate * secs) : 0.0,
                      rmsL, rmsR, db(rmsL), db(rmsR), g_peak[0], g_peak[1], st.keyedOnVoices[0], st.keyedOnVoices[1],
                      st.irqCount, st.dmaCount[0], st.dmaCount[1], static_cast<unsigned long long>(st.framesDropped),
                      static_cast<unsigned long long>(g_underrunFrames.load()),
-                     static_cast<unsigned long long>(g_skippedFrames.load()), g_pace ? g_factor : 1.0, g_paceAhead);
+                     static_cast<unsigned long long>(g_skippedFrames.load()), g_pace ? g_factor : 1.0,
+                     static_cast<unsigned long long>(g_feedCalls.load()), static_cast<unsigned long long>(g_feedFrames.load()));
         g_statsFrames = 0;
         g_sumSq[0] = g_sumSq[1] = 0;
         g_peak[0] = g_peak[1] = 0;
@@ -140,6 +142,8 @@ namespace
     // ---- SDL audio thread ---------------------------------------------------------------------------------------------
     void SDLCALL feed(void *, SDL_AudioStream *stream, int additional, int)
     {
+        ++g_feedCalls;
+        g_feedFrames += static_cast<uint64_t>(std::max(additional, 0)) / 4u;
         const uint32_t avail = kzspu2AvailableFrames();
         if (avail > kHighFrames)
             g_skippedFrames += kzspu2SkipFrames(avail - kTargetFrames);
@@ -174,10 +178,20 @@ namespace
             std::cerr << "[kz_audio] no audio device: " << SDL_GetError() << std::endl;
             return false;
         }
-        const int volume = std::clamp(kzConfig().masterVolume, 0, 100);
+        int volume = std::clamp(kzConfig().masterVolume, 0, 100);
+        if (const char *v = std::getenv("KZ_AUDIO_VOLUME")) // automation: e.g. 0 to exercise the device silently
+            volume = std::clamp(std::atoi(v), 0, 100);
         SDL_SetAudioStreamGain(g_stream, volume / 100.0f);
-        SDL_ResumeAudioStreamDevice(g_stream);
-        std::cout << "[kz_audio] output: " << SDL_GetCurrentAudioDriver() << ", 48 kHz stereo, volume " << volume << "%"
+        const bool resumed = SDL_ResumeAudioStreamDevice(g_stream);
+        const SDL_AudioDeviceID device = SDL_GetAudioStreamDevice(g_stream);
+        const char *name = SDL_GetAudioDeviceName(device);
+        SDL_AudioSpec deviceSpec{};
+        int deviceFrames = 0;
+        SDL_GetAudioDeviceFormat(device, &deviceSpec, &deviceFrames);
+        std::cout << "[kz_audio] output: " << SDL_GetCurrentAudioDriver() << " device '" << (name ? name : "?") << "' "
+                  << deviceSpec.freq << " Hz " << deviceSpec.channels << " ch, buffer " << deviceFrames
+                  << " frames; stream 48 kHz stereo, volume " << volume << "%"
+                  << (resumed ? "" : " (RESUME FAILED: ") << (resumed ? "" : SDL_GetError()) << (resumed ? "" : ")")
                   << std::endl;
         return true;
     }
