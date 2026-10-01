@@ -1152,7 +1152,7 @@ change nothing (rifle slots 1 and 2 are empty, the 7/29-round object stays inact
    `FUN_0023e8c8` adds |turn| * turnSpeed * pi/180 per frame to a counter (`ctrl+0xBC`, reset when the stick is released) and starts a 1 -> 2x
    smoothstep ramp once it passes 15 degrees. Per frame, not per second: full stick starts the ramp after 8 frames (0.27 s at 30 fps), half stick
    after about 60 frames (2.0 s at 30 fps: never inside a 2 s hold). At 120 Hz (game frames of 8-17 ms) it started after 0.1 s / 0.5 s. Before the fix
-   (`KZ_TIMEFIX=0`, port / PCSX2): full-stick turn rate at 0.6 s 1.08-1.14, angle after 0.9 s 1.05-1.09; half stick at 1.5 s 1.40-1.67 (it is flat in the
+   (`KZ_TIMEFIX=0`, port / PCSX2): full-stick turn rate at 0.6 s 1.08-1.14, angle after 0.9 s 1.05-1.10; half stick at 1.5 s 1.40-1.67 (it is flat in the
    original), angle after 1.9 s 1.20-1.30. The step is now scaled by dt * 30: full stick is within 0.970-1.019 of PCSX2 at 60-240 Hz and half stick is
    exactly 0.499 flat (ratio 1.000), identical at 30 Hz.
 2. **Camera lag is an Euler step (fixed, gamepad play).** `FUN_0021C550` (ApplyLook) keeps the view trailing the aim (`player+0x2A8` yaw / `+0x2AC` pitch,
@@ -1163,8 +1163,9 @@ change nothing (rifle slots 1 and 2 are empty, the 7/29-round object stays inact
 3. **Countdown timers quantise to frames (not changed).** The rifle sets a countdown (`weapon+0x138`) to 0.1538 s at each shot, subtracts dt every frame and
    fires on the first frame where it is <= 0 (`+0x11C` holds the time of the last shot). The designed rate is 6.5/s; the original's 5 frames of 33.4 ms make it
    0.1668 s (6.0/s). Port: 60 Hz 10 frames = 0.1667; 120 / 144 Hz frames are 1-2 vblanks, 0.164-0.167; 240 Hz frames are 1-3 vblanks (4-12 ms) and the interval averages
-   0.156 s (6.4/s, +7 %). Weapon switch and crouch are a countdown plus a few one-frame state changes, which cost 33 ms apiece at 30 fps: the switch flag is 0.05-0.11 s
-   *shorter* in the port (1.14-1.17 vs 1.20-1.24 s; 1.58-1.60 vs 1.64-1.67 s), the button-to-first-reaction 0.05-0.08 s shorter. Left as is: matching the original
+   0.156 s (6.4/s, +7 %). Weapon switch and crouch are a countdown plus a few one-frame state changes, which cost 33 ms apiece at 30 fps: the switch flag is 0.04-0.09 s
+   *shorter* in the port at 60-144 Hz (1.14-1.17 vs 1.20-1.24 s; 1.58-1.60 vs 1.64-1.67 s; at 240 Hz one run was 0.04-0.10 s longer, its frames are irregular),
+   the button-to-first-reaction 0.05-0.08 s shorter. Left as is: matching the original
    would mean re-quantising every countdown to 30 fps.
 4. **Equal:** walk/strafe/sprint speeds and their acceleration, reload (animation driven), crouch transition 0.767 s, the frame-time clamp (0.1333 s of game time
    at every rate), the EE cycle clock scale (no effect on game time, see above).
@@ -1198,7 +1199,8 @@ change nothing (rifle slots 1 and 2 are empty, the 7/29-round object stays inact
   Throughput is the same with limit 1 and 2 (1758 / 1871 kicks in 28 s at 120 Hz; 1807 / 1766 and 1757 / 1753 at 240 Hz under 4-way host load). With an idle GS thread the queue is
   one deep either way; the depth appears when the GS thread is slow or its present blocks, which is the VSync-on case.
 - **Fix:** `KzgsConfig::maxQueuedFrames` default 1: at most one frame waits behind the one the GS thread is on (`KZ_GS_QUEUE=n` overrides for tests). Back-pressure on the EE does
-  exist: with the blocking present the producer was held back 40-50 % of the time, the EE waited in a spin loop and the game still ran at 117.7 of 120 fps.
+  exist: with the blocking present the producer (limit 1) was held back 49 % of the time and the game still ran at 117.7 of 120 fps; the same case with limit 2 and the
+  timeline window set too early showed the EE in a spin wait while loading, so the throttle does reach the EE.
 - The original at 30 fps: list built in a 33 ms frame, kicked at the next vblank (up to 33 ms later), drawn during the next frame and displayed at its end, i.e. 2-3 frames = 70-100 ms before
   the monitor; derived from the frame structure, not measured (PCSX2 has no host present to time). The PCSX2 reference shows the same one-frame quantisation of input: first heading change
   0.033 s after the pad write.
