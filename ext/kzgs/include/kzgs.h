@@ -57,6 +57,10 @@ struct KzgsConfig
 	int anisotropy = 0;                                // 0 (off), 2, 4, 8, 16
 	bool fxaa = false;                                 // post-process FXAA
 	bool smaa = false;                                 // post-process SMAA 1x (Direct3D 11 only; others ignore it)
+	// PCSX2 texture replacement: files in <exe dir>/textures/SCUS-97402/replacements (named by PCSX2's texture hash) replace
+	// the game's textures; dumpTextures writes every texture the game uses to .../dumps (named the same way).
+	bool loadTextureReplacements = false;
+	bool dumpTextures = false;
 	bool edgeAA = false;                               // GS AA1 (PS2 edge antialiasing emulation, "HWAA1")
 	KzgsAspect aspect = KzgsAspect::Ratio4_3;
 	bool vsync = true;

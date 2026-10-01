@@ -249,7 +249,12 @@ namespace
 		o.UpscaleMultiplier = static_cast<float>(std::clamp(cfg.upscale, 1, 8));
 		o.TextureFiltering = static_cast<BiFiltering>(std::clamp(static_cast<int>(cfg.textureFiltering), 0, 3));
 		o.MaxAnisotropy = static_cast<u8>(std::clamp(cfg.anisotropy, 0, 16));
-		o.FXAA = cfg.fxaa || cfg.smaa; // SMAA rides on the FXAA slot of the post chain (kz_smaa11.cpp)
+		o.FXAA = cfg.fxaa || (cfg.smaa && cfg.renderer == KzgsRenderer::D3D11); // SMAA rides on the FXAA slot of the post chain (kz_smaa11.cpp)
+		o.LoadTextureReplacements = cfg.loadTextureReplacements;
+		o.DumpReplaceableTextures = cfg.dumpTextures;
+		o.DumpDirectTextures = cfg.dumpTextures;
+		o.DumpPaletteTextures = cfg.dumpTextures;
+		o.DumpTexturesWithFMVActive = cfg.dumpTextures;
 		o.HWAA1 = cfg.edgeAA;
 		o.AspectRatio = ToAspect(cfg.aspect);
 		o.VsyncEnable = cfg.vsync;
@@ -324,6 +329,8 @@ namespace
 		EmuFolders::Snapshots = Path::Combine(exe_dir, "snaps");
 		EmuFolders::Videos = Path::Combine(exe_dir, "videos");
 		EmuFolders::Textures = Path::Combine(exe_dir, "textures");
+		// PCSX2 creates <Textures>/<serial>/dumps non-recursively, so the folder itself must exist.
+		FileSystem::EnsureDirectoryExists(EmuFolders::Textures.c_str(), false);
 		if (!cfg.disableShaderCache)
 			FileSystem::CreateDirectoryPath(EmuFolders::Cache.c_str(), false);
 	}

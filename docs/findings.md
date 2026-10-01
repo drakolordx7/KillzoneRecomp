@@ -942,3 +942,94 @@ Player report: horizontal mouse inverted and faster than vertical; wanted hold-t
   (`SharpScaling`), optional CAS (`Sharpen`, applied at present time, not visible in headless captures: untested).
   Presented 2560x1440 capture, stddev of the Laplacian over the weapon/HUD region: 8.35 (FXAA + smooth) -> 10.44.
 - Open: with movies on, quitting a mission to the front end shows a white screen (background movie not restarted).
+
+## Post-process passes, draw distance, LOD, SMAA (2026-10-01)
+Player taste: no FXAA, no blur; SMAA / MSAA, normal textures, specular, shadows and render distance welcome. Everything
+below was found from a GS trace of first-mission gameplay (`work/kzfix/failed.trace`, `kzgs_replay --dump-draws F:N
+--dump-skip K --dump-rt` writes PCSX2's per-draw dump with the render target after every draw) plus the reflection data
+(property names, defaults and offsets are registered in the ELF) and Ghidra.
+
+### 1. The game's post-processing (draw sequence of one gameplay frame, frame buffers FBP 0x0 / 0xE00, scratch = Z memory 0x1C00)
+`FUN_001EF640` (post-process render, obj = PostProcess; preset fields copied to obj+0x240..0x280) draws, in order:
+| draws (trace f38) | what | GS signature | game code |
+|---|---|---|---|
+| 27837-27853 (17) | **glow**: the frame's alpha channel (glow mask, read as PSMT8H) -> glow palette CLUT (`Effects/Glow/glow-palette.act`, loaded by `FUN_001BD5A0`) -> 256x224 in Z memory -> 15 blur/downsample taps -> 128x112 -> added back over the frame (A=0,B=2,C=2,D=1,FIX=128) | FRAME 0x1C00 reading TBP 0x0/0x1C00, TW=TH=9 | `FUN_0015DFC0` -> `FUN_0015E028` (taps with `FUN_0015F4D8`) |
+| 27854-27971 (118) | **colour grade**: luma of the frame (CT16 -> CT32 -> P8 CLUT shuffle, 111 draws of 64x32 tiles to re-swizzle) built into an 8-bit index, then one 512x448 draw through the 256-entry palette made from the preset's shadow/midtone/highlight colours (CBP 0x3952), blended with the preset Contrast/Brightness/MixFactor | FRAME 0x1C00..0x29E0 then FRAME 0 reading 0x1C00 as PSMT8H | `FUN_00167050` (luma prep, params at +0x240) and `FUN_00166A28` (palette) |
+| 27972 (1) | **motion blur**: previous frame buffer (FBP 0xE00, the other buffer, `FUN_00150BE8(ctx,1)`) blended over the current one with FIX = strength*127.5 (preset "Motion blur" Strength 0.1 -> FIX 12 here) | A=0,B=1,C=2,D=1 FIX=12, TBP 0xE00 | `FUN_0015F768(f12 = strength)` (obj+0x280); also called with 0.02 by `FUN_001A8D30` |
+| 27973 | **film grain**: noise texture strips (alpha = Noise Strength*255); already switchable by the existing noise filter option (byte 0x55DF6C) | TBP 0x395E, 128x128 | tail of `FUN_001EF640` |
+Other blur: `FUN_001A9308` (called every frame from `FUN_001A8D30`) draws the camera "lens" overlay (rain on lens): eight
+half-resolution ping-pong blur taps (`FUN_0015F198`) plus the overlay texture, only when the camera has a lens texture
+(+0x140). PostProcessPreset resource (reflection class at 0x545462, object size 0x38, type pointer 0x523A20 at +0): Contrast
++0x10, Brightness +0x14, MixFactor +0x18, Shadow +0x1C / Midtone +0x20 / Highlight +0x24 colours, Motion blur Strength
++0x28, Noise Strength +0x2C, Grain size +0x30, Texture +0x34; 19 instances in a gameplay RAM dump (motion blur 0.1-0.5,
+noise 0.025-0.3). There is no depth-of-field pass: none of the draws reads depth, and no DoF property exists in the
+reflection data.
+- **Hooks** (`src/kz_post.cpp`, runtime function replacement, no regen): `0x15DFC0` glow, `0x15F768` frame blend, `0x1A9308`
+  lens blur, each returns at once when its option is off. The colour grade, film grain and heat vision (`0x15E028` called
+  directly with the heat palette) are not touched.
+- Config: `[Graphics] MotionBlur=0|1`, `Glow=0|1`, `LensBlur=0|1` (all default 0 = off); env `KZ_MOTION_BLUR`, `KZ_GLOW`,
+  `KZ_LENS_BLUR`, `KZ_POST_LOG=1` (call counts).
+- **Measured** (first mission, `KZ_FPS=120`, 2560x1440 window, 4x internal, frames per second = vif counter over t=150..200 s, `work/pp/fps.ps1`):
+  original look (all three passes on) 117.3, passes off 117.3. The game is EE/CPU bound there (about 118 fps at 120 Hz), so skipping the
+  17 + 1 GS draws is not visible in the frame rate; it removes 15 blur taps and one full-screen blend per frame from the GS.
+  GS trace of the same moment, two frames, passes on / off (`work/pp/orig.trace`, `nopost.trace`, replayed with
+  `kzgs_replay --dump-draws 18:3000`, `work/pp/sumdraws.py`): glow taps 15 -> 0, frame-blend draw (A0 B1 C2 D1 FIX 12 into FBP 0xE00) 1 -> 0, colour
+  grade tiles 112 -> 112 and final grade draws 2 -> 2 (kept).
+  Pixel effect of each pass in that trace (`rt1` render target after the draw): motion blur changes 91 % of the pixels (mean 0.8/255, max 22) in this almost
+  static scene; the glow add changes 0 pixels here (the glow mask in the alpha channel is empty in the tutorial scene), so its look is not demonstrated;
+  it only matters around emissive surfaces. `work/pp/motionblur_before_after.png` (before | after | difference x10).
+- **Not done / not found:** no depth-of-field and no bloom other than the glow pass exist. The heat-vision filter reuses `0x15E028` and was not touched.
+
+### 2. Draw distance and LOD (first-mission zones: far plane = fog end = 35..70 units)
+- **RenderZone** (reflection class at 0x552C70, vtable 0x531500): "Fade distance", "Render: Far plane" (default 4096) +0x140, fog enabled +0x144,
+  fog start +0x148, fog end +0x14C, start/end density +0x150/+0x154, colour +0x158. RenderZoneManager (vtable 0x531448) instance 0x7C4540 in the
+  gameplay dump: four zones with far = fog end = 65, 70, 50, 35 and fog start -10/-5, so the original view distance is 35-70 world units.
+  `FUN_00339C38(manager, camera, out)` picks the zone around the camera (blending two at a boundary) and fills `out`: out[0] far plane
+  (min of far and fog end when fog is on), byte out+4 fog enabled, out[2] fog start, out[3] fog end, out[4]/[5] densities, out[6] colour; returns 1 when a zone was found.
+- **Render distance option:** hook on `0x339C38` multiplies out[0], out[2], out[3] by the factor (clip and fog move together; scaling only the far plane would
+  hide the extra geometry in fog). Captured at the same frame (f20400 of the scripted run, `work/pp/view_distance_montage.png`): at 2x and 4x the
+  buildings and ruins behind the first hill, which are fully fogged at 1x, are visible; mean absolute difference to 1x 6.6 and 9.1 (of 255).
+  Frame rate: 1x 117.3, 2x 117.2, 4x 115.9 (-1.2 %).
+- **LOD:** the LOD selectors divide the distance by `ctx+0x1AC` (`FUN_003F4E70` static meshes, `FUN_003F4F10` skinned, `FUN_003EFAD8` multi-mesh, the grass and ~35
+  other readers). `FUN_001C2168(f12 = fov, a0 = game object)` sets it to `obj[0x1C] * tan(refFov/2) / tan(fov/2)` (refFov 75 at 0x559540, obj = `*(0x559178)`, obj[0x1C] = 1.0
+  in the dump), the setter `FUN_00151E60` also restores saved values, so the root is hooked instead: the hook on `0x1C2168` multiplies obj[0x1C] around the call.
+  Other per-class distances exist as data: MeshResource "Maximum visible distance" (+0x1C, default -1 = none), Grass "Max View Distance"/"Max Animate Distance"
+  (default 20), LodStaticMeshResource/LodSkinnedMeshResource "LOD Info" tables. LOD scale 4x: frame rate 108.4 (-7.6 %), scene mean difference to 1x 4.5.
+- Config: `[Graphics] RenderDistance=1..16` (default 1 = original), `LodScale=0.25..16` (default 1); env `KZ_RENDER_DISTANCE`, `KZ_LOD_SCALE`. Only the first mission was
+  checked; the defaults stay at the original values because other levels' fog and portal setups were not looked at (indoor zones, boss areas).
+
+### 3. Shadows (identified, not changed)
+Materials carry "Cast Static Shadows / Cast Dynamic Shadows / Receives Dynamic Shadows" (MeshResource +0x?, light classes), shader variants PROJECTIVESHADOW
+and STENCILSHADOW (material type enum, `FUN_00337298`/`FUN_00337538`), baked lightmaps (LIGHTMAPCOLOR/INTENSITY, "Lightmap Density Factor"), and dynamic shadows are
+TextureProjector/Projector objects (reflection classes 0x55304C/0x552F20: texture, matrix, near/far distance, blend mode) limited by LightingManager "Max Lights" and
+"Max Projectors" (`FUN_00331658`). The first-mission trace has no shadow-casting object in view (every draw targets the frame buffer or the post scratch area), so the
+projector texture size and distance could not be measured and nothing was changed. Not feasible to claim more without a trace of a scene with characters.
+
+### 4. SMAA 1x (done, D3D11)
+- PCSX2's HW renderer has no SMAA. `GSRenderer::Merge` runs `GSDevice::FXAA()` at internal resolution (before the final scale), which ends in the virtual
+  `DoFXAA(src, dst)`; GSDevice11 is final and private. `ext/kzgs/src/kz_smaa11.cpp`: when SMAA is on, GSOptions::FXAA is set and the live device gets a
+  copy of its vtable with the DoFXAA slot replaced (slot index decoded from the vcall thunk of `&GSDevice::DoFXAA`, `kz_smaa_vt.cpp`). The replacement runs the unmodified
+  SMAA.hlsl (HIGH preset, luma edges) as three raw D3D11 passes (edges -> blend weights with the Area/Search textures -> neighbourhood blending) and saves/restores the
+  pipeline state around them. If it fails, the frame is copied through (no FXAA). ext/pcsx2 is untouched. Files: MIT SMAA from the KoAR-Modernized project
+  (`ext/kzgs/shaders`, `ext/kzgs/third_party/smaa`, licence text included).
+- Replay evidence (`failed.trace` frame 40, 1x internal, `work/pp/smaa_1x.png`): 3.8 % of the pixels change, all on edges (tree trunks, tank outline, crosshair arc smoothed, textures untouched).
+  Live evidence (rifle at 2560x1440, `work/pp/smaa_live_rifle.png`). Frame rate 117.4 vs 117.3 without.
+- `[Graphics] SMAA=1` (default on), env `KZ_SMAA`, `kzgs_replay --smaa`. D3D12 and Vulkan ignore it (no FXAA either: the flag is only set for D3D11).
+- **MSAA:** confirmed not practical: PCSX2's GSOptions has no MSAA setting, every render target is a plain texture that later draws sample (render-to-texture feedback,
+  the post chain above reads the frame as a texture), and the D3D11 device creates only single-sample targets. The sharp anti-aliasing available is internal resolution (Upscale) plus SMAA.
+
+### 5. Specular maps and new material effects
+- Texture replacement is compiled into kzgs (PCSX2 `GSTextureReplacements`) and is now switchable: `[Graphics] TextureReplacement=1` loads files from `textures/SCUS-97402/replacements`
+  next to the exe (names are PCSX2 texture hashes); `KZ_TEX_DUMP=1` dumps every texture the game draws to `textures/SCUS-97402/dumps`. See the measurement below.
+- New lighting terms (specular, normal maps) are not feasible at the GS level: the game's shading is baked into VU1 vertex colours and lightmaps; the GS only sees finished
+  textured triangles, with no normals or light vectors, so a specular term would need new VU1 programs and new vertex data in every model. Not attempted.
+- **Texture replacement measured:** PCSX2 creates `<exe>/textures/SCUS-97402/dumps` one level at a time, so kzgs now creates `<exe>/textures` itself (before this
+  nothing was ever dumped). With `KZ_TEX_DUMP=1` the game dumped 19 textures by the title menu (`kzgs_replay --dump-textures`: 80 in the 40-frame gameplay trace, names `<tex0 hash>-<clut hash>-<size/bits>.png`).
+  Replacing one dump (the 1024x128 plank atlas `a934f5fca6f05cb9-58a3ccaa8b269230-00001e93.png`, tinted magenta, copy in `work/pp/texrep/`) and replaying
+  with `--replace-textures` changed 1.9 % of the frame (x 0..134, y 225..407 of 512x448: the plank on the left, `work/pp/texture_replacement_test.png`), so replacement
+  works through kzgs; a texture pack (higher resolution or with baked specular detail) is therefore possible. No pack exists; making one is art work.
+  Config `[Graphics] TextureReplacement=1` (default on, harmless when the folder is empty), env `KZ_TEX_REPLACE`, `KZ_TEX_DUMP`; replay `--dump-textures`, `--replace-textures`.
+
+### Defaults chosen
+SMAA on (verified, no cost), motion blur / glow / lens blur off, texture replacement on, render distance 1x and LOD 1x (verified in the first mission only; 2x costs 0.1 fps, 4x
+1.2 %, LOD 4x 7.6 %).

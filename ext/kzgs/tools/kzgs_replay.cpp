@@ -266,6 +266,8 @@ int main(int argc, char** argv)
 		else if (a == "--interlace" && i + 1 < argc) cfg.interlaceMode = std::atoi(argv[++i]);
 		else if (a == "--fxaa") cfg.fxaa = true;
 		else if (a == "--smaa") cfg.smaa = true;
+		else if (a == "--dump-textures") cfg.dumpTextures = true;
+		else if (a == "--replace-textures") cfg.loadTextureReplacements = true;
 		else if (a == "--crop" && i + 1 < argc) std::sscanf(argv[++i], "%d,%d,%d,%d", &cfg.crop[0], &cfg.crop[1], &cfg.crop[2], &cfg.crop[3]);
 		else if (a == "--last" && i + 1 < argc) last = std::atoi(argv[++i]);
 		else if (a == "--pcrtc") pcrtc = true;
