@@ -647,3 +647,16 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
 - **0026-pad-pressure-order.patch** - DualShock 2 pressure bytes 16..19 are L1, R1, L2, R2 (the runtime wrote L1, L2, R1, R2). Killzone reads every
   button through the pressure bytes (FUN_001b33b8: byte pad+0x34+id), so R1 and L2 were swapped for keyboard and gamepad: fire (id 9) came from L2
   and crouch (id 10) from R1. Measured with `KZ_PAD_LOG=1` (scripted R1, L2, R2, L1, triangle -> ids 10, 9, 11, 8, 4 before the fix).
+- **0027-fmv-audio-sdremote-demux-callbacks.patch** - the boot movies' sound (was silent: SPU2 WAV RMS 0 until the intro ended). Three independent causes in the runtime's
+  libsd / libmpeg HLE (docs/findings.md, "FMV audio"):
+  - `Stubs/Audio.cpp`: `sceSdRemote` / `sceSdRemoteInit` are the SDK's EE-side libsd client; the recompiler bound them to stubs that never sent an RPC, so
+    Killzone's movie player (it drives SPU2 itself: ADPCM upload with `sceSdVoiceTrans`, voice setup, NAX polling) never reached the emulated SDRDRV.IRX. With a server
+    behind sid 0x80000701 they now bind it and do blocking `sceSifCallRpc` calls (six arguments after the command in a 0x40-byte buffer from word 1, reply word 0), as the
+    library's own code does. `PS2X_SDR_REMOTE=0` keeps the stubs.
+  - `Stubs/MPEG.cpp`: `sceMpegDemuxPss/Ring` queued the stream callbacks and ignored their result. The game reuses its input buffer at once, so the audio callback often
+    read a packet that had been overwritten, and a full audio ring (callback returns 0) did not stop the demux (the game then threw its whole ring away every ~2 s).
+    Audio/data callbacks now run inside the call, on a private copy of the packet, as an invocation of the calling guest thread (`processPssBuffer` pauses at the packet,
+    the completion resumes); a callback that returns 0 hands the packet and the rest of the input back (consumed < offered, as libmpeg). Video callbacks stay asynchronous.
+    `PS2X_MPEG_SYNC_AUDIO=0` restores the old dispatch; calls made outside guest execution (unit tests) keep it.
+  - `Stubs/MPEG.cpp`: PTS -> vsync tick conversion and picture intervals assumed one tick per NTSC field; with the host's raised guest vblank rate
+    (`ps2SetVblankPeriodMicros`, 120+ Hz) movies were paced that many times too fast. Both are scaled by 16667 us / vblank period (1.0 at the native rate).

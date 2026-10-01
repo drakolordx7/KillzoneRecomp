@@ -1,0 +1,779 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp
+index e1be7d2..1b87f4a 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp
+@@ -1,5 +1,9 @@
+ #include "Common.h"
+ #include "Audio.h"
++#include "../../ps2_iop_transport.h"
++
++#include <chrono>
++#include <thread>
+ 
+ namespace ps2_stubs
+ {
+@@ -54,6 +58,134 @@ namespace ps2_stubs
+             g_audio_stub_state = {};
+         }
+ 
++        // ---- libsd remote (sceSdRemote / sceSdRemoteInit) over the real SIF RPC -----------------------------------
++        // The recompiler binds the SDK's EE-side libsd client (sdr.c) to these stubs. With an emulated SDRDRV.IRX behind
++        // sid 0x80000701 the calls must reach it: a game that drives the SPU2 itself (Killzone's movie player uploads
++        // the FMV ADPCM and starts its voices this way) is otherwise silent. The code below is the client's argument
++        // packing (read from the game's copy of the library): the six arguments after the command go to a 0x40-byte
++        // buffer from word 1 (word 0 is overwritten by the reply), the call is a blocking sceSifCallRpc with the
++        // command as the RPC function number, and the first word of the reply is the return value.
++        constexpr uint32_t kLibSdSid = 0x80000701u;
++        constexpr uint32_t kSdrBufSize = 0x40u;
++
++        struct SdrRemoteState
++        {
++            uint32_t client = 0u;  // t_SifRpcClientData (0x40 bytes)
++            uint32_t buffer = 0u;  // send/reply buffer (0x40 bytes)
++            uint32_t scratch = 0u; // private stack for the SifCallRpc stack-argument reads
++            bool bound = false;
++        };
++        SdrRemoteState g_sdr;
++
++        bool sdrAllocate(PS2Runtime *runtime)
++        {
++            if (g_sdr.client != 0u)
++                return true;
++            const uint32_t base = runtime->guestMalloc(0x200u, 64u);
++            if (base == 0u)
++                return false;
++            g_sdr.client = base;
++            g_sdr.buffer = base + 0x80u;
++            g_sdr.scratch = base + 0x100u;
++            return true;
++        }
++
++        uint32_t sdrRead(uint8_t *rdram, uint32_t addr)
++        {
++            uint32_t v = 0u;
++            if (const uint8_t *p = getConstMemPtr(rdram, addr))
++                std::memcpy(&v, p, sizeof(v));
++            return v;
++        }
++
++        void sdrWrite(uint8_t *rdram, uint32_t addr, uint32_t v)
++        {
++            if (uint8_t *p = getMemPtr(rdram, addr))
++                std::memcpy(p, &v, sizeof(v));
++        }
++
++        void sdrCall(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t cmd,
++                     uint32_t sendBuf, uint32_t sendSize, uint32_t recvBuf, uint32_t recvSize)
++        {
++            R5900Context c = *ctx;
++            SET_GPR_U32(&c, 4, g_sdr.client);
++            SET_GPR_U32(&c, 5, cmd);
++            SET_GPR_U32(&c, 6, 0u); // blocking
++            SET_GPR_U32(&c, 7, sendBuf);
++            SET_GPR_U32(&c, 8, sendSize);
++            SET_GPR_U32(&c, 9, recvBuf);
++            SET_GPR_U32(&c, 10, recvSize);
++            SET_GPR_U32(&c, 11, 0u); // no end function
++            if (uint8_t *sp = getMemPtr(rdram, g_sdr.scratch))
++                std::memset(sp, 0, 0x40u);
++            SET_GPR_U32(&c, 29, g_sdr.scratch);
++            ps2_syscalls::SifCallRpc(rdram, &c, runtime);
++        }
++
++        // Returns true when the call went to the emulated SDRDRV.
++        bool sdrRemote(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++        {
++            if (!g_sdr.bound)
++                return false;
++            uint32_t cmd = getRegU32(ctx, 5);
++            // The six arguments after the command: a2, a3, t0..t3 (the SDK function takes all eight in registers).
++            const uint32_t a[6] = {getRegU32(ctx, 6), getRegU32(ctx, 7), getRegU32(ctx, 8),
++                                   getRegU32(ctx, 9), getRegU32(ctx, 10), getRegU32(ctx, 11)};
++            uint8_t *buf = getMemPtr(rdram, g_sdr.buffer);
++            if (!buf)
++                return false;
++            std::memset(buf, 0, kSdrBufSize);
++            sdrWrite(rdram, g_sdr.buffer, g_sdr.buffer);
++            for (uint32_t i = 0; i < 6u; ++i)
++                sdrWrite(rdram, g_sdr.buffer + 4u + i * 4u, a[i]);
++
++            uint32_t result = 0u;
++            if (cmd == 0x8130u || cmd == 0x81A0u || cmd == 0x81B0u)
++            {
++                cmd |= a[0];
++                sdrCall(rdram, ctx, runtime, cmd, a[1], kSdrBufSize, g_sdr.buffer, 0x40u);
++                result = sdrRead(rdram, g_sdr.buffer);
++            }
++            else if (cmd == 0x8140u)
++            {
++                cmd |= a[0];
++                sdrCall(rdram, ctx, runtime, cmd, g_sdr.buffer, kSdrBufSize, a[1], 0x40u);
++            }
++            else if (cmd == 0x81C0u || cmd == 0x81D0u)
++            {
++                // sceSdProcBatch / sceSdProcBatchEx: batch table a[0] with a[1]+1 entries of 8 bytes, replies to a[2]
++                // (a[3] bytes), the extended form also passes a[4] in the table's second word.
++                if (uint8_t *b = getMemPtr(rdram, a[0] + 2u))
++                {
++                    const uint16_t n = static_cast<uint16_t>(a[1]);
++                    std::memcpy(b, &n, sizeof(n));
++                }
++                if (cmd == 0x81D0u)
++                    sdrWrite(rdram, a[0] + 4u, a[4]);
++                uint32_t rb = a[2], rs = a[3];
++                if (rb == 0u)
++                {
++                    rb = g_sdr.buffer;
++                    rs = 4u;
++                }
++                sdrCall(rdram, ctx, runtime, cmd, a[0], (a[1] + 1u) * 8u, rb, rs);
++                result = a[2] != 0u ? sdrRead(rdram, a[2]) : 0u;
++            }
++            else
++            {
++                uint32_t sendBuf = g_sdr.buffer, sendSize = kSdrBufSize;
++                if (cmd - 0x9000u <= 0xF0u)
++                {
++                    sendBuf = a[0];
++                    sendSize = a[1];
++                }
++                sdrCall(rdram, ctx, runtime, cmd, sendBuf, sendSize, g_sdr.buffer, 0x10u);
++                result = sdrRead(rdram, g_sdr.buffer);
++            }
++            setReturnU32(ctx, result);
++            return true;
++        }
++
+         uint32_t currentBlockStatus(const BlockTransferState &transfer)
+         {
+             const uint32_t position = (transfer.base + transfer.offset) & kAudioPositionMask;
+@@ -76,7 +208,8 @@ namespace ps2_stubs
+ 
+     void sceSdRemote(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        (void)runtime;
++        if (sdrRemote(rdram, ctx, runtime))
++            return;
+ 
+         const uint32_t cmd = getRegU32(ctx, 5);
+         const uint32_t cmdArg0 = getRegU32(ctx, 6);
+@@ -196,8 +329,25 @@ namespace ps2_stubs
+ 
+     void sceSdRemoteInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        (void)rdram;
+-        (void)runtime;
++        // Bind to the emulated SDRDRV when there is one (the library's init loops on sceSifBindRpc until the server
++        // shows up; the IOP thread keeps running meanwhile). Without one the old stub model stays in charge.
++        g_sdr.bound = false;
++        static const bool s_remoteEnabled = [] { const char *v = std::getenv("PS2X_SDR_REMOTE"); return !(v && v[0] == '0'); }();
++        if (s_remoteEnabled && PS2IopTransport::canBindRpc(runtime, kLibSdSid) && sdrAllocate(runtime))
++        {
++            for (int attempt = 0; attempt < 2000 && !g_sdr.bound; ++attempt)
++            {
++                R5900Context c = *ctx;
++                SET_GPR_U32(&c, 4, g_sdr.client);
++                SET_GPR_U32(&c, 5, kLibSdSid);
++                SET_GPR_U32(&c, 6, 0u);
++                ps2_syscalls::SifBindRpc(rdram, &c, runtime);
++                if (sdrRead(rdram, g_sdr.client + 0x24u) != 0u)
++                    g_sdr.bound = true;
++                else
++                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
++            }
++        }
+ 
+         std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
+         resetAudioStubStateUnlocked();
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index 164c951..9a281e7 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -1,6 +1,7 @@
+ #include "Common.h"
+ #include "MPEG.h"
+ #include "runtime/ee_scheduler.h"
++#include "runtime/ps2_host_gs.h"
+ 
+ #if !defined(PS2X_HAS_FFMPEG)
+ #define PS2X_HAS_FFMPEG 1
+@@ -547,6 +548,19 @@ namespace ps2_stubs
+             std::vector<uint8_t> videoSequenceSyncBuffer;
+             std::vector<uint8_t> pssBuffer;
+             std::vector<uint32_t> pssGuestAddrs;
++            // Audio/data stream callbacks run synchronously inside sceMpegDemuxPss/Ring, like libmpeg's, and their result
++            // matters: a callback that returns 0 (its ring is full) stops the demux there, and the call returns the
++            // bytes before that packet (see demuxEntry). processPssBuffer pauses at such a packet with audioPaused set
++            // and the packet still at the front of pssBuffer.
++            bool syncAudio = false;
++            bool audioPaused = false;
++            bool audioAccepted = false; // the paused packet's callback accepted it: process it without calling again
++            size_t pausedPayloadOffset = 0u;
++            size_t pausedPacketEnd = 0u;
++            uint32_t pausedStreamType = 0u;
++            uint64_t pausedPts = 0xFFFFFFFFFFFFFFFFull;
++            uint64_t pausedDts = 0xFFFFFFFFFFFFFFFFull;
++            std::vector<MpegRegisteredCallback> pausedCallbacks;
+             std::deque<MpegDecodedFrame> decodedFrames;
+             std::unique_ptr<MpegFfmpegDecoder> decoder;
+             uint8_t frameRateCode = 0u;
+@@ -747,6 +761,33 @@ namespace ps2_stubs
+             }
+         }
+ 
++        // The movie clock counts NTSC fields (59.94 Hz), the EE scheduler's vsync tick is one guest vblank. The host may
++        // raise the guest vblank rate (high refresh output, ps2SetVblankPeriodMicros; native 16667 us): a field then
++        // spans several ticks, or the movie would play that many times too fast. Q16, 1.0 at the native rate.
++        uint64_t mpegTicksPerFieldQ16()
++        {
++            constexpr uint64_t kNativePeriodMicros = 16667u;
++            const uint32_t period = ps2VblankPeriodMicros();
++            if (period == 0u || period >= kNativePeriodMicros)
++            {
++                return 65536u;
++            }
++            return (65536u * kNativePeriodMicros + period / 2u) / period;
++        }
++
++        // Q32 vsync ticks -> Q32 ticks at the current guest vblank rate (value < 2^47 ticks, scale < 2^20).
++        uint64_t mpegScaleTicksQ32(uint64_t ticksQ32)
++        {
++            const uint64_t scale = mpegTicksPerFieldQ16();
++            if (scale == 65536u)
++            {
++                return ticksQ32;
++            }
++            const uint64_t hi = ticksQ32 >> 32u;
++            const uint64_t lo = ticksQ32 & 0xFFFFFFFFull;
++            return ((hi * scale) << 16u) + ((lo * scale) >> 16u);
++        }
++
+         uint64_t decodedFrameIntervalQ32(const MpegPlaybackState &playback,
+                                          const MpegDecodedFrame &frame)
+         {
+@@ -754,7 +795,7 @@ namespace ps2_stubs
+                                       ? playback.pictureIntervalQ32
+                                       : kDefaultPictureIntervalQ32;
+             const uint64_t fields = static_cast<uint64_t>(2 + std::max(0, frame.repeatPict));
+-            return std::max(kPictureClockOne, (base * fields + 1u) / 2u);
++            return std::max(kPictureClockOne, mpegScaleTicksQ32((base * fields + 1u) / 2u));
+         }
+ 
+         constexpr uint64_t kMpegPtsWrap = 1ull << 33u;
+@@ -786,7 +827,7 @@ namespace ps2_stubs
+             const uint64_t remainder = delta90k % kPtsDivisor;
+             const uint64_t wholeQ32 = whole * 2u * kPictureClockOne;
+             const uint64_t remainderQ32 = ((remainder * 2u * kPictureClockOne) + kPtsDivisor / 2u) / kPtsDivisor;
+-            return wholeQ32 + remainderQ32;
++            return mpegScaleTicksQ32(wholeQ32 + remainderQ32);
+         }
+ 
+         uint64_t presentationTickForFrame(MpegPlaybackState &playback, const MpegDecodedFrame &frame, uint64_t currentTickQ32)
+@@ -1466,19 +1507,42 @@ namespace ps2_stubs
+                 {
+                     const MpegPesHeader pes = parsePesHeader(buffer.data(), packetEnd);
+                     const size_t payloadStart = pes.payloadOffset;
+-                    if (payloadStart < packetEnd && payloadStart < playback.pssGuestAddrs.size())
++                    if (payloadStart < packetEnd && payloadStart < playback.pssGuestAddrs.size() && !playback.audioAccepted)
+                     {
+-                        // The callback gets the payload including the 4-byte sub-stream header, as from libmpeg.
+-                        queueStreamCallbackEvent(
+-                            mpegAddr,
+-                            kMpegStrAudio,
+-                            mpegPacketKey(streamId, buffer.data() + payloadStart, packetEnd - payloadStart),
+-                            playback.pssGuestAddrs[payloadStart],
+-                            static_cast<uint32_t>(packetEnd - payloadStart),
+-                            callbackEvents,
+-                            pes.pts90k,
+-                            pes.dts90k);
++                        const uint64_t packetKey =
++                            mpegPacketKey(streamId, buffer.data() + payloadStart, packetEnd - payloadStart);
++                        if (playback.syncAudio)
++                        {
++                            std::vector<MpegRegisteredCallback> matching = matchingStreamCallbacks(mpegAddr, packetKey);
++                            if (!matching.empty())
++                            {
++                                // Pause here: the demux entry point runs the guest callback and, when it accepts the
++                                // packet, resumes with audioAccepted set.
++                                playback.audioPaused = true;
++                                playback.pausedPayloadOffset = payloadStart;
++                                playback.pausedPacketEnd = packetEnd;
++                                playback.pausedStreamType = kMpegStrAudio;
++                                playback.pausedPts = pes.pts90k >= 0 ? static_cast<uint64_t>(pes.pts90k) : 0xFFFFFFFFFFFFFFFFull;
++                                playback.pausedDts = pes.dts90k >= 0 ? static_cast<uint64_t>(pes.dts90k) : 0xFFFFFFFFFFFFFFFFull;
++                                playback.pausedCallbacks = std::move(matching);
++                                return;
++                            }
++                        }
++                        else
++                        {
++                            // The callback gets the payload including the 4-byte sub-stream header, as from libmpeg.
++                            queueStreamCallbackEvent(
++                                mpegAddr,
++                                kMpegStrAudio,
++                                packetKey,
++                                playback.pssGuestAddrs[payloadStart],
++                                static_cast<uint32_t>(packetEnd - payloadStart),
++                                callbackEvents,
++                                pes.pts90k,
++                                pes.dts90k);
++                        }
+                     }
++                    playback.audioAccepted = false;
+                 }
+ 
+                 erasePssPrefix(playback, packetEnd);
+@@ -1548,7 +1612,8 @@ namespace ps2_stubs
+                             const uint8_t *data,
+                             size_t size,
+                             uint32_t guestAddr,
+-                            std::vector<MpegStreamCallbackEvent> &callbackEvents)
++                            std::vector<MpegStreamCallbackEvent> &callbackEvents,
++                            bool process = true)
+         {
+             if (!data || size == 0)
+             {
+@@ -1588,7 +1653,10 @@ namespace ps2_stubs
+             {
+                 playback.pssGuestAddrs.push_back(guestAddr + static_cast<uint32_t>(i));
+             }
+-            processPssBuffer(mpegAddr, playback, callbackEvents);
++            if (process)
++            {
++                processPssBuffer(mpegAddr, playback, callbackEvents);
++            }
+         }
+ 
+         size_t appendGuestBytes(uint32_t mpegAddr,
+@@ -1596,7 +1664,8 @@ namespace ps2_stubs
+                                 const uint8_t *rdram,
+                                 uint32_t addr,
+                                 size_t size,
+-                                std::vector<MpegStreamCallbackEvent> &callbackEvents)
++                                std::vector<MpegStreamCallbackEvent> &callbackEvents,
++                                bool process = true)
+         {
+             size_t copied = 0u;
+             while (copied < size)
+@@ -1621,7 +1690,8 @@ namespace ps2_stubs
+                     src,
+                     chunk,
+                     curAddr,
+-                    callbackEvents);
++                    callbackEvents,
++                    process);
+                 copied += chunk;
+             }
+             return copied;
+@@ -1634,7 +1704,8 @@ namespace ps2_stubs
+                                     uint32_t byteCount,
+                                     uint32_t ringBaseAddr,
+                                     uint32_t ringSize,
+-                                    std::vector<MpegStreamCallbackEvent> &callbackEvents)
++                                    std::vector<MpegStreamCallbackEvent> &callbackEvents,
++                                    bool process = true)
+         {
+             if (byteCount == 0u)
+             {
+@@ -1655,7 +1726,8 @@ namespace ps2_stubs
+                         rdram,
+                         dataAddr,
+                         first,
+-                        callbackEvents);
++                        callbackEvents,
++                        process);
+                     if (copied < first)
+                     {
+                         return copied;
+@@ -1670,13 +1742,14 @@ namespace ps2_stubs
+                             rdram,
+                             ringBaseAddr,
+                             remaining,
+-                            callbackEvents);
++                            callbackEvents,
++                            process);
+                     }
+                     return copied;
+                 }
+             }
+ 
+-            return appendGuestBytes(mpegAddr, playback, rdram, dataAddr, byteCount, callbackEvents);
++            return appendGuestBytes(mpegAddr, playback, rdram, dataAddr, byteCount, callbackEvents, process);
+         }
+ 
+         bool writeMpegCallbackData(uint8_t *rdram, uint32_t addr, const MpegStreamCallbackEvent &event)
+@@ -2222,167 +2295,244 @@ namespace ps2_stubs
+         setReturnU32(ctx, 0u);
+     }
+ 
+-    void sceMpegDemuxPss(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    namespace
+     {
+-        const uint32_t mpegAddr = getRegU32(ctx, 4);
+-        const uint32_t dataAddr = getRegU32(ctx, 5);
+-        const uint32_t byteCount = getRegU32(ctx, 6);
++        // One sceMpegDemuxPss / sceMpegDemuxPssRing call. libmpeg runs the stream callbacks inside the call and a callback
++        // that returns 0 (the game's ring for that stream is full) stops the demux: the call returns the number of bytes
++        // before that packet and the game offers the rest again later. Killzone's FMV audio relies on it: its audio
++        // callback copies the packet into a ring that the SPU2 streaming code drains, and a full ring is refused. Running
++        // the callbacks later and ignoring their result (as this HLE did) overwrote the packet before the callback read
++        // it, dropped packets whenever the ring was full, and fed the SPU2 a stream with holes.
++        // Audio/data packets therefore pause processPssBuffer; the guest callback runs as an invocation of the calling
++        // thread and the demux resumes from its completion. Video callbacks stay asynchronous: the video is decoded
++        // from the demuxed stream here, and the game's video ring is only bookkeeping.
++        struct MpegDemuxJob
++        {
++            uint32_t mpegAddr = 0u;
++            size_t inputBytes = 0u;  // bytes appended to the playback's PSS buffer by this call
++            size_t unconsumed = 0u;  // bytes handed back after a callback refused a packet
++            size_t decodedBefore = 0u;
++            std::vector<MpegStreamCallbackEvent> events; // video callbacks (asynchronous)
++        };
+ 
+-        std::vector<MpegStreamCallbackEvent> callbackEvents;
+-        std::vector<uint32_t> completedMpegIds;
+-        size_t consumed = 0u;
+-        size_t decodedBefore = 0u;
+-        size_t decodedCount = 0u;
+-        uint32_t traceIdx = 0u;
+-        bool eofChanged = false;
+-        bool backpressured = false;
++        void demuxFinish(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, const std::shared_ptr<MpegDemuxJob> &job)
+         {
+-            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+-            MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+-            decodedBefore = playback.decodedFrames.size();
+-            backpressured = mpegDemuxBackpressured(playback);
+-            if (!backpressured)
++            const size_t consumed = job->inputBytes - job->unconsumed;
++            std::vector<uint32_t> completedMpegIds;
++            size_t decodedCount = 0u;
++            bool eofChanged = false;
++            uint32_t traceIdx = 0u;
+             {
+-                consumed = appendGuestBytes(mpegAddr, playback, rdram, dataAddr, byteCount, callbackEvents);
++                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                MpegPlaybackState &playback = getPlaybackState(job->mpegAddr);
++                playback.syncAudio = false;
++                playback.audioPaused = false;
++                playback.audioAccepted = false;
+                 recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
++                decodedCount = playback.decodedFrames.size();
++                traceIdx = g_mpeg_stub_state.demuxPssTraceCount++;
++            }
++
++            const bool currentStreamCompleted =
++                std::find(completedMpegIds.begin(), completedMpegIds.end(), job->mpegAddr) != completedMpegIds.end();
++            if (decodedCount != job->decodedBefore || eofChanged || currentStreamCompleted)
++            {
++                runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, job->mpegAddr, KE_OK);
++            }
++            for (const uint32_t completedMpegId : completedMpegIds)
++            {
++                if (completedMpegId != job->mpegAddr)
++                {
++                    runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, completedMpegId, KE_OK);
++                }
+             }
+-            decodedCount = playback.decodedFrames.size();
+-            traceIdx = g_mpeg_stub_state.demuxPssTraceCount++;
+-        }
+ 
+-        if (backpressured)
+-        {
+             if (traceIdx < 32u)
+             {
+                 PS2_IF_AGRESSIVE_LOGS({
+-                    std::cerr << "[MPEG:DemuxPss:BACKPRESSURE] mpeg=0x" << std::hex << mpegAddr << std::dec << " decoded=" << decodedCount << std::endl;
++                    std::cerr << "[MPEG:DemuxPss] mpeg=0x" << std::hex << job->mpegAddr << std::dec
++                              << " bytes=" << job->inputBytes
++                              << " consumed=" << consumed
++                              << " decoded=" << decodedCount
++                              << " callbacks=" << job->events.size()
++                              << std::endl;
+                 });
+             }
+-            setReturnS32(ctx, 0);
+-            return;
+-        }
+-        const bool currentStreamCompleted = std::find(completedMpegIds.begin(), completedMpegIds.end(), mpegAddr) != completedMpegIds.end();
+-        if (decodedCount != decodedBefore || eofChanged || currentStreamCompleted)
+-        {
+-            runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
++
++            dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, job->events);
++            setReturnS32(ctx, static_cast<int32_t>(consumed));
+         }
+-        for (const uint32_t completedMpegId : completedMpegIds)
++
++        void demuxProcess(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, const std::shared_ptr<MpegDemuxJob> &job)
+         {
+-            if (completedMpegId != mpegAddr)
++            while (true)
+             {
+-                runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, completedMpegId, KE_OK);
+-            }
+-        }
++                std::vector<uint8_t> payload;
++                MpegStreamCallbackEvent event{};
++                MpegRegisteredCallback callback{};
++                {
++                    std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                    MpegPlaybackState &playback = getPlaybackState(job->mpegAddr);
++                    playback.audioPaused = false;
++                    processPssBuffer(job->mpegAddr, playback, job->events);
++                    if (!playback.audioPaused)
++                    {
++                        break;
++                    }
++                    const size_t payloadStart = playback.pausedPayloadOffset;
++                    const size_t packetEnd = std::min(playback.pausedPacketEnd, playback.pssBuffer.size());
++                    if (payloadStart < packetEnd)
++                    {
++                        payload.assign(playback.pssBuffer.begin() + static_cast<std::ptrdiff_t>(payloadStart),
++                                       playback.pssBuffer.begin() + static_cast<std::ptrdiff_t>(packetEnd));
++                    }
++                    event.mpegAddr = job->mpegAddr;
++                    event.streamType = playback.pausedStreamType;
++                    event.len = static_cast<uint32_t>(payload.size());
++                    event.pts = playback.pausedPts;
++                    event.dts = playback.pausedDts;
++                    callback = playback.pausedCallbacks.front();
++                }
++
++                // The callback reads a private copy: the game reuses its input buffer as soon as the call returns.
++                const uint32_t bufAddr = payload.empty() ? 0u : runtime->guestMalloc(static_cast<uint32_t>(payload.size()), 64u);
++                const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
++                uint8_t *bufPtr = bufAddr != 0u ? getMemPtr(rdram, bufAddr) : nullptr;
++                bool canCall = cbDataAddr != 0u && bufPtr != nullptr && callback.func != 0u && runtime->hasFunction(callback.func);
++                if (canCall)
++                {
++                    std::memcpy(bufPtr, payload.data(), payload.size());
++                    event.dataAddr = bufAddr;
++                    canCall = writeMpegCallbackData(rdram, cbDataAddr, event);
++                }
++                if (!canCall)
++                {
++                    if (bufAddr != 0u)
++                        runtime->guestFree(bufAddr);
++                    if (cbDataAddr != 0u)
++                        runtime->guestFree(cbDataAddr);
++                    std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                    MpegPlaybackState &playback = getPlaybackState(job->mpegAddr);
++                    playback.audioPaused = false;
++                    playback.audioAccepted = true; // nothing to call: the packet is consumed
++                    continue;
++                }
+ 
+-        if (traceIdx < 32u)
+-        {
+-            PS2_IF_AGRESSIVE_LOGS({
+-                std::cerr << "[MPEG:DemuxPss] mpeg=0x" << std::hex << mpegAddr
+-                          << " data=0x" << dataAddr << std::dec
+-                          << " bytes=" << byteCount
+-                          << " consumed=" << consumed
+-                          << " decoded=" << decodedCount
+-                          << " callbacks=" << callbackEvents.size()
+-                          << std::endl;
+-            });
++                GuestInvocation invocation{};
++                invocation.kind = GuestInvocationKind::HleCall;
++                invocation.context = *ctx;
++                invocation.context.pc = callback.func;
++                SET_GPR_U32(&invocation.context, 4, job->mpegAddr);
++                SET_GPR_U32(&invocation.context, 5, cbDataAddr);
++                SET_GPR_U32(&invocation.context, 6, callback.data);
++                SET_GPR_U32(&invocation.context, 7, 0u);
++                SET_GPR_U32(&invocation.context, 29, 0u);
++                SET_GPR_U32(&invocation.context, 31, 0u);
++                invocation.onComplete = [job, rdram, runtime, bufAddr, cbDataAddr](const R5900Context &done, R5900Context &parent)
++                {
++                    const bool accepted = getRegU32(&done, 2) != 0u;
++                    runtime->guestFree(bufAddr);
++                    runtime->guestFree(cbDataAddr);
++                    bool refused = false;
++                    {
++                        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                        MpegPlaybackState &playback = getPlaybackState(job->mpegAddr);
++                        playback.audioPaused = false;
++                        const size_t buffered = playback.pssBuffer.size();
++                        // A packet that began in an earlier call cannot be handed back: take it.
++                        if (accepted || buffered > job->inputBytes)
++                        {
++                            playback.audioAccepted = true;
++                        }
++                        else
++                        {
++                            // Hand the packet and everything after it back to the game.
++                            job->unconsumed = buffered;
++                            g_mpeg_stub_state.pssBytesAppended -= std::min<uint64_t>(g_mpeg_stub_state.pssBytesAppended, buffered);
++                            playback.pssBuffer.clear();
++                            playback.pssGuestAddrs.clear();
++                            refused = true;
++                        }
++                    }
++                    if (refused)
++                    {
++                        demuxFinish(rdram, &parent, runtime, job);
++                    }
++                    else
++                    {
++                        demuxProcess(rdram, &parent, runtime, job);
++                    }
++                };
++                runtime->eeScheduler().invokeCurrent(std::move(invocation));
++            }
++            demuxFinish(rdram, ctx, runtime, job);
+         }
+ 
+-        dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
+-        setReturnS32(ctx, static_cast<int32_t>(consumed));
+-    }
+-
+-    void sceMpegDemuxPssRing(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+-    {
+-        static std::atomic<uint32_t> s_demuxRingEntryCount{0u};
+-        const uint32_t entryIdx = s_demuxRingEntryCount.fetch_add(1u, std::memory_order_relaxed);
+-        if (entryIdx < 4u)
++        void demuxEntry(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, bool ring)
+         {
+-            PS2_IF_AGRESSIVE_LOGS({
+-                std::cerr << "[MPEG:DemuxPssRing:ENTER] call #" << entryIdx
+-                          << " pc=0x" << std::hex << ctx->pc
+-                          << " ra=0x" << getRegU32(ctx, 31)
+-                          << std::dec << std::endl;
+-            });
+-        }
++            const uint32_t mpegAddr = getRegU32(ctx, 4);
++            const uint32_t dataAddr = getRegU32(ctx, 5);
++            const uint32_t byteCount = getRegU32(ctx, 6);
++            const uint32_t ringBaseAddr = ring ? getRegU32(ctx, 7) : 0u;
++            const uint32_t ringSize = ring ? readAbiArg4(rdram, ctx) : 0u;
+ 
+-        const uint32_t mpegAddr = getRegU32(ctx, 4);
+-        const uint32_t dataAddr = getRegU32(ctx, 5);
+-        const uint32_t availableBytes = getRegU32(ctx, 6);
+-        const uint32_t ringBaseAddr = getRegU32(ctx, 7);
+-        const uint32_t ringSize = readAbiArg4(rdram, ctx);
++            // The synchronous callbacks need a guest thread to run them on (and PS2X_MPEG_SYNC_AUDIO=0 restores the
++            // asynchronous dispatch); a call made outside the scheduler's guest execution keeps the asynchronous one.
++            static const bool s_syncAudioEnabled = [] { const char *v = std::getenv("PS2X_MPEG_SYNC_AUDIO"); return !(v && v[0] == '0'); }();
++            const bool syncAudio = s_syncAudioEnabled && runtime->eeScheduler().isExecutingGuest();
+ 
+-        std::vector<MpegStreamCallbackEvent> callbackEvents;
+-        std::vector<uint32_t> completedMpegIds;
+-        size_t consumed = 0u;
+-        size_t decodedBefore = 0u;
+-        size_t decodedCount = 0u;
+-        uint32_t traceIdx = 0u;
+-        bool eofChanged = false;
+-        bool backpressured = false;
+-        {
+-            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+-            MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+-            decodedBefore = playback.decodedFrames.size();
+-            backpressured = mpegDemuxBackpressured(playback);
+-            if (!backpressured)
++            auto job = std::make_shared<MpegDemuxJob>();
++            job->mpegAddr = mpegAddr;
++            bool backpressured = false;
++            uint32_t traceIdx = 0u;
+             {
+-                consumed = appendGuestRingBytes(
+-                    mpegAddr,
+-                    playback,
+-                    rdram,
+-                    dataAddr,
+-                    availableBytes,
+-                    ringBaseAddr,
+-                    ringSize,
+-                    callbackEvents);
+-                recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
++                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                MpegPlaybackState &playback = getPlaybackState(mpegAddr);
++                job->decodedBefore = playback.decodedFrames.size();
++                backpressured = mpegDemuxBackpressured(playback);
++                traceIdx = ring ? g_mpeg_stub_state.demuxRingTraceCount++ : g_mpeg_stub_state.demuxPssTraceCount++;
++                if (!backpressured)
++                {
++                    // Synchronous: append without processing (processPssBuffer pauses at audio packets, see
++                    // MpegDemuxJob); the appended bytes are job->inputBytes.
++                    job->inputBytes = ring ? appendGuestRingBytes(mpegAddr, playback, rdram, dataAddr, byteCount,
++                                                                  ringBaseAddr, ringSize, job->events, !syncAudio)
++                                           : appendGuestBytes(mpegAddr, playback, rdram, dataAddr, byteCount, job->events, !syncAudio);
++                    playback.syncAudio = syncAudio;
++                }
+             }
+-            decodedCount = playback.decodedFrames.size();
+-            traceIdx = g_mpeg_stub_state.demuxRingTraceCount++;
+-        }
+ 
+-        if (backpressured)
+-        {
+-            if (traceIdx < 32u)
++            if (backpressured)
+             {
+-                PS2_IF_AGRESSIVE_LOGS({
+-                    std::cerr << "[MPEG:DemuxPssRing:BACKPRESSURE] mpeg=0x" << std::hex << mpegAddr
+-                              << std::dec << " decoded=" << decodedCount
+-                              << " avail=" << availableBytes << std::endl;
+-                });
++                if (traceIdx < 32u)
++                {
++                    PS2_IF_AGRESSIVE_LOGS({
++                        std::cerr << "[MPEG:DemuxPss:BACKPRESSURE] mpeg=0x" << std::hex << mpegAddr << std::dec
++                                  << " avail=" << byteCount << std::endl;
++                    });
++                }
++                setReturnS32(ctx, 0);
++                return;
+             }
+-            setReturnS32(ctx, 0);
+-            return;
+-        }
+-        const bool currentStreamCompleted = std::find(completedMpegIds.begin(), completedMpegIds.end(), mpegAddr) != completedMpegIds.end();
+-        if (decodedCount != decodedBefore || eofChanged || currentStreamCompleted)
+-        {
+-            runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
+-        }
+-        for (const uint32_t completedMpegId : completedMpegIds)
+-        {
+-            if (completedMpegId != mpegAddr)
++            if (syncAudio)
+             {
+-                runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, completedMpegId, KE_OK);
++                demuxProcess(rdram, ctx, runtime, job);
++            }
++            else
++            {
++                demuxFinish(rdram, ctx, runtime, job);
+             }
+         }
++    }
+ 
+-        if (traceIdx < 32u)
+-        {
+-            PS2_IF_AGRESSIVE_LOGS({
+-                std::cerr << "[MPEG:DemuxPssRing] mpeg=0x" << std::hex << mpegAddr
+-                          << " data=0x" << dataAddr
+-                          << " ring=0x" << ringBaseAddr << std::dec
+-                          << " avail=" << availableBytes
+-                          << " consumed=" << consumed
+-                          << " decoded=" << decodedCount
+-                          << " callbacks=" << callbackEvents.size()
+-                          << std::endl;
+-            });
+-        }
++    void sceMpegDemuxPss(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        demuxEntry(rdram, ctx, runtime, false);
++    }
+ 
+-        dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
+-        setReturnS32(ctx, static_cast<int32_t>(consumed));
++    void sceMpegDemuxPssRing(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        demuxEntry(rdram, ctx, runtime, true);
+     }
+ 
+     void sceMpegDispCenterOffX(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
