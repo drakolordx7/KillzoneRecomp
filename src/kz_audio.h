@@ -15,6 +15,8 @@
 class PS2Runtime;
 
 // Call before PS2Runtime::initialize(). Returns true when audio emulation is active.
-bool kzAudioInstall();
+// `outputDevice`: open the host audio device (false for automated runs, which only record with KZ_AUDIO_WAV).
+// KZ_AUDIO_DEVICE=0/1 overrides it.
+bool kzAudioInstall(bool outputDevice);
 void kzAudioBindRuntime(PS2Runtime &runtime);
 bool kzAudioActive();
