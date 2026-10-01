@@ -297,7 +297,7 @@ namespace
                     if (ImGui::Button("Sharp and clean"))
                     {
                         cfg.fxaa = false; cfg.smaa = true; cfg.sharpScaling = true; cfg.bilinear = true; cfg.anisotropy = 16;
-                        cfg.noiseFilter = false; cfg.motionBlur = false; cfg.glow = false; cfg.lensBlur = false;
+                        cfg.noiseFilter = false; cfg.motionBlur = false; cfg.glow = false; cfg.lensBlur = false; cfg.sharpen = 30;
                     }
                     ImGui::SameLine();
                     if (ImGui::Button("Original PS2 look"))
@@ -333,7 +333,7 @@ namespace
                     section("Anti-aliasing");
                     if (beginRows("aa"))
                     {
-                        toggleRow("SMAA", "Smooths jagged edges without blurring textures. Direct3D 11 only.", cfg.smaa);
+                        toggleRow("SMAA", "Smooths jagged edges; costs a little fine texture detail. Direct3D 11 only.", cfg.smaa);
                         toggleRow("FXAA", "Softens the whole picture slightly.", cfg.fxaa, "On (softer)", "Off");
                         ImGui::EndTable();
                     }
@@ -375,7 +375,7 @@ namespace
                         ImGui::SliderFloat("##renderdist", &cfg.renderDistance, 1.0f, 4.0f, "%.1fx");
                         row("Model detail distance", "Keeps detailed models further away. 4x costs about 8 % fps.");
                         ImGui::SliderFloat("##lod", &cfg.lodScale, 1.0f, 4.0f, "%.1fx");
-                        row("Sharpening", "Extra edge contrast. Not verified yet.");
+                        row("Sharpening", "Extra edge contrast on the final picture (30 % by default).");
                         ImGui::SliderInt("##sharpen", &cfg.sharpen, 0, 100, cfg.sharpen == 0 ? "Off" : "%d%%");
                         ImGui::EndTable();
                     }
