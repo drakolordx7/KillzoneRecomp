@@ -35,6 +35,8 @@ namespace
     constexpr uint32_t kGlowPass = 0x0015DFC0u;
     constexpr uint32_t kFrameBlend = 0x0015F768u;
     constexpr uint32_t kLensBlur = 0x001A9308u;
+    constexpr uint32_t kPostRender = 0x001EF640u;      // post-process render (a0 = PostProcess object)
+    constexpr uint32_t kNoiseStrengthOffset = 0x284u;  // film grain alpha; the pass is skipped below 2/255
     constexpr uint32_t kZoneParams = 0x00339C38u;
     constexpr uint32_t kLodScale = 0x001C2168u;
     constexpr uint32_t kRamMask = 0x01FFFFFFu;
@@ -42,11 +44,13 @@ namespace
     bool g_motionBlur = false;
     bool g_glow = false;
     bool g_lensBlur = false;
+    bool g_grain = false;
     bool g_log = false;
 
     PS2Runtime::RecompiledFunction g_origGlow = nullptr;
     PS2Runtime::RecompiledFunction g_origFrameBlend = nullptr;
     PS2Runtime::RecompiledFunction g_origLensBlur = nullptr;
+    PS2Runtime::RecompiledFunction g_origPostRender = nullptr;
     PS2Runtime::RecompiledFunction g_origZoneParams = nullptr;
     PS2Runtime::RecompiledFunction g_origLodScale = nullptr;
     float g_renderDistance = 1.0f;
@@ -158,6 +162,19 @@ namespace
             wrF(rdram, obj, saved);
     }
 
+    // Film grain off: the grain strips at the end of the post-process render are drawn only when the object's noise
+    // strength (+0x284, from the active preset) is above 2/255, so it is zeroed on entry.
+    void postRender(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
+    {
+        if (ctx->pc == kPostRender && !g_grain)
+        {
+            const uint32_t obj = getRegU32(ctx, 4);
+            if (obj >= 0x00100000u && obj < 0x02000000u)
+                wrF(rdram, obj + kNoiseStrengthOffset, 0.0f);
+        }
+        g_origPostRender(rdram, ctx, rt);
+    }
+
     bool hook(PS2Runtime &rt, uint32_t addr, PS2Runtime::RecompiledFunction fn, PS2Runtime::RecompiledFunction &orig)
     {
         orig = rt.hasFunction(addr) ? rt.lookupFunction(addr) : nullptr;
@@ -177,6 +194,9 @@ void kzPostInstall(PS2Runtime &runtime)
     const KzConfig &cfg = kzConfig();
     g_motionBlur = envFlag("KZ_MOTION_BLUR", cfg.motionBlur);
     g_glow = envFlag("KZ_GLOW", cfg.glow);
+    g_grain = envFlag("KZ_GRAIN", cfg.noiseFilter);
+    if (!hook(runtime, kPostRender, &postRender, g_origPostRender))
+        std::printf("[kz] film grain switch: hook FAILED\n");
     g_lensBlur = envFlag("KZ_LENS_BLUR", cfg.lensBlur);
     g_log = std::getenv("KZ_POST_LOG") != nullptr;
     g_renderDistance = cfg.renderDistance;

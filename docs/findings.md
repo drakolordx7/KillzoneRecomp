@@ -1065,3 +1065,10 @@ switched back on). Gameplay is unchanged (noise filter still off).
 - Not changed: during the level the pause menu is still drawn with the cleared byte, so its panels and highlight bars are missing (flat grey) while the noise filter is off. Only a
   noise-filter-specific patch (not the shared material alpha) or a pause detector would fix that.
 - The IPU/HLE code (`src/kz_ipu.cpp`, `ext/PS2Recomp` libmpeg HLE) needed no change.
+
+## Film grain switch moved to the post-process object (2026-10-01)
+The grain strips at the end of `FUN_001EF640` are drawn only when the PostProcess object's noise strength (`obj+0x284`,
+from the active preset) is above 2/255. With `NoiseFilter=0` a hook on `0x1EF640` zeroes it on entry (`src/kz_post.cpp`,
+env `KZ_GRAIN`). The pnach byte `0x55DF6C` (default 2D material alpha) is no longer written, so the pause menu keeps its
+panels, highlight bar and dimmed background, and the front end is unaffected. Checked with movies on: grain off vs on
+(crop `work/grain_cmp.png`), pause menu with panels, Quit -> menu with its movie (`work/grain_quit_grid.png`).
