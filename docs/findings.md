@@ -1085,3 +1085,131 @@ box average of the motion (about 4 ms at 120 fps). It can only become immediate 
 removed. Other findings from the same hands-on report: the player's ini had MotionBlur=1 and NoiseFilter=1 (the old
 launcher labels were unclear), which smears view changes; the device path was verified (WASAPI, 48 kHz, callback
 consuming 48000 frames/s at volume 0) and the SPU2 output is silent only during the boot movies.
+
+## Speed parity with the original, input latency (2026-10-01)
+
+Player report at the monitor's refresh rate: "everything feels delayed, molasses: animations, movements, shooting, swapping" and
+"mouse input still feels like smoothing or buffering". Question: is the port's game logic slower or laggier than the original, or is
+the original just heavy? Answer, measured against the original game in PCSX2: **every dt-based system runs at the original's speed**
+(walk, strafe, sprint, reload, crouch; game time = wall time within 0.15 % at 30, 60, 120, 144 and 240 Hz), two pieces of view code
+that count *frames* were not frame-rate independent and are fixed, fire rate / switch / crouch timers quantise to frames (the port is
+equal or faster, never slower), and the port's input-to-present latency is 15-22 ms at 120 Hz (the original's 30 fps pipeline is about
+70-100 ms by construction). Nothing measured makes the port slower than the original; the heaviness is the game's (reload 3.3 s, weapon
+switch 1.2-1.7 s, crouch 0.77 s, a stick that needs a second to reach full turn speed).
+
+### Method
+- **Reference run.** `tools/scripts/parity_pcsx2.py` runs a copy of PCSX2 (`tools/pcsx2_par`, git-ignored, PINE slot 28111) on a
+  private invisible Windows desktop (`pcsx2_hidden.py`: CreateDesktop + CreateProcess with lpDesktop, so it cannot take the focus or
+  show a window), renderer Null, `[SPU2/Output] Backend=Null, OutputMuted=true` written into its ini before every launch (the early
+  launches of the session ran without it and played audio; fixed after the coordinator's report). Savestate 9
+  (`tools/pcsx2/sstates/... .09.p2s`, first mission, standing in the trench) is loaded over PINE; input goes through
+  `pcsx2_pad_hook2.pnach`: the scePadRead call at 0x416D98 jumps to a cave at 0xFF000 that, when the word at 0xFFF00 is non-zero, copies
+  the 18 bytes at 0xFFF10 over pad reply bytes 2..19 (buttons active-low, sticks, pressure bytes), so any button/stick combination can
+  be written over PINE. Game memory is sampled over PINE in batched reads at about 1 kHz. The player dies about 14 s after a load (enemy
+  fire), so each scenario is one load and at most 13 s.
+- **Port.** `KZ_PARITY_LOG=<file>` (`src/kz_parity.cpp`, called from `kzTimingOnVsync`) writes one CSV row per guest vblank: wall time,
+  vsync counter, frame timer (`*(0x559178)` +0x68 now, +0x64 elapsed, +0x50 seconds per tick), the player entity and its character
+  controller (`player+0x31C`: position +0x50, heading +0x78), and any words named in `KZ_PARITY_WORDS` (`p:` player, `c:` controller,
+  `w:` the rifle, `g:` game object, `a:` absolute, `>` follows a pointer). The player and the rifle are found by a RAM sweep of 128 K words
+  per vblank (0.15 ms, never long enough to disturb the vblank; the heap layout differs from PCSX2's, so addresses cannot be copied).
+  `KZ_PARITY_START` delays logging, `KZ_PARITY_DUMP=t1,t2` dumps RAM. `parity_pcsx2.py --words` takes the same names and writes the same CSV;
+  the pad script (`KZ_INPUT_SCRIPT` syntax, byte 0 / 255 for a full stick) is the same for both.
+- **Game time.** `parity_analyze.py`: a frame boundary is a change of the frame timer's `now` tick, the simulation step is the tick
+  difference times seconds per tick (capped at the game's 0.1333 s clamp). The timer's `elapsed` field cannot be used: the limiter
+  stores `now` before `elapsed`, so a sampler reads a stale value for 15 % of the frames. All times below are game seconds.
+  Game seconds per wall second at 30/60/120/144/240 Hz, four 10 s windows each: 1.0000 / 1.0000 / 1.0009 / 1.0001 / 0.9999 (worst window
+  1.0014); vsync counter / (R * wall) 1.0000 everywhere. (The 10 s headless screenshot stalls the pipeline 130-175 ms and costs ~0.04 s of game
+  time through the clamp: `KZ_SHOT_INTERVAL` is 400 in these runs.)
+- Scenarios (port script offset 162/176 s after boot, PCSX2 from the load; the trench walls end each move after 1.5-2.5 s, the geometry is
+  the same in both): walk back 2.5 s, strafe left 2 s, strafe right 2 s, turn right / left 1 s at full stick, turn right 2 s at half stick;
+  a 0.55 s turn, then forward + L3 (sprint); fire 2 s, reload, weapon switch (5 presses), crouch hold. The player cannot walk forward from
+  the spawn (a berm), so walking is measured backwards and sprint after a turn.
+
+### Results (`tools/scripts/parity_compare.py AC`; the port columns are with the fixes below)
+| quantity (units / rad / game s) | PCSX2 | port@30 | @60 | @120 | @144 | @240 |
+|---|---|---|---|---|---|---|
+| walk back speed | 3.581 | 3.581 | 3.581 | 3.582 | 3.581 | 3.581 |
+| strafe left / right speed | 4.860 / 4.747 | 4.860 / 4.747 | 4.860 / 4.747 | 4.860 / 4.747 | 4.860 / 4.747 | 4.860 / 4.750 |
+| sprint peak speed (0.1 s bins) | 7.2 | 7.2 | 7.2 | 7.2 | 7.2 | 7.2 |
+| stick turn right, full: rad/s at 0.3 / 0.6 / 0.9 s | 4.13 / 5.24 / 7.02 | 4.13 / 5.24 / 7.02 | 4.15 / 5.34 / 7.11 | 4.12 / 5.16 / 6.92 | 4.11 / 5.09 / 6.85 | 4.12 / 5.15 / 6.92 |
+| stick turn left, full | 4.23 / 5.37 / 7.19 | 4.23 / 5.37 / 7.19 | 4.21 / 5.27 / 7.09 | 4.22 / 5.32 / 7.14 | 4.21 / 5.28 / 7.11 | 4.21 / 5.23 / 7.05 |
+| stick turn, half stick, rad/s (0.3 ... 1.5 s) / angle in 1.9 s | 0.499 flat / 0.949 | same | same | same | same | same |
+| fire interval (s) / shots per second | 0.167 / 6.00 | 0.167 / 6.00 | 0.167 / 6.00 | 0.164 / 6.11 | 0.167 / 6.00 | 0.156 / 6.40 |
+| reload: magazine out -> in | 1.835 | 1.833 | 1.833 | 1.850 | 1.833 | 1.833 |
+| reload: weapon state "reloading" | 3.303 | 3.300 | 3.300 | 3.300 | 3.285 | 3.292 |
+| crouch: request -> stance changed | 0.767 | 0.733 | 0.767 | 0.758 | 0.750 | 0.763 |
+| weapon switch flag, slot 1->2 / 2->1 | 1.235, 1.201 / 1.668, 1.635 | 1.200 / 1.667 | 1.150 / 1.600 | 1.150 / - | 1.146 / 1.583 | 1.275 / 1.763 |
+| button -> first reaction: switch / reload (+-0.05) | 0.267 / 0.534 | 0.200 / 0.433 | 0.217 / 0.467 | 0.208 / 0.458 | 0.208 / 0.451 | 0.225 / 0.479 |
+
+The port at 30 Hz (`KZ_FPS=30`) reproduces PCSX2 bit for bit (turn 4.131 / 5.242 / 7.021 vs 4.131 / 5.241 / 7.019, half stick 0.949 in both), so
+the whole chain (timer patches, pad path, controller code) is the original's and every difference at higher rates is a frame-rate effect inside
+the game code. Walk, strafe and sprint speeds are identical to three digits. Grenade throw could not be measured: in this state L1 and R2
+change nothing (rifle slots 1 and 2 are empty, the 7/29-round object stays inactive); reported as unverified.
+
+### Discrepancies
+1. **Stick turn acceleration counts frames (fixed in `src/kz_timefix.cpp`).** A held stick turns at 2T = 4.19 rad/s at first (every turn
+   value acts twice, in its frame and the next: the original does that too, 4.13 rad/s in PCSX2) and speeds up to about 7.4 rad/s over a second.
+   `FUN_0023e8c8` adds |turn| * turnSpeed * pi/180 per frame to a counter (`ctrl+0xBC`, reset when the stick is released) and starts a 1 -> 2x
+   smoothstep ramp once it passes 15 degrees. Per frame, not per second: full stick starts the ramp after 8 frames (0.27 s at 30 fps), half stick
+   after about 60 frames (2.0 s at 30 fps: never inside a 2 s hold). At 120 Hz (game frames of 8-17 ms) it started after 0.1 s / 0.5 s. Before the fix
+   (`KZ_TIMEFIX=0`, port / PCSX2): full-stick turn rate at 0.6 s 1.08-1.14, angle after 0.9 s 1.05-1.09; half stick at 1.5 s 1.40-1.67 (it is flat in the
+   original), angle after 1.9 s 1.20-1.30. The step is now scaled by dt * 30: full stick is within 0.970-1.019 of PCSX2 at 60-240 Hz and half stick is
+   exactly 0.499 flat (ratio 1.000), identical at 30 Hz.
+2. **Camera lag is an Euler step (fixed, gamepad play).** `FUN_0021C550` (ApplyLook) keeps the view trailing the aim (`player+0x2A8` yaw / `+0x2AC` pitch,
+   enabled by byte `+0x16C`; kz_aim clears it for keyboard/mouse) as lag = (lag - step) * 10 * (0.1 - dt), exact for one dt only. At 0.5 rad/s the original
+   trails 0.0316 s and settles with tau 0.0822 s; the port (KZ_AIM=off to keep the lag) trailed 0.0381-0.0391 s (+21..24 %) and settled with tau
+   0.0888-0.0915 s (+8..11 %) at 60/120/144 Hz. The stored lag is now multiplied after the call by exp(-dt / 0.075) / (10 * (0.1 - dt)): trail 0.0311 / 0.0311 /
+   0.0320 s (-2..+1 %), tau 0.075 s (-9 %). (A first-order filter cannot match both the trail and the settling of the original's discrete step: 0.075 balances them.)
+3. **Countdown timers quantise to frames (not changed).** The rifle sets a countdown (`weapon+0x138`) to 0.1538 s at each shot, subtracts dt every frame and
+   fires on the first frame where it is <= 0 (`+0x11C` holds the time of the last shot). The designed rate is 6.5/s; the original's 5 frames of 33.4 ms make it
+   0.1668 s (6.0/s). Port: 60 Hz 10 frames = 0.1667; 120 / 144 Hz frames are 1-2 vblanks, 0.164-0.167; 240 Hz frames are 1-3 vblanks (4-12 ms) and the interval averages
+   0.156 s (6.4/s, +7 %). Weapon switch and crouch are a countdown plus a few one-frame state changes, which cost 33 ms apiece at 30 fps: the switch flag is 0.05-0.11 s
+   *shorter* in the port (1.14-1.17 vs 1.20-1.24 s; 1.58-1.60 vs 1.64-1.67 s), the button-to-first-reaction 0.05-0.08 s shorter. Left as is: matching the original
+   would mean re-quantising every countdown to 30 fps.
+4. **Equal:** walk/strafe/sprint speeds and their acceleration, reload (animation driven), crouch transition 0.767 s, the frame-time clamp (0.1333 s of game time
+   at every rate), the EE cycle clock scale (no effect on game time, see above).
+5. Not changed: the idle-sway low-pass (`sway * 0.97 + noise * 0.03` per frame in ApplyLook) is per frame too, but it filters a 0.33 rad/s noise and only
+   shifts the phase of the idle sway; the pitch auto-centre and the stick slew limit (4 units/s) are time based.
+
+### Input latency
+- **Mouse path.** `SDL_PollEvent` runs on the main thread about every millisecond (`SDL_Delay(1)` loop in `kz_main.cpp`); `KZ_PUMP_PROBE=1` pushes an event
+  every 2 ms and measures its wait: median 0.11-0.51 ms, p90 0.6-0.8 ms, p99 1.2-1.6 ms, max 1.9-3.8 ms (hidden window, game running). `kzInputOnEvent` adds
+  each motion to an accumulator at once; the aim patch takes it once per game frame at the controller update, so a mouse count waits at most one game frame
+  (one or two vblanks, 8-17 ms at 120 Hz) and is never carried over a frame. `kz_aim.cpp` then spreads each yaw command over two frames because every
+  turn value acts twice (as in the original); pitch is added at once. Not touched (owner is on it).
+- **Where frames queue.** The game kicks a frame list only in a vblank handler and only when the previous kick finished, so at most one list is in flight in
+  front of the VIF1 worker, as on the PS2. Behind it, `kzgsVsync` counts frames pushed and not yet finished by the GS thread and blocks the producer (the VIF1 worker,
+  and through it the EE: its D1 transfer does not complete) once more than `maxQueuedFrames` are in flight. That limit was 2 (PCSX2's MTGS default too), i.e. two finished
+  frames could wait behind the one being drawn.
+- **Measured** (`KZ_TIMELINE` + `tools/scripts/tl_latency.py`; input = the frame limiter's exit before the frame's D1 kick, present = end of the GS-thread frame of the first vsync
+  pushed after the list was done; host ms; other builds ran on the host at the same time, so absolute numbers vary by a few ms):
+
+  | case | queue limit | input -> present, median / p90 | frames queued after each push (1 = none waiting) |
+  |---|---|---|---|
+  | 120 Hz, VSync off (default), idle host | 2 | 22.1 / 31.4 (2.7 vblanks) | 1: 1798, 2: 18, 3: 6 |
+  | same | 1 | 20.1 / 31.1 | 1: 1900, 2: 22 |
+  | 240 Hz, same, two paired runs | 2 / 1 | 15.3, 15.5 / 16.2, 15.0 (3.7-3.9 vblanks of 4.17 ms) | mostly 1, up to 3 / 2 |
+  | 120 Hz, blocking present emulated (`KZGS_FAKE_FIFO_HZ=120`) | 2 | **31.7 / 49.3** (3.8 vblanks) | 1: 1718, 2: 769, 3: 448 |
+  | same | 1 | **18.8 / 42.5** (2.3) | 1: 2849, 2: 108 |
+  | 120 Hz, GPU-bound (3840x2160 window, 8x upscale) | 2 | 38.6 / 66.7 | 1: 739, 2: 679, 3: 717 |
+  | same | 1 | 30.6 / 51.9 | 1: 1135, 2: 1008 |
+
+  Breakdown at 120 Hz VSync off: limiter exit -> kick 5-10 ms (the list is built in ~5 ms, then waits for the next vblank), kick -> worker done 4.4-6.4 ms, done -> present 1.6-9 ms.
+  Throughput is the same with limit 1 and 2 (1758 / 1871 kicks in 28 s at 120 Hz; 1807 / 1766 and 1757 / 1753 at 240 Hz under 4-way host load). With an idle GS thread the queue is
+  one deep either way; the depth appears when the GS thread is slow or its present blocks, which is the VSync-on case.
+- **Fix:** `KzgsConfig::maxQueuedFrames` default 1: at most one frame waits behind the one the GS thread is on (`KZ_GS_QUEUE=n` overrides for tests). Back-pressure on the EE does
+  exist: with the blocking present the producer was held back 40-50 % of the time, the EE waited in a spin loop and the game still ran at 117.7 of 120 fps.
+- The original at 30 fps: list built in a 33 ms frame, kicked at the next vblank (up to 33 ms later), drawn during the next frame and displayed at its end, i.e. 2-3 frames = 70-100 ms before
+  the monitor; derived from the frame structure, not measured (PCSX2 has no host present to time). The PCSX2 reference shows the same one-frame quantisation of input: first heading change
+  0.033 s after the pad write.
+
+### Not verified
+Real display latency with VSync on (a hidden window's Present does not block; emulated only with `KZGS_FAKE_FIFO_HZ`, DXGI's own queue behind it is not measured), grenade throw and
+the secondary weapon (not available in the savestate), other weapons, the first-person animations beyond the state timers listed, enemy/AI timing, the hold-to-aim zoom time,
+the mouse path end to end with a physical mouse.
+
+### Files, switches
+`src/kz_parity.*` (`KZ_PARITY_LOG/START/WORDS/DUMP`), `src/kz_timefix.*` (`KZ_TIMEFIX=0` off, `KZ_TIMEFIX_LAG=0` keeps the camera lag, `KZ_TIMEFIX_LOG`), `tools/scripts/parity_pcsx2.py`,
+`pcsx2_hidden.py`, `pcsx2_pad_hook2.pnach`, `parity_analyze.py`, `parity_compare.py <AC|ACB>`, `parity_events.py`, `tl_latency.py`; `KZGS_STATS=1`, `KZGS_FAKE_FIFO_HZ`, `KZ_GS_QUEUE`,
+`KZ_VSYNC`, `KZ_PUMP_PROBE=1`. Raw logs (work/, git-ignored): `AC_*.csv` (fixes) and `ACB_*.csv` (`KZ_TIMEFIX=0`) movement and turns, `B_*.csv` weapons and sprint, `S_*.csv` switches,
+`LAG*_*.csv` camera lag, `parity/ref_*.csv` PCSX2, `lat*.csv` timelines.
