@@ -108,10 +108,15 @@ KzConfig kzLoadConfig(const std::filesystem::path &path)
     if (auto v = get("Graphics.Anisotropy")) c.anisotropy = std::clamp(std::atoi(v->c_str()), 0, 16);
     if (auto v = get("Graphics.FXAA")) c.fxaa = parseBool(*v, c.fxaa);
     if (auto v = get("Graphics.Bilinear")) c.bilinear = parseBool(*v, c.bilinear);
+    if (auto v = get("Graphics.SharpScaling")) c.sharpScaling = parseBool(*v, c.sharpScaling);
+    if (auto v = get("Graphics.Sharpen")) c.sharpen = std::clamp(std::atoi(v->c_str()), 0, 100);
+    // Files written before the sharp defaults (no SharpScaling key) had FXAA on by default: switch it off once.
+    if (!get("Graphics.SharpScaling")) c.fxaa = false;
     if (auto v = get("Graphics.NoiseFilter")) c.noiseFilter = parseBool(*v, c.noiseFilter);
     if (auto v = get("Input.MouseSensitivity")) c.mouseSensitivity = std::clamp(static_cast<float>(std::atof(v->c_str())), 0.05f, 20.0f);
     if (auto v = get("Input.InvertY")) c.invertY = parseBool(*v, c.invertY);
     if (auto v = get("Input.RawMouse")) c.rawMouse = parseBool(*v, c.rawMouse);
+    if (auto v = get("Input.AimMode")) c.holdAim = _stricmp(v->c_str(), "Toggle") != 0;
     if (auto v = get("Input.StickDeadzone")) c.stickDeadzone = std::clamp(static_cast<float>(std::atof(v->c_str())), 0.0f, 0.9f);
     if (auto v = get("Audio.MasterVolume")) c.masterVolume = std::clamp(std::atoi(v->c_str()), 0, 100);
     if (auto v = get("Paths.ISO")) c.isoPath = *v;
@@ -127,9 +132,11 @@ bool kzSaveConfig(const std::filesystem::path &path, const KzConfig &c)
       << "\nVSync=" << (c.vsync ? 1 : 0) << "\nFpsLimit=" << c.fpsLimit << "\n\n"
       << "[Graphics]\nRenderer=" << toName(kRenderers, c.renderer) << "\nUpscale=" << c.upscale
       << "\nAspect=" << toName(kAspects, c.aspect) << "\nAnisotropy=" << c.anisotropy << "\nFXAA=" << (c.fxaa ? 1 : 0)
-      << "\nBilinear=" << (c.bilinear ? 1 : 0) << "\nNoiseFilter=" << (c.noiseFilter ? 1 : 0) << "\n\n"
+      << "\nBilinear=" << (c.bilinear ? 1 : 0) << "\nSharpScaling=" << (c.sharpScaling ? 1 : 0) << "\nSharpen=" << c.sharpen
+      << "\nNoiseFilter=" << (c.noiseFilter ? 1 : 0) << "\n\n"
       << "[Input]\nMouseSensitivity=" << c.mouseSensitivity << "\nInvertY=" << (c.invertY ? 1 : 0)
-      << "\nRawMouse=" << (c.rawMouse ? 1 : 0) << "\nStickDeadzone=" << c.stickDeadzone << "\n\n"
+      << "\nRawMouse=" << (c.rawMouse ? 1 : 0) << "\nAimMode=" << (c.holdAim ? "Hold" : "Toggle")
+      << "\nStickDeadzone=" << c.stickDeadzone << "\n\n"
       << "[Audio]\nMasterVolume=" << c.masterVolume << "\n\n"
       << "[Paths]\nISO=" << c.isoPath << "\n\n"
       << "[Launcher]\nShow=" << (c.showLauncher ? 1 : 0) << "\n\n";
@@ -137,7 +144,7 @@ bool kzSaveConfig(const std::filesystem::path &path, const KzConfig &c)
     o << "[Bindings]\n; Key=Target. Targets: pad buttons (Cross Circle Square Triangle L1 R1 L2 R2 L3 R3 Start Select\n"
       << "; Up Down Left Right) or MoveForward MoveBack StrafeLeft StrafeRight LookUp LookDown LookLeft LookRight.\n"
       << "; Mouse1 left, Mouse2 right, Mouse3 middle, Mouse4/Mouse5 side, WheelUp/WheelDown; keys by SDL key name.\n";
-    o << "Version=2\n";
+    o << "Version=3\n";
     for (const auto &[key, target] : kzInputBindingPairs(path))
         o << key << "=" << target << "\n";
     std::ofstream out(path, std::ios::trunc);

@@ -60,6 +60,8 @@ struct KzgsConfig
 	KzgsAspect aspect = KzgsAspect::Ratio4_3;
 	bool vsync = true;
 	bool bilinearPresent = true;                       // smooth scaling of the final image to the window
+	bool sharpPresent = false;                         // with bilinearPresent: PCSX2 "Bilinear (Sharp)" (crisp pixel edges)
+	int casSharpness = 0;                              // Contrast Adaptive Sharpening, 0 = off, 1..100
 	// Presentation crop in native (1x) output pixels: left, top, right, bottom. Applies to the displayed image and to
 	// kzgsReadback only, not to GS rendering. Hides the edge pixels PCSX2 shows that a CRT's overscan would hide.
 	int crop[4] = {0, 0, 0, 0};

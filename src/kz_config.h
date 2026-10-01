@@ -41,14 +41,17 @@ struct KzConfig
     int upscale = 0; // internal resolution multiplier over 640x448; 0 = auto (match window height)
     KzAspect aspect = KzAspect::Widescreen16x9;
     int anisotropy = 16;     // 0/2/4/8/16
-    bool fxaa = true;
+    bool fxaa = false;       // post-process blur AA; off by default (supersampling via Upscale is the sharp AA)
     bool bilinear = true;    // texture filtering
+    bool sharpScaling = true; // final image -> window: sharp bilinear (crisp pixel edges) instead of smooth
+    int sharpen = 0;         // Contrast Adaptive Sharpening, 0 = off, 1..100
     bool noiseFilter = false; // PS2 film-grain overlay (off by default on PC)
 
     // Input
     float mouseSensitivity = 1.0f;
     bool invertY = false;
     bool rawMouse = true;
+    bool holdAim = true;     // hold the zoom key to aim (the game's own zoom is a toggle)
     float stickDeadzone = 0.15f;
 
     // Audio

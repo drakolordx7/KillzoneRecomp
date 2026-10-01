@@ -37,7 +37,8 @@ First start
 
 Controls (defaults; shown in the launcher's Controls tab, change them in killzone.ini, section [Bindings])
 - Mouse: aim (applied directly to the view, no stick acceleration)
-- Left mouse: fire              - Right mouse: zoom / scope      - Middle mouse: secondary fire
+- Left mouse: fire              - Right mouse: hold to aim       - Middle mouse: secondary fire
+  (zoomed: 1 / 3 change the zoom level; "Hold to aim" can be switched to toggle in the launcher)
 - W A S D: move                 - Left Shift: sprint             - C / Left Ctrl: crouch
 - R: reload                     - G: throw grenade               - Q / mouse wheel: switch weapon
 - E / F: use (ladders, emplaced guns, pick up)                  - X / Mouse4: special item

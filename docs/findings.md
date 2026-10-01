@@ -913,3 +913,32 @@ Other automation switches: `KZ_UPSCALE=n`, `KZ_RENDERER=d3d11|d3d12|vulkan`, `KZ
 - Checked and unrelated: PCRTC anti-blur is active (both circuits read the same lines, `fbRect (0,0,512,448)` and
   `(0,0,512,447)`), turning deinterlacing off gives a bit-identical bad frame, FXAA is not the cause (wrong frames also without it), and the
   present-skip logic in `kz_gs.cpp` is not involved (the replay calls `kzgsVsync` for every recorded vsync and still shows it).
+
+## Mouse yaw, second pass: the real turn path, hold to aim, sharper defaults (2026-09-30)
+Player report: horizontal mouse inverted and faster than vertical; wanted hold-to-aim; dislikes FXAA/blur.
+- **The earlier yaw model was wrong.** The body turn is in the player update `FUN_0021a8c8`:
+  `heading += turn * T * dt`, turn = control state +0x18 (`ctrl+0x3C`; stick right is *negative*, and it ramps to about
+  2x while the stick is held), `T = ctl[0x190] / ctl[0x44C]` (the controller's vtable +0x188 at 0x45E4F0; 2.0944 rad/s
+  unzoomed, `ctl+0x44C` = zoom factor, 2 with the first rifle's scope). Heading angle = `ctl+0x78`, aim mode =
+  `ctl+0x454` (0 normal, 1 zoomed, 2 mounted). The previous patch scaled by the *look* speed (vtable +0x190, 2.793) and
+  one frame's dt, and used the stick-left sign.
+- **Every turn value acts twice** (measured with `KZ_AIM_LOG=2`, heading logged at the controller update and at
+  ApplyLook): once in the player update of frame k and once more in frame k+1 before that frame's player update, from
+  a latched copy. One frame of turn changes the heading by `turn * T * (dt[k] + dt[k+1])`: impulses 67.5 / 3.75 /
+  -11.25 (unzoomed) and 33.75 (zoomed) gave 4.7124 / 0.19635 / -0.98175 / 0.58905 rad, all equal to the formula.
+  (So a held stick turns at 2 * T * turn; whether the PS2 original does the same has not been checked against PCSX2.)
+- **Mouse yaw now:** a debt of heading still owed; each frame it is charged with the second step of the previous
+  command (this frame's dt) and half of the rest is commanded. Totals are exact and independent of frame-time changes;
+  the motion is a two-frame average. Zoomed, yaw and pitch are divided by the zoom factor. Verified: `mx=1800` ->
+  -1.5708 rad (right, like stick right), `mx=-600` -> +0.5236, `my=-300` -> pitch +0.2618; zoomed `mx=600` -> -0.2618,
+  `my=-300` -> +0.1309.
+- **Hold to aim** (`[Input] AimMode=Hold`, default): key/mouse bindings to R3 are not sent to the pad in gameplay; R3
+  is pulsed whenever the key state differs from the game's zoom state (`ctl+0x454 == 1`). Verified with the scripted
+  `zoomkey` event: mode 0 -> 1 while held, back to 0 on release. Gamepad R3 stays a toggle.
+- **D-pad in gameplay** is the scope zoom axis (controller map zoom = 105 = D-pad up/down, read through the axis
+  path, which `KZ_PAD_LOG` did not log). The WASD/arrow D-pad presses added for menus are now menu-only
+  (`MenuUp` ... targets, bindings Version=3).
+- **Sharper defaults:** FXAA off (existing ini files are switched once), final scaling uses PCSX2's sharp bilinear
+  (`SharpScaling`), optional CAS (`Sharpen`, applied at present time, not visible in headless captures: untested).
+  Presented 2560x1440 capture, stddev of the Laplacian over the weapon/HUD region: 8.35 (FXAA + smooth) -> 10.44.
+- Open: with movies on, quitting a mission to the front end shows a white screen (background movie not restarted).

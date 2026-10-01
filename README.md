@@ -18,7 +18,8 @@ play-throughs and hands-on testing are ongoing.
   130-140 fps at 144 Hz. The game's clock runs at real time at 120 Hz (the frame timer is rescaled, not sped up).
 - **Mouse and keyboard:** mouse aim is an engine patch (raw counts go into the game's own look rate: no stick
   acceleration or dead zone), with fully rebindable keys. Controllers work through SDL3 with the original PS2 layout.
-- **Graphics:** internal resolution up to 8x, native 16:9, FXAA, anisotropic filtering; D3D11, D3D12 or Vulkan.
+- **Graphics:** internal resolution up to 8x (supersampling), native 16:9, sharp scaling, anisotropic filtering,
+  optional FXAA; D3D11, D3D12 or Vulkan.
 - **Launcher:** display, graphics, controls and audio settings; checks the disc image is the supported version.
 - **Not included:** Killzone Online (LOADER.ELF and the network modules); its servers are long gone.
 
@@ -27,7 +28,7 @@ play-throughs and hands-on testing are ongoing.
 | | |
 |---|---|
 | Mouse | aim |
-| Left / right / middle mouse | fire / zoom / secondary fire |
+| Left / right / middle mouse | fire / hold to aim / secondary fire |
 | W A S D | move (menus: navigate) |
 | Left Shift / C or Left Ctrl | sprint / crouch |
 | R / G / Q or wheel | reload / grenade / switch weapon |

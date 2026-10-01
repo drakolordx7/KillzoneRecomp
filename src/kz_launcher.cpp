@@ -238,7 +238,9 @@ namespace
                 if (ImGui::Combo("Anisotropic filtering", &anisoIdx, aniso, 5))
                     cfg.anisotropy = anisoValues[anisoIdx];
                 ImGui::Checkbox("Bilinear texture filtering", &cfg.bilinear);
-                ImGui::Checkbox("FXAA anti-aliasing", &cfg.fxaa);
+                ImGui::Checkbox("Sharp display scaling (crisp pixels)", &cfg.sharpScaling);
+                ImGui::SliderInt("Sharpening (CAS)", &cfg.sharpen, 0, 100, cfg.sharpen == 0 ? "Off" : "%d%%");
+                ImGui::Checkbox("FXAA (blurs edges; higher internal resolution is the sharp anti-aliasing)", &cfg.fxaa);
                 ImGui::Checkbox("Film-grain noise filter (original look)", &cfg.noiseFilter);
                 ImGui::EndTabItem();
             }
@@ -247,6 +249,7 @@ namespace
                 ImGui::SliderFloat("Mouse sensitivity", &cfg.mouseSensitivity, 0.1f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
                 ImGui::Checkbox("Invert mouse Y", &cfg.invertY);
                 ImGui::Checkbox("Raw mouse input", &cfg.rawMouse);
+                ImGui::Checkbox("Hold to aim (off: zoom key toggles, as on PS2)", &cfg.holdAim);
                 ImGui::SliderFloat("Controller stick deadzone", &cfg.stickDeadzone, 0.0f, 0.5f, "%.2f");
                 ImGui::Spacing();
                 ImGui::TextDisabled("Mouse aim is applied directly to the player's view (no stick acceleration).\n"
