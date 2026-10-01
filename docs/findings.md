@@ -1215,3 +1215,60 @@ the mouse path end to end with a physical mouse.
 `pcsx2_hidden.py`, `pcsx2_pad_hook2.pnach`, `parity_analyze.py`, `parity_compare.py <AC|ACB>`, `parity_events.py`, `tl_latency.py`; `KZGS_STATS=1`, `KZGS_FAKE_FIFO_HZ`, `KZ_GS_QUEUE`,
 `KZ_VSYNC`, `KZ_PUMP_PROBE=1`. Raw logs (work/, git-ignored): `AC_*.csv` (fixes) and `ACB_*.csv` (`KZ_TIMEFIX=0`) movement and turns, `B_*.csv` weapons and sprint, `S_*.csv` switches,
 `LAG*_*.csv` camera lag, `parity/ref_*.csv` PCSX2, `lat*.csv` timelines.
+
+## FMV audio: the boot movies were silent (2026-10-01, patch 0027)
+**Symptom.** `KZ_AUDIO_WAV`: RMS 0 / peak 0 from t=0 until the intro cinematic ended (~80 s), then normal menu music and gameplay sound.
+
+**Where it was lost (measured).** The movie player is `FUN_002df9d0`/`FUN_002df080` (EE, `DAT_0055b3d8` = player object). Audio is the PSS private stream 0xBD sub-stream
+0xFF 0xA1 (SPU2 ADPCM, stereo, 48 kHz; the first 0x28 bytes are an `SShd`/`SSbd` header, interleave 0x20, five language channels `..A10000-4`). The game registers
+`FUN_002e07a0` as the audio stream callback (copies the payload into a ring at +0x108, size 0x8000, fill +0x114, sets +0x140 and returns 0 when full), and
+`FUN_002e2528` (consumer, once per movie update) deinterleaves 0x400-byte halves with the SPR DMA, `sceSifSetDma`s them to an IOP buffer and uploads them into a 2x0x400
+ring per channel in SPU2 RAM with `sceSdRemote(0x80D0 VoiceTrans)`; it polls NAX (`0x8060`), starts the voices with `0x8050`/`0x8030` and sets volumes with `0x8010`.
+That is libsd's EE client (`FUN_003d6ae8` = `sceSdRemoteInit`, `FUN_003d6ba8` = `sceSdRemote`, sid 0x80000701, client at 0x58CAC0), not the PSOUND_R RPC the rest of
+the game uses.
+1. `FUN_003d6ae8/ba8` are bound to the runtime stubs `sceSdRemoteInit/sceSdRemote` (`generated/FUN_003d6ba8_0x3d6ba8.cpp`), which only keep a model and never send an RPC.
+   RPC tracing (debug, not kept): zero calls to sid 0x80000701, no SPU2 DMA, `voices 0/0`, although the audio callback ran and the ring was full.
+   (SDRDRV.IRX is loaded twice, ids 9 and 13; the second load is the movie system's one-time init.) Fix: real RPC (Audio.cpp). Result: sound, but wrong (below).
+2. With the RPCs working the DMA'd data was corrupt: callbacks were queued and run later (`changed_bytes` ~4000 of 4077 in half of them: the game had reused its input
+   buffer), and their result was ignored (a full ring let the demux go on; the game's blocking feeder then drops its whole ring: fill 0x7D49 -> 0xFF2 every ~1.8 s, i.e. 0.55 s
+   of audio skipped each time). Fix: synchronous callbacks with the result honoured (MPEG.cpp). Verified with dumps (debug, not kept): the accepted PSS payloads
+   deinterleaved per the header equal every uploaded half, 1114 rounds / 41.6 s with 0 skips or duplicates.
+3. At the host's high vblank rate the HLE paced the movie one picture per 2 vsync ticks: 30 frames per 92-121 ticks at 120 Hz instead of 120 (1.3x too fast on a loaded
+   machine, up to 2x on a fast one), so audio arrived faster than the SPU consumes it and fed cause 2's overflow. Fix: tick scale by vblank period (MPEG.cpp). After: 30 frames
+   per 121-129 ticks at 120 Hz (ideal 120.1), no refusals, ring fill 0x1200-0x3B87 of 0x8000.
+Menu background movies have no audio stream (`AddStrCallback` for video only, no 0xBD packets); they are silent by design.
+
+**Playback check.** WAV (voice 0 = left, gain 0x2CCC/0x7FFF) vs the uploaded halves decoded in Python: contiguous with one constant offset. The only anomalies are voice
+underruns when the EE thread stalls: 28 of 1125 upload pairs later than 2 half periods (max gap 176 ms vs 37.3 nominal) on a machine at ~50 % load with other agents'
+builds; each repeats <= 75 ms of the SPU2 ring. The consumer polls once per movie update, so a loaded EE thread shows up as repeats.
+
+**WAV levels, `ipu_test.ps1`-style run (movies on, `KZ_FPS=120`, start/cross script, 5 s windows, RMS dBFS / peak), before = `PS2X_SDR_REMOTE=0`:**
+
+| t (s) | before RMS / peak | after RMS / peak |
+|---|---|---|
+| 0-25 | silent | silent (logos) |
+| 25-30 | silent | -35.6 / 0.088 |
+| 30-35 | silent | -28.6 / 0.214 |
+| 35-40 | silent | -24.4 / 0.318 |
+| 40-45 | silent | -18.5 / 0.622 |
+| 45-50 | silent | -18.1 / 0.633 |
+| 50-55 | silent | -17.5 / 0.764 |
+| 55-60 | silent | -17.4 / 0.657 |
+| 60-65 | silent | -16.2 / 0.674 |
+| 65-70 | silent | -16.4 / 0.657 |
+| 70-75 | silent | -15.9 / 0.687 |
+| 75-80 | silent | -15.8 / 0.702 |
+| 80-85 | -113 / 0.0001 | -28.4 / 0.588 (end of the movie) |
+| 85-90 (menu music) | -19.6 / 0.657 | -19.8 / 0.657 |
+
+Menu music 88-135 s, before vs after: correlation 0.993 / 0.925 / 0.9993 / 0.9993, RMS ratio 1.000 (the same constant offset as in earlier findings). Gameplay 150-240 s: RMS
+within ~1 dB, correlation low as always (scripted gameplay is not deterministic). `KZ_IPU=off` (100 s): per-10 s RMS equal to 0.1 dB before/after (movie path unused).
+`KZ_FPS=60`: intro audio 25-80 s at -37.6...-16.8 dBFS, menu music after. No `TIMED OUT` lines.
+
+**A/V sync.** The movie's first picture and first audio block both have PTS 7386; audio started 0.1-0.2 s before the first picture and led by 0.27 s after 7 s of media on a
+loaded machine (video 0.95-1.0x real time there). Neither clock is slaved to the other (the game drives audio by SPU NAX, the HLE video by vsync ticks).
+
+**Not verified.** The runtime unit test "sceMpegDemuxPssRing dispatches ..." (ps2xTest, not built here: `PS2X_BUILD_TEST` is off): the asynchronous path it uses is unchanged and is
+taken whenever the scheduler is not executing guest code. A second movie with audio (created around 142 s at mission start) was created in every run but never started its audio
+before the level began; it runs the same code. In-level cutscenes were not exercised. `tools/ghidra_scripts/KzRefs.java` lists the functions that reference a data address (used to
+find the player's state accessors).
