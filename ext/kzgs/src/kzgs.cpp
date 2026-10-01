@@ -20,7 +20,9 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <emmintrin.h>
 #include <functional>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -442,6 +444,21 @@ namespace
 	static std::mutex s_burst_mutex;
 	static u64 s_vsync_seq = 0;
 	static int s_cur_field = 0;
+	// KZGS_STATS=1: frame-queue statistics on stderr every 600 frames (queue depth after each push, time the producer was held
+	// back by the frame throttle, push -> GS-thread-done latency of each frame). Costs a clock read per frame when on.
+	static const bool s_stats_on = []() {
+		const char* v = std::getenv("KZGS_STATS");
+		return v && *v && *v != '0';
+	}();
+	static std::atomic<s64> s_stat_push_ns[64];
+	static std::atomic<u64> s_stat_push_count{0};
+	static std::atomic<u64> s_stat_hist[8];
+	static std::atomic<s64> s_stat_throttle_ns{0};
+	static s64 s_stat_lat_sum = 0, s_stat_lat_max = 0, s_stat_frames = 0;
+	static inline s64 StatNowNs()
+	{
+		return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	}
 	// KZGS_PRESENT_LOG=<file>: one line per frame that reached the GS thread: time the GS vsync finished (QPC ns), field, GS vsync duration (us).
 	static std::vector<std::array<long long, 3>> s_present_log;
 	static const char* const s_present_log_path = std::getenv("KZGS_PRESENT_LOG");
@@ -506,7 +523,10 @@ namespace
 			slot = last_slot + 1;
 		last_slot = slot;
 		const auto until = t0 + std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(slot * period));
-		std::this_thread::sleep_until(until);
+		// Windows sleeps in 1-15 ms steps: sleep to 2 ms before the slot, spin the rest.
+		std::this_thread::sleep_until(until - std::chrono::milliseconds(2));
+		while (clock::now() < until)
+			_mm_pause();
 	}
 
 	static void GSThreadLoop()
@@ -560,6 +580,23 @@ namespace
 						s_present_log.push_back({static_cast<long long>(t1.QuadPart * 1000000000ll / fq.QuadPart), static_cast<long long>(hdr.a), static_cast<long long>((t1.QuadPart - t0.QuadPart) * 1000000ll / fq.QuadPart)});
 					}
 					FakeFifoPresent();
+					if (s_stats_on)
+					{
+						const s64 lat = StatNowNs() - s_stat_push_ns[s_vsync_seq % 64].load(std::memory_order_acquire);
+						s_stat_lat_sum += lat;
+						s_stat_lat_max = std::max(s_stat_lat_max, lat);
+						if (++s_stat_frames % 600 == 0)
+						{
+							std::fprintf(stderr, "[kzgs] frames %lld: push->done mean %.2f ms max %.2f ms; queued after push (1=none waiting) %llu %llu %llu %llu %llu+; producer held back %.1f ms\n",
+							             static_cast<long long>(s_stat_frames), s_stat_lat_sum / 600 / 1e6, s_stat_lat_max / 1e6,
+							             static_cast<unsigned long long>(s_stat_hist[1].exchange(0)), static_cast<unsigned long long>(s_stat_hist[2].exchange(0)),
+							             static_cast<unsigned long long>(s_stat_hist[3].exchange(0)), static_cast<unsigned long long>(s_stat_hist[4].exchange(0)),
+							             static_cast<unsigned long long>(s_stat_hist[5].exchange(0) + s_stat_hist[6].exchange(0) + s_stat_hist[7].exchange(0)),
+							             s_stat_throttle_ns.exchange(0) / 1e6);
+							s_stat_lat_sum = 0;
+							s_stat_lat_max = 0;
+						}
+					}
 					++s_vsync_seq;
 					if (s_burst_pw >= 0 && s_burst_left.load(std::memory_order_acquire) > 0)
 						BurstCaptureAfterVsync(static_cast<int>(hdr.a));
@@ -789,16 +826,24 @@ void kzgsVsync(int field, bool regsWritten)
 
 	// Frame pacing: don't let the game run more than N frames ahead of the GPU.
 	s32 queued = s_queued_frames.fetch_add(1, std::memory_order_acq_rel) + 1;
+	if (s_stats_on)
+	{
+		s_stat_push_ns[s_stat_push_count.fetch_add(1) % 64].store(StatNowNs(), std::memory_order_release);
+		s_stat_hist[std::min<s32>(queued, 7)].fetch_add(1);
+	}
 	Push(Cmd::Vsync, static_cast<u32>(field & 1), regsWritten ? 1u : 0u, &p, sizeof(p));
 	Trace(9, static_cast<u32>(queued));
 	const bool throttled = queued > s_max_queued_frames;
 	if (throttled)
 		Trace(5);
+	const s64 throttle_t0 = (s_stats_on && queued > s_max_queued_frames) ? StatNowNs() : 0;
 	while (queued > s_max_queued_frames)
 	{
 		s_queued_frames.wait(queued, std::memory_order_acquire);
 		queued = s_queued_frames.load(std::memory_order_acquire);
 	}
+	if (throttle_t0)
+		s_stat_throttle_ns.fetch_add(StatNowNs() - throttle_t0);
 	if (throttled)
 		Trace(6);
 }

@@ -32,6 +32,9 @@ extern "C" int __llvm_profile_write_file(void);
 #include <windows.h>
 #include <cstdio>
 
+#include <algorithm>
+#include <chrono>
+#include <vector>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -374,13 +377,47 @@ int main(int argc, char *argv[])
         });
 
         bool focused = true;
+        // KZ_PUMP_PROBE=1 (latency measurement): a thread pushes a user event every 2 ms; the pump reports how long
+        // each one waited in the event queue (the time a mouse motion event waits before kzInputOnEvent sees it).
+        static std::atomic<bool> s_probeStop{false};
+        std::thread probeThread;
+        std::vector<double> probeLatencyUs;
+        const bool pumpProbe = window && std::getenv("KZ_PUMP_PROBE") && std::getenv("KZ_PUMP_PROBE")[0] == '1';
+        if (pumpProbe)
+            probeThread = std::thread([]() {
+                while (!s_probeStop.load())
+                {
+                    SDL_Event pe{};
+                    pe.type = SDL_EVENT_USER;
+                    pe.user.timestamp = SDL_GetTicksNS();
+                    SDL_PushEvent(&pe);
+                    std::this_thread::sleep_for(std::chrono::microseconds(2000));
+                }
+            });
+        auto probeReport = [&]() {
+            if (probeLatencyUs.size() < 100)
+                return;
+            std::sort(probeLatencyUs.begin(), probeLatencyUs.end());
+            auto pc = [&](double q) { return probeLatencyUs[static_cast<size_t>(q * (probeLatencyUs.size() - 1))]; };
+            std::fprintf(stderr, "[kz] event pump latency (%zu events): median %.0f us, p90 %.0f us, p99 %.0f us, max %.0f us\n",
+                         probeLatencyUs.size(), pc(0.5), pc(0.9), pc(0.99), probeLatencyUs.back());
+            probeLatencyUs.clear();
+        };
+        auto probeNext = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         while (!runtimeDone.load())
         {
+            if (pumpProbe && std::chrono::steady_clock::now() >= probeNext)
+            {
+                probeReport();
+                probeNext += std::chrono::seconds(10);
+            }
             if (window)
             {
                 SDL_Event e;
                 while (SDL_PollEvent(&e))
                 {
+                    if (pumpProbe && e.type == SDL_EVENT_USER)
+                        probeLatencyUs.push_back(static_cast<double>(SDL_GetTicksNS() - e.user.timestamp) / 1000.0);
                     kzInputOnEvent(e);
                     switch (e.type)
                     {
@@ -412,6 +449,12 @@ int main(int argc, char *argv[])
             }
             kzInputPoll();
             SDL_Delay(1);
+        }
+        if (pumpProbe)
+        {
+            s_probeStop = true;
+            probeThread.join();
+            probeReport();
         }
         runtime.requestStop();
         runtimeThread.join();
