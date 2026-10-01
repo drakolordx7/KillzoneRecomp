@@ -338,6 +338,7 @@ set(KZGS_RUNTIME_DLLS
 	"${DEPS}/bin/shaderc_shared.dll"
 	CACHE INTERNAL "")
 set(KZGS_RESOURCES_DIR "${P2}/bin/resources" CACHE INTERNAL "")
+set(KZGS_SMAA_SHADERS_DIR "${KZGS_ROOT}/shaders" CACHE INTERNAL "")
 
 # kzgs_stage_resources(<target>): after <target> links, copy the GS shaders to <exe dir>/resources/shaders and the
 # runtime DLLs next to the exe. kzgsOpen() looks in <exe dir>/resources unless KzgsConfig::resourcesDir is set.
@@ -345,7 +346,7 @@ function(kzgs_stage_resources target)
 	add_custom_command(TARGET ${target} POST_BUILD
 		COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:${target}>/resources"
 		COMMAND "${CMAKE_COMMAND}" -E copy_directory "${KZGS_RESOURCES_DIR}/shaders" "$<TARGET_FILE_DIR:${target}>/resources/shaders"
-		COMMAND "${CMAKE_COMMAND}" -E copy_directory "${KZGS_ROOT}/shaders" "$<TARGET_FILE_DIR:${target}>/resources/shaders/kzgs"
+		COMMAND "${CMAKE_COMMAND}" -E copy_directory "${KZGS_SMAA_SHADERS_DIR}" "$<TARGET_FILE_DIR:${target}>/resources/shaders/kzgs"
 		COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${KZGS_RUNTIME_DLLS} "$<TARGET_FILE_DIR:${target}>"
 		COMMENT "kzgs: staging GS shaders and runtime DLLs for ${target}"
 		VERBATIM)
