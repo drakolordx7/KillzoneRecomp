@@ -241,7 +241,14 @@ namespace
                 ImGui::Checkbox("Sharp display scaling (crisp pixels)", &cfg.sharpScaling);
                 ImGui::SliderInt("Sharpening (CAS)", &cfg.sharpen, 0, 100, cfg.sharpen == 0 ? "Off" : "%d%%");
                 ImGui::Checkbox("FXAA (blurs edges; higher internal resolution is the sharp anti-aliasing)", &cfg.fxaa);
+                ImGui::Checkbox("SMAA 1x (Direct3D 11; keeps edges sharper than FXAA)", &cfg.smaa);
+                ImGui::Checkbox("Load replacement textures (textures/SCUS-97402/replacements)", &cfg.textureReplacement);
                 ImGui::Checkbox("Film-grain noise filter (original look)", &cfg.noiseFilter);
+                ImGui::Checkbox("Motion blur (original look: previous frame blended over the current)", &cfg.motionBlur);
+                ImGui::Checkbox("Glow blur (original look: soft halo on emissive surfaces)", &cfg.glow);
+                ImGui::Checkbox("Lens blur (original look: rain-on-lens blur overlay)", &cfg.lensBlur);
+                ImGui::SliderFloat("Render distance (fog and far plane)", &cfg.renderDistance, 1.0f, 8.0f, "%.1fx", ImGuiSliderFlags_Logarithmic);
+                ImGui::SliderFloat("Model detail distance (LOD)", &cfg.lodScale, 0.5f, 8.0f, "%.1fx", ImGuiSliderFlags_Logarithmic);
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Controls", nullptr, forcedTab("Controls")))
