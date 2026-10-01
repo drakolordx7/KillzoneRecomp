@@ -16,7 +16,10 @@
 #include "common/RedtapeWindows.h"
 #include "common/StringUtil.h"
 
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <functional>
 #include <cstdlib>
 #include <cstring>
@@ -432,6 +435,63 @@ namespace
 		}
 	}
 
+	// kzgsBurstArm: frames captured on the GS thread right after each vsync merge.
+	static std::atomic<int> s_burst_left{0};
+	static int s_burst_pw = 0, s_burst_ph = 0;
+	static std::vector<KzgsBurstFrame> s_burst_frames;
+	static std::mutex s_burst_mutex;
+	static u64 s_vsync_seq = 0;
+	// KZGS_PRESENT_LOG=<file>: one line per frame that reached the GS thread: time the GS vsync finished (QPC ns), field, GS vsync duration (us).
+	static std::vector<std::array<long long, 3>> s_present_log;
+	static const char* const s_present_log_path = std::getenv("KZGS_PRESENT_LOG");
+
+	static void BurstCaptureAfterVsync(int field)
+	{
+		KzgsBurstFrame f;
+		f.field = field;
+		f.seq = s_vsync_seq;
+		if (g_gs_renderer)
+		{
+			const auto& pc = g_gs_renderer->PCRTCDisplays.PCRTCDisplays;
+			f.gameDeint = ((pc[0].prevFramebufferOffsets.y != pc[0].framebufferOffsets.y) != (pc[1].prevFramebufferOffsets.y != pc[1].framebufferOffsets.y)) ? 1 : 0;
+		}
+		ReadbackRequest req;
+		req.rgba = &f.rgba;
+		req.width = &f.width;
+		req.height = &f.height;
+		req.present_w = s_burst_pw;
+		req.present_h = s_burst_ph;
+		DoReadback(&req);
+		std::lock_guard<std::mutex> lock(s_burst_mutex);
+		if (req.ok)
+			s_burst_frames.push_back(std::move(f));
+		s_burst_left.fetch_sub(1, std::memory_order_release);
+	}
+
+	// KZGS_FAKE_FIFO_HZ=<hz>: measurement aid for hidden/headless windows, where Present(1) does not block. After each
+	// presented frame the GS thread waits for the next free display slot (one frame per 1/hz s, grid fixed at the first
+	// present), the way a blocking FIFO present behaves with one frame queued behind the front buffer.
+	static void FakeFifoPresent()
+	{
+		static const double hz = []() {
+			const char* v = std::getenv("KZGS_FAKE_FIFO_HZ");
+			return v ? std::atof(v) : 0.0;
+		}();
+		if (hz <= 0.0)
+			return;
+		using clock = std::chrono::steady_clock;
+		static const clock::time_point t0 = clock::now();
+		static s64 last_slot = -1;
+		const double period = 1.0 / hz;
+		const double now = std::chrono::duration<double>(clock::now() - t0).count();
+		s64 slot = static_cast<s64>(std::ceil(now / period));
+		if (slot <= last_slot)
+			slot = last_slot + 1;
+		last_slot = slot;
+		const auto until = t0 + std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(slot * period));
+		std::this_thread::sleep_until(until);
+	}
+
 	static void GSThreadLoop()
 	{
 		u64 r = s_read_pos.load(std::memory_order_relaxed);
@@ -472,7 +532,19 @@ namespace
 					Trace(2, static_cast<u32>(s_trace_idle_ns / 1000)); // idle time (us) since the previous frame
 					s_trace_idle_ns = 0;
 					Trace(3);
+					LARGE_INTEGER t0, t1, fq;
+					if (s_present_log_path) QueryPerformanceCounter(&t0);
 					GSvsync(hdr.a, hdr.b != 0);
+					if (s_present_log_path)
+					{
+						QueryPerformanceCounter(&t1);
+						QueryPerformanceFrequency(&fq);
+						s_present_log.push_back({static_cast<long long>(t1.QuadPart * 1000000000ll / fq.QuadPart), static_cast<long long>(hdr.a), static_cast<long long>((t1.QuadPart - t0.QuadPart) * 1000000ll / fq.QuadPart)});
+					}
+					FakeFifoPresent();
+					++s_vsync_seq;
+					if (s_burst_left.load(std::memory_order_acquire) > 0)
+						BurstCaptureAfterVsync(static_cast<int>(hdr.a));
 					Trace(4);
 					s_queued_frames.fetch_sub(1, std::memory_order_acq_rel);
 					s_queued_frames.notify_all();
@@ -652,6 +724,16 @@ void kzgsClose()
 		return;
 	Push(Cmd::Quit);
 	s_gs_thread.join();
+	if (s_present_log_path)
+	{
+		if (FILE* f = std::fopen(s_present_log_path, "w"))
+		{
+			std::fprintf(f, "ns,field,vsync_us\n");
+			for (const auto& l : s_present_log)
+				std::fprintf(f, "%lld,%lld,%lld\n", l[0], l[1], l[2]);
+			std::fclose(f);
+		}
+	}
 	s_open.store(false);
 	s_caller_regs = nullptr;
 }
@@ -775,4 +857,23 @@ void kzgsSetLogCallback(KzgsLogFn fn)
 void kzgsSetTraceHook(KzgsTraceFn fn)
 {
 	s_trace_fn = fn;
+}
+
+void kzgsBurstArm(int count, int presentWidth, int presentHeight)
+{
+	std::lock_guard<std::mutex> lock(s_burst_mutex);
+	s_burst_frames.clear();
+	s_burst_pw = presentWidth;
+	s_burst_ph = presentHeight;
+	s_burst_left.store(std::max(count, 0), std::memory_order_release);
+}
+
+bool kzgsBurstTake(std::vector<KzgsBurstFrame>& out)
+{
+	if (s_burst_left.load(std::memory_order_acquire) > 0)
+		return false;
+	std::lock_guard<std::mutex> lock(s_burst_mutex);
+	out = std::move(s_burst_frames);
+	s_burst_frames.clear();
+	return true;
 }
