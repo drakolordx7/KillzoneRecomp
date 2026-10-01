@@ -39,9 +39,9 @@ class Scen:
         self.r = r
 
 
-def plateau(r, g0, dur, step=0.25):
+def plateau(r, g0, dur, step=0.25, top=1):
     t, v = r.speed_series(g0 - 0.05, g0 + dur, step)
-    return float(np.max(v)), t, v
+    return float(np.mean(np.sort(v)[-top:])), t, v  # mean of the `top` fastest bins
 
 
 def rise(r, g0, dur, vmax, frac=0.9):
@@ -111,7 +111,7 @@ def metrics_turn(r, tp):
 def metrics_sprint(r, tp):
     out = {}
     s = Scen(r, port_t=tp[1]) if tp else Scen(r, ref_label='l3+ly=-1')
-    v, t, series = plateau(r, s.g, 2.5)
+    v, t, series = plateau(r, s.g, 2.5, 0.1, 3)
     out['sprint_speed'] = v
     out['sprint_t90'] = rise(r, s.g, 2.5, v)
     s0 = Scen(r, port_t=tp[0]) if tp else Scen(r, ref_label='rx=1')
