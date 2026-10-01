@@ -43,10 +43,11 @@ struct KzConfig
     int anisotropy = 16;     // 0/2/4/8/16
     bool fxaa = false;       // post-process blur AA; off by default (supersampling via Upscale is the sharp AA)
     bool smaa = true;        // SMAA 1x post-process (Direct3D 11 renderer only; measured: no frame-rate cost)
+    float smaaThreshold = 0.2f; // SMAA edge threshold 0.05..0.5: 0.1 = SMAA HIGH preset (smooths more, softens textures: 73 % of the 8x-supersampled detail at 4x), higher keeps texture detail
     bool textureReplacement = true; // load textures from textures/SCUS-97402/replacements (PCSX2 texture replacement)
     bool bilinear = true;    // texture filtering
     bool sharpScaling = true; // final image -> window: sharp bilinear (crisp pixel edges) instead of smooth
-    int sharpen = 0;         // Contrast Adaptive Sharpening, 0 = off, 1..100
+    int sharpen = 30;        // Contrast Adaptive Sharpening, 0 = off, 1..100 (30: +55 % menu text detail, no visible halos; docs/findings.md "Menu jitter and blur")
     bool noiseFilter = false; // PS2 film-grain overlay (off by default on PC)
     // The game's own soft post passes (docs/findings.md "Post-process passes"); the colour grade is always kept.
     bool motionBlur = false; // blends the previous frame over the current one
