@@ -89,7 +89,7 @@ struct KzgsConfig
 	std::string cacheDir;
 	bool disableShaderCache = false;
 
-	int maxQueuedFrames = 2;                           // kzgsVsync blocks when this many frames are still queued
+	int maxQueuedFrames = 1;                           // kzgsVsync blocks when this many frames are still queued (1: at most one frame waits behind the one the GS thread is on)
 
 	// true: every kzgsGifTransfer() call is a self-contained GIF packet sequence that starts with a GIFtag, as
 	// PS2Recomp's GIF arbiter produces (it re-wraps IMAGE data continued across VIF DIRECT/DMA chunks in a synthesized
