@@ -241,7 +241,9 @@ int main(int argc, char** argv)
 	const std::string trace = argv[1];
 	const std::filesystem::path out = argv[2];
 	int every = 100, from = 0, last = 0, sleep_ms = 0, sleep_from = 0, dump_frame = -1, dump_count = 0; bool dump_rt = false; int dump_skip = 0;
-	bool pcrtc = false, targets = false, use_window = false;
+	bool pcrtc = false, targets = false, use_window = false, backbuffer = false, skip_idle = false, single_circuit = false;
+	uint64_t packets_since_vsync = 0;
+	uint8_t last_regs[0xF0] = {};
 	FILE* thumbs = nullptr;
 	bool nopng = false;
 	int present_w = 0, present_h = 0;
@@ -265,7 +267,10 @@ int main(int argc, char** argv)
 		else if (a == "--antiblur" && i + 1 < argc) cfg.pcrtcAntiBlur = std::atoi(argv[++i]) != 0;
 		else if (a == "--interlace" && i + 1 < argc) cfg.interlaceMode = std::atoi(argv[++i]);
 		else if (a == "--fxaa") cfg.fxaa = true;
+		else if (a == "--skip-idle") skip_idle = true;
+		else if (a == "--single-circuit") single_circuit = true;
 		else if (a == "--window") use_window = true;
+		else if (a == "--backbuffer") backbuffer = true; // with --window: bb_<frame>.png = the swap chain back buffer at Present (exact final pixels, CAS included)
 		else if (a == "--sharp" && i + 1 < argc) cfg.sharpPresent = std::atoi(argv[++i]) != 0;
 		else if (a == "--bilinear" && i + 1 < argc) cfg.bilinearPresent = std::atoi(argv[++i]) != 0;
 		else if (a == "--cas" && i + 1 < argc) cfg.casSharpness = std::atoi(argv[++i]);
@@ -387,11 +392,49 @@ int main(int argc, char** argv)
 			break;
 		if (hdr[0] == 1)
 		{
+			++packets_since_vsync;
 			kzgsGifTransfer(int(hdr[1]), buf.data(), hdr[2] / 16);
 			continue;
 		}
 		std::memcpy(regs, buf.data(), std::min<size_t>(sizeof(regs), buf.size()));
-		kzgsVsync(int(hdr[1]), true);
+		if (single_circuit) // same register rewrite as src/kz_gs.cpp snapshotPrivRegs: read circuit 2 := read circuit 1 when it is Killzone's 1-line-offset flicker filter
+		{
+			uint64_t pmode, dispfb1, display1, dispfb2, display2;
+			std::memcpy(&pmode, regs + 0x00, 8); std::memcpy(&dispfb1, regs + 0x70, 8); std::memcpy(&display1, regs + 0x80, 8);
+			std::memcpy(&dispfb2, regs + 0x90, 8); std::memcpy(&display2, regs + 0xA0, 8);
+			const uint64_t fbLow = 0xFFFFFFFFull, dbxMask = 0x7FFull << 32, dbyMask = 0x7FFull << 43, dhMask = 0x7FFull << 44;
+			const uint64_t dby1 = (dispfb1 & dbyMask) >> 43, dby2 = (dispfb2 & dbyMask) >> 43, dh1 = (display1 & dhMask) >> 44, dh2 = (display2 & dhMask) >> 44;
+			if ((pmode & 3u) == 3u && (dispfb1 & (fbLow | dbxMask)) == (dispfb2 & (fbLow | dbxMask)) && dby2 >= dby1 && dby2 - dby1 <= 1 &&
+			    (display1 & ~dhMask) == (display2 & ~dhMask) && dh1 >= dh2 && dh1 - dh2 <= 1)
+			{
+				std::memcpy(regs + 0x90, &dispfb1, 8);
+				std::memcpy(regs + 0xA0, &display1, 8);
+			}
+		}
+		const bool capture_bb = backbuffer && every > 0 && (frame + 1) % uint64_t(every) == 0 && frame + 1 >= uint64_t(from);
+		if (capture_bb)
+			kzgsBurstArm(1, -1, -1);
+		// --skip-idle: like the game (src/kz_gs.cpp runVsync), do not present a vblank that has no new GIF packets and unchanged display registers
+		bool present_now = true;
+		if (skip_idle)
+		{
+			present_now = packets_since_vsync != 0 || std::memcmp(last_regs, regs, sizeof(last_regs)) != 0 || frame == 0;
+			std::memcpy(last_regs, regs, sizeof(last_regs));
+		}
+		packets_since_vsync = 0;
+		if (present_now)
+			kzgsVsync(int(hdr[1]), true);
+		if (capture_bb)
+		{
+			kzgsSync();
+			std::vector<KzgsBurstFrame> got;
+			if (kzgsBurstTake(got) && !got.empty())
+			{
+				char bn[64];
+				std::snprintf(bn, sizeof(bn), "bb_%04llu.png", (unsigned long long)(frame + 1));
+				WritePNG((out / bn).string(), got[0].rgba, got[0].width, got[0].height);
+			}
+		}
 		frame++;
 		if (sleep_ms > 0 && frame >= uint64_t(sleep_from))
 			Sleep(sleep_ms);

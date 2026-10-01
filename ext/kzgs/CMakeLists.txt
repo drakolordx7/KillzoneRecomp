@@ -301,6 +301,7 @@ add_library(kzgs STATIC
 	"${KZGS_ROOT}/src/kz_smaa11.cpp"
 	"${KZGS_ROOT}/src/kz_smaa_vt.cpp"
 	"${KZGS_ROOT}/src/kz_present11.cpp"
+	"${KZGS_ROOT}/src/kz_inspect.cpp"
 	"${KZGS_ROOT}/include/kzgs.h"
 	$<TARGET_OBJECTS:kzgs_3rdparty>
 	$<TARGET_OBJECTS:kzgs_common>

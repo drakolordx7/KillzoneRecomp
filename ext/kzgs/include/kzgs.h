@@ -155,6 +155,12 @@ void kzgsSetLogCallback(KzgsLogFn fn);
 using KzgsTraceFn = void (*)(int id, uint32_t a);
 void kzgsSetTraceHook(KzgsTraceFn fn);
 
+// SMAA edge-detection luma threshold (0.02 .. 0.5, default 0.1 = the HIGH preset); applied the next time the SMAA shaders are built.
+void kzgsSetSmaaThreshold(float threshold);
+
+// SMAA luma edge threshold (0.02..0.5, default 0.1 = SMAA's HIGH preset). Higher = only strong edges are smoothed and texture detail is kept;
+// the shaders are rebuilt on the next frame when it changes. Direct3D 11 only. See docs/findings.md ("Menu jitter and blur").
+
 // Measurement aid: after the next `count` kzgsVsync() frames that reach the GS thread, the GS thread copies the output
 // (internal resolution, presentWidth/presentHeight 0; or as presented in such a window) into memory right after the
 // frame is merged, without making the caller wait. kzgsBurstTake() returns them once all are captured.
@@ -163,6 +169,9 @@ struct KzgsBurstFrame
 	std::vector<uint8_t> rgba;
 	int width = 0, height = 0;
 	int field = 0;
+	std::string tcInfo; // texture cache render targets when the frame was presented
+	int scanmask = 0;  // GSState::m_scanmask_used after the frame was merged (PCRTC anti-blur is disabled while it is non-zero)
+	int rc[8] = {};    // display circuits after PCSX2's offset logic: framebufferRect (x,y,z,w) of circuit 1 then 2... y and w only: fb1.y fb1.w fb2.y fb2.w disp1.y disp1.w disp2.y disp2.w
 	int gameDeint = 0; // PCSX2 'game_deinterlacing' (selects the MAD/bob path in Merge)
 	uint64_t seq = 0; // count of vsync commands the GS thread has processed
 };
