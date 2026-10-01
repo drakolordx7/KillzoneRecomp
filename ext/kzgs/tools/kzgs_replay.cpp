@@ -240,7 +240,7 @@ int main(int argc, char** argv)
 	}
 	const std::string trace = argv[1];
 	const std::filesystem::path out = argv[2];
-	int every = 100, from = 0, last = 0, sleep_ms = 0, sleep_from = 0, dump_frame = -1, dump_count = 0;
+	int every = 100, from = 0, last = 0, sleep_ms = 0, sleep_from = 0, dump_frame = -1, dump_count = 0; bool dump_rt = false; int dump_skip = 0;
 	bool pcrtc = false, targets = false;
 	FILE* thumbs = nullptr;
 	bool nopng = false;
@@ -265,6 +265,7 @@ int main(int argc, char** argv)
 		else if (a == "--antiblur" && i + 1 < argc) cfg.pcrtcAntiBlur = std::atoi(argv[++i]) != 0;
 		else if (a == "--interlace" && i + 1 < argc) cfg.interlaceMode = std::atoi(argv[++i]);
 		else if (a == "--fxaa") cfg.fxaa = true;
+		else if (a == "--smaa") cfg.smaa = true;
 		else if (a == "--crop" && i + 1 < argc) std::sscanf(argv[++i], "%d,%d,%d,%d", &cfg.crop[0], &cfg.crop[1], &cfg.crop[2], &cfg.crop[3]);
 		else if (a == "--last" && i + 1 < argc) last = std::atoi(argv[++i]);
 		else if (a == "--pcrtc") pcrtc = true;
@@ -273,6 +274,8 @@ int main(int argc, char** argv)
 		else if (a == "--aspect" && i + 1 < argc) { const std::string v = argv[++i]; cfg.aspect = v == "16:9" ? KzgsAspect::Ratio16_9 : v == "stretch" ? KzgsAspect::Stretch : KzgsAspect::Ratio4_3; }
 		else if (a == "--present" && i + 1 < argc) std::sscanf(argv[++i], "%dx%d", &present_w, &present_h);
 		else if (a == "--thumbs" && i + 1 < argc) thumbs = std::fopen(argv[++i], "wb");
+		else if (a == "--dump-rt") dump_rt = true;
+		else if (a == "--dump-skip" && i + 1 < argc) dump_skip = std::atoi(argv[++i]); // skip this many draws after the dump frame starts
 		else if (a == "--dump-draws" && i + 1 < argc) std::sscanf(argv[++i], "%d:%d", &dump_frame, &dump_count);
 		else if (a == "--renderer" && i + 1 < argc)
 		{
@@ -392,7 +395,9 @@ int main(int argc, char** argv)
 				GSConfig.SWDumpDirectory = dir;
 				GSConfig.DumpGSData = true;
 				GSConfig.SaveInfo = true;
-				GSConfig.SaveDrawStart = static_cast<int>(GSState::s_n);
+				GSConfig.SaveRT = dump_rt; // render target after every dumped draw (.bmp)
+				GSConfig.SaveTexture = dump_rt; // input texture of every dumped draw (.dds)
+				GSConfig.SaveDrawStart = static_cast<int>(GSState::s_n) + dump_skip;
 				GSConfig.SaveDrawCount = dump_count;
 				GSConfig.SaveDrawBy = 1;
 				GSConfig.SaveFrameStart = 0;

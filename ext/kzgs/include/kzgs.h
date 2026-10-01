@@ -56,6 +56,7 @@ struct KzgsConfig
 	KzgsTextureFilter textureFiltering = KzgsTextureFilter::PS2;
 	int anisotropy = 0;                                // 0 (off), 2, 4, 8, 16
 	bool fxaa = false;                                 // post-process FXAA
+	bool smaa = false;                                 // post-process SMAA 1x (Direct3D 11 only; others ignore it)
 	bool edgeAA = false;                               // GS AA1 (PS2 edge antialiasing emulation, "HWAA1")
 	KzgsAspect aspect = KzgsAspect::Ratio4_3;
 	bool vsync = true;
