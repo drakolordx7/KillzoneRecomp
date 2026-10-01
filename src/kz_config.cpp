@@ -107,12 +107,19 @@ KzConfig kzLoadConfig(const std::filesystem::path &path)
     if (auto v = get("Graphics.Aspect")) c.aspect = fromName(kAspects, *v, c.aspect);
     if (auto v = get("Graphics.Anisotropy")) c.anisotropy = std::clamp(std::atoi(v->c_str()), 0, 16);
     if (auto v = get("Graphics.FXAA")) c.fxaa = parseBool(*v, c.fxaa);
+    if (auto v = get("Graphics.SMAA")) c.smaa = parseBool(*v, c.smaa);
+    if (auto v = get("Graphics.TextureReplacement")) c.textureReplacement = parseBool(*v, c.textureReplacement);
     if (auto v = get("Graphics.Bilinear")) c.bilinear = parseBool(*v, c.bilinear);
     if (auto v = get("Graphics.SharpScaling")) c.sharpScaling = parseBool(*v, c.sharpScaling);
     if (auto v = get("Graphics.Sharpen")) c.sharpen = std::clamp(std::atoi(v->c_str()), 0, 100);
     // Files written before the sharp defaults (no SharpScaling key) had FXAA on by default: switch it off once.
     if (!get("Graphics.SharpScaling")) c.fxaa = false;
     if (auto v = get("Graphics.NoiseFilter")) c.noiseFilter = parseBool(*v, c.noiseFilter);
+    if (auto v = get("Graphics.MotionBlur")) c.motionBlur = parseBool(*v, c.motionBlur);
+    if (auto v = get("Graphics.Glow")) c.glow = parseBool(*v, c.glow);
+    if (auto v = get("Graphics.LensBlur")) c.lensBlur = parseBool(*v, c.lensBlur);
+    if (auto v = get("Graphics.RenderDistance")) c.renderDistance = std::clamp(static_cast<float>(std::atof(v->c_str())), 1.0f, 16.0f);
+    if (auto v = get("Graphics.LodScale")) c.lodScale = std::clamp(static_cast<float>(std::atof(v->c_str())), 0.25f, 16.0f);
     if (auto v = get("Input.MouseSensitivity")) c.mouseSensitivity = std::clamp(static_cast<float>(std::atof(v->c_str())), 0.05f, 20.0f);
     if (auto v = get("Input.InvertY")) c.invertY = parseBool(*v, c.invertY);
     if (auto v = get("Input.RawMouse")) c.rawMouse = parseBool(*v, c.rawMouse);
@@ -131,9 +138,11 @@ bool kzSaveConfig(const std::filesystem::path &path, const KzConfig &c)
       << "[Display]\nWindowMode=" << toName(kWindowModes, c.windowMode) << "\nWidth=" << c.width << "\nHeight=" << c.height
       << "\nVSync=" << (c.vsync ? 1 : 0) << "\nFpsLimit=" << c.fpsLimit << "\n\n"
       << "[Graphics]\nRenderer=" << toName(kRenderers, c.renderer) << "\nUpscale=" << c.upscale
-      << "\nAspect=" << toName(kAspects, c.aspect) << "\nAnisotropy=" << c.anisotropy << "\nFXAA=" << (c.fxaa ? 1 : 0)
+      << "\nAspect=" << toName(kAspects, c.aspect) << "\nAnisotropy=" << c.anisotropy << "\nFXAA=" << (c.fxaa ? 1 : 0) << "\nSMAA=" << (c.smaa ? 1 : 0) << "\nTextureReplacement=" << (c.textureReplacement ? 1 : 0)
       << "\nBilinear=" << (c.bilinear ? 1 : 0) << "\nSharpScaling=" << (c.sharpScaling ? 1 : 0) << "\nSharpen=" << c.sharpen
-      << "\nNoiseFilter=" << (c.noiseFilter ? 1 : 0) << "\n\n"
+      << "\nNoiseFilter=" << (c.noiseFilter ? 1 : 0) << "\nMotionBlur=" << (c.motionBlur ? 1 : 0)
+      << "\nGlow=" << (c.glow ? 1 : 0) << "\nLensBlur=" << (c.lensBlur ? 1 : 0)
+      << "\nRenderDistance=" << c.renderDistance << "\nLodScale=" << c.lodScale << "\n\n"
       << "[Input]\nMouseSensitivity=" << c.mouseSensitivity << "\nInvertY=" << (c.invertY ? 1 : 0)
       << "\nRawMouse=" << (c.rawMouse ? 1 : 0) << "\nAimMode=" << (c.holdAim ? "Hold" : "Toggle")
       << "\nStickDeadzone=" << c.stickDeadzone << "\n\n"

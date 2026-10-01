@@ -95,10 +95,18 @@ namespace
         k.textureFiltering = c.bilinear ? KzgsTextureFilter::PS2 : KzgsTextureFilter::Nearest;
         k.anisotropy = c.anisotropy;
         k.fxaa = c.fxaa;
+        k.smaa = c.smaa;
+        k.loadTextureReplacements = c.textureReplacement;
         k.sharpPresent = c.sharpScaling;
         k.casSharpness = c.sharpen;
         if (const char *v = std::getenv("KZ_FXAA")) // automation overrides
             k.fxaa = std::atoi(v) != 0;
+        if (const char *v = std::getenv("KZ_SMAA"))
+            k.smaa = std::atoi(v) != 0;
+        if (const char *v = std::getenv("KZ_TEX_DUMP")) // automation: dump every texture to textures/SCUS-97402/dumps
+            k.dumpTextures = std::atoi(v) != 0;
+        if (const char *v = std::getenv("KZ_TEX_REPLACE"))
+            k.loadTextureReplacements = std::atoi(v) != 0;
         if (const char *v = std::getenv("KZ_SHARP_SCALING"))
             k.sharpPresent = std::atoi(v) != 0;
         if (const char *v = std::getenv("KZ_SHARPEN"))
