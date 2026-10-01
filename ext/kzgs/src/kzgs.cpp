@@ -249,7 +249,7 @@ namespace
 		o.UpscaleMultiplier = static_cast<float>(std::clamp(cfg.upscale, 1, 8));
 		o.TextureFiltering = static_cast<BiFiltering>(std::clamp(static_cast<int>(cfg.textureFiltering), 0, 3));
 		o.MaxAnisotropy = static_cast<u8>(std::clamp(cfg.anisotropy, 0, 16));
-		o.FXAA = cfg.fxaa;
+		o.FXAA = cfg.fxaa || cfg.smaa; // SMAA rides on the FXAA slot of the post chain (kz_smaa11.cpp)
 		o.HWAA1 = cfg.edgeAA;
 		o.AspectRatio = ToAspect(cfg.aspect);
 		o.VsyncEnable = cfg.vsync;
@@ -309,6 +309,7 @@ namespace
 		EmuConfig.CurrentAspectRatio = opts.AspectRatio;
 		s_max_queued_frames = std::max(1, cfg.maxQueuedFrames);
 		s_self_contained_packets = cfg.selfContainedGifPackets;
+		kzgs::SmaaSetEnabled(cfg.smaa);
 	}
 
 	static void SetupFolders(const KzgsConfig& cfg)
@@ -497,6 +498,7 @@ namespace
 					const bool vsync_changed = (opts.VsyncEnable != GSConfig.VsyncEnable);
 					ApplyGlobals(*cfg, opts);
 					GSUpdateConfig(opts);
+					kzgs::SmaaInstall();
 					if (vsync_changed)
 						GSSetVSyncMode(opts.VsyncEnable ? GSVSyncMode::FIFO : GSVSyncMode::Disabled, false);
 				}
@@ -579,6 +581,7 @@ namespace
 			return;
 		}
 
+		kzgs::SmaaInstall();
 		result->ok = true;
 		result->sync.Signal();
 		result = nullptr; // owned by the opener, which has returned

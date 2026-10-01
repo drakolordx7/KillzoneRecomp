@@ -298,6 +298,8 @@ target_precompile_headers(kzgs_gs PRIVATE "${P2SRC}/PrecompiledHeader.h")
 # ---------------------------------------------------------------------------------------------------------------------
 add_library(kzgs STATIC
 	"${KZGS_ROOT}/src/kzgs.cpp"
+	"${KZGS_ROOT}/src/kz_smaa11.cpp"
+	"${KZGS_ROOT}/src/kz_smaa_vt.cpp"
 	"${KZGS_ROOT}/include/kzgs.h"
 	$<TARGET_OBJECTS:kzgs_3rdparty>
 	$<TARGET_OBJECTS:kzgs_common>
@@ -306,6 +308,7 @@ add_library(kzgs STATIC
 target_link_libraries(kzgs PRIVATE kzgs_flags)
 target_precompile_headers(kzgs PRIVATE "${P2SRC}/PrecompiledHeader.h")
 target_include_directories(kzgs PUBLIC "${KZGS_ROOT}/include")
+target_include_directories(kzgs PRIVATE "${KZGS_ROOT}/third_party/smaa")
 
 # Import libraries for the bundle DLLs + system libs. The bundle DLLs are delay-loaded so a D3D11-only run does not
 # need dxcompiler.dll, and PNG/WebP/zstd are only touched by screenshots, dumps and texture replacement.
@@ -342,6 +345,7 @@ function(kzgs_stage_resources target)
 	add_custom_command(TARGET ${target} POST_BUILD
 		COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:${target}>/resources"
 		COMMAND "${CMAKE_COMMAND}" -E copy_directory "${KZGS_RESOURCES_DIR}/shaders" "$<TARGET_FILE_DIR:${target}>/resources/shaders"
+		COMMAND "${CMAKE_COMMAND}" -E copy_directory "${KZGS_ROOT}/shaders" "$<TARGET_FILE_DIR:${target}>/resources/shaders/kzgs"
 		COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${KZGS_RUNTIME_DLLS} "$<TARGET_FILE_DIR:${target}>"
 		COMMENT "kzgs: staging GS shaders and runtime DLLs for ${target}"
 		VERBATIM)
