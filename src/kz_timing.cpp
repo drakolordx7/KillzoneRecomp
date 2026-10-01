@@ -1,5 +1,7 @@
 #include "kz_timing.h"
 
+#include "kz_parity.h"
+
 #include "runtime/ps2_host_gs.h"
 
 #include <algorithm>
@@ -82,6 +84,7 @@ void kzTimingOnVsync(uint8_t *rdram)
 {
     if (!rdram)
         return;
+    kzParityOnVsync(rdram);
 
     // Seconds per vsync. The game writes 1/59.94 (NTSC) at init; keep it at 1/R.
     const float period = 1.0f / static_cast<float>(g_rate);

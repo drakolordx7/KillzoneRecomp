@@ -1,0 +1,26 @@
+gametitle=Killzone (SCUS-97402) - KillzoneRecomp parity reference-run input hook v2 (temporary)
+// scePadRead call at 0x416d98 goes through a cave at 0xFF000. When the word at 0xFFF00 is non-zero the 18 bytes at 0xFFF10 replace
+// pad reply bytes 2..19 (buttons, sticks, pressure bytes), so any button/stick combination can be injected over PINE.
+patch=1,EE,00416d98,word,0C03FC00
+patch=1,EE,000FF000,word,27BDFFE0
+patch=1,EE,000FF004,word,FFBF0000
+patch=1,EE,000FF008,word,FFA60008
+patch=1,EE,000FF00C,word,0C0AB422
+patch=1,EE,000FF010,word,00000000
+patch=1,EE,000FF014,word,DFA60008
+patch=1,EE,000FF018,word,DFBF0000
+patch=1,EE,000FF01C,word,3C080010
+patch=1,EE,000FF020,word,8D09FF00
+patch=1,EE,000FF024,word,1120000A
+patch=1,EE,000FF028,word,00000000
+patch=1,EE,000FF02C,word,250AFF10
+patch=1,EE,000FF030,word,24CB0002
+patch=1,EE,000FF034,word,240C0012
+patch=1,EE,000FF038,word,914D0000
+patch=1,EE,000FF03C,word,A16D0000
+patch=1,EE,000FF040,word,254A0001
+patch=1,EE,000FF044,word,258CFFFF
+patch=1,EE,000FF048,word,1580FFFB
+patch=1,EE,000FF04C,word,256B0001
+patch=1,EE,000FF050,word,03E00008
+patch=1,EE,000FF054,word,27BD0020
