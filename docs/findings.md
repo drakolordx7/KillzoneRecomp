@@ -1072,3 +1072,16 @@ from the active preset) is above 2/255. With `NoiseFilter=0` a hook on `0x1EF640
 env `KZ_GRAIN`). The pnach byte `0x55DF6C` (default 2D material alpha) is no longer written, so the pause menu keeps its
 panels, highlight bar and dimmed background, and the front end is unaffected. Checked with movies on: grain off vs on
 (crop `work/grain_cmp.png`), pause menu with panels, Quit -> menu with its movie (`work/grain_quit_grid.png`).
+
+## Mouse yaw: why the two-frame average stays (2026-10-01)
+Tried "command = motion / (T * dt) - previous command" so the frame's rendered heading change equals the frame's mouse
+motion (rendered heading = heading at ApplyLook + this command's first step). The first frame was exact (30 deg in,
+29.99 deg out), but the leftover command cannot be removed cleanly once the mouse stops, because every command acts in
+two frames: cancelling it needs an equal and opposite command for ever (the heading is then wrong between the two
+steps inside every frame, by up to the last flick), halving it gives a one-frame bounce of half the last step, and
+running it down by 20 % per frame left a single 30 deg impulse at 37.1 deg with varying frame times. The committed rule
+(half the debt per frame) reaches the target in two frames with no overshoot and exact totals; its cost is a two-frame
+box average of the motion (about 4 ms at 120 fps). It can only become immediate if the double application itself is
+removed. Other findings from the same hands-on report: the player's ini had MotionBlur=1 and NoiseFilter=1 (the old
+launcher labels were unclear), which smears view changes; the device path was verified (WASAPI, 48 kHz, callback
+consuming 48000 frames/s at volume 0) and the SPU2 output is silent only during the boot movies.
