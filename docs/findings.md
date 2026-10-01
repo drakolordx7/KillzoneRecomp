@@ -941,7 +941,7 @@ Player report: horizontal mouse inverted and faster than vertical; wanted hold-t
 - **Sharper defaults:** FXAA off (existing ini files are switched once), final scaling uses PCSX2's sharp bilinear
   (`SharpScaling`), optional CAS (`Sharpen`, applied at present time, not visible in headless captures: untested).
   Presented 2560x1440 capture, stddev of the Laplacian over the weapon/HUD region: 8.35 (FXAA + smooth) -> 10.44.
-- Open: with movies on, quitting a mission to the front end shows a white screen (background movie not restarted).
+- Fixed (see "Quit to the front end: white screen" below): with movies on, quitting a mission to the front end showed a white screen.
 
 ## Post-process passes, draw distance, LOD, SMAA (2026-10-01)
 Player taste: no FXAA, no blur; SMAA / MSAA, normal textures, specular, shadows and render distance welcome. Everything
@@ -1033,3 +1033,35 @@ projector texture size and distance could not be measured and nothing was change
 ### Defaults chosen
 SMAA on (verified, no cost), motion blur / glow / lens blur off, texture replacement on, render distance 1x and LOD 1x (verified in the first mission only; 2x costs 0.1 fps, 4x
 1.2 %, LOD 4x 7.6 %).
+
+## Quit to the front end: white screen (2026-10-01)
+**Symptom.** Movies on (`KZ_IPU` unset): start a mission, pause, Quit, confirm. The front end comes back without its background movie; in the player's runs the whole
+screen is white, with only OPTIONS / GAME / EXTRAS drawn (in other runs the menu is drawn over the frozen pause screen). `KZ_IPU=off` is fine (black background).
+
+**It is not the movie path.** Measured with `PS2X_MPEG_TRACE`-style logging in the HLE and `KZ_IPU_TRACE` (debug code, not kept):
+- The menu movie is opened again after the level (`FUN_002ded00` call #4, args identical to the boot-time menu movie #2), `sceMpegCreate`/`sceMpegReset` run, `sceMpegGetPicture`
+  delivers frames from the first call (frame counter, `queued`, mean colour of the decoded RGBA 39..66, the same dark green as before the level) and loops. kzipu is idle at the
+  open (`busy=0`, FIFOs empty, no DMA active, `pending=0`), no kzipu DMA write ever touched game memory outside its buffers, and `g_eofPlayer`/`g_eofReads` are not involved.
+- The frame is uploaded to GS memory every frame (GS trace: 32 strips of 16x448 CT32 into DBP 0x1C00, pixel data green-grey, not white). What differs is the draw of the background
+  quad: before the level (and at boot) ALPHA_1 = 0x80000080A8, TEX0.TCC = 1 (opaque), after the level ALPHA_1 = 0x44 (blend with the vertex alpha), TCC = 0 and vertex alpha 0:
+  the quad is invisible, nothing clears the frame, and the additive light bars accumulate to white.
+- All draws of the front end after the level go through `FUN_001527F0` (render state setter) with the engine's default 2D material alpha, `*(u8*)0x55DF6C` (word 13 of the render
+  state copied from `0x55DF38`), at 0 instead of 0xFF. A census of called guest functions in both states showed the same code paths in both; only this value differs.
+- A page-protect watchpoint on the word (host call stack symbolised from the PDB) named the writer: `kzPatchesApply` <- `onVsync`.
+
+**Root cause.** `src/kz_patches.cpp`, the "disable noise filter in gameplay" pnach: it clears the byte at `0x55DF6C` every vsync while the gate halfword `0x57BA88` is 4 (in a level,
+including its pause menu). That byte is not only the film-grain overlay's alpha: the front end draws its background movie quad (and the pause menu panels and highlight bars)
+with the same default material alpha. The game writes it once at start-up (0xFF) and never again, so after the patch cleared it, the menu inherited 0.
+Gate/byte log without the patch: gate 0 in the menus, 5344 for a few ticks while loading, 4 in the level, byte 0xFF all along. With the patch: byte 0x00 from tick 17450 and never restored.
+`KZ_NO_PATCHES=1` shows the menu movie correctly after a Quit (that is how the cause was first confirmed).
+
+**Fix.** `kzPatchesApply` remembers the byte before the first override of a level session and writes it back on the first vsync where the gate is no longer 4 (or when the option is
+switched back on). Gameplay is unchanged (noise filter still off).
+- Evidence (`work/proof_quit_to_menu.png`: before white / before default / after; `work/proof_ram165.bin` and `work/proof_ram215.bin`, EE RAM at the end of two runs): at 165 s (in the
+  level) byte 0x00, gate 4; at 215 s (front end) byte 0xFF, gate 0. After the fix the front end shows the looping background movie with the light bars at every sampled second from
+  184 s on (`work/proof_after`). Boot with movies on: Sony / Guerrilla logos, intro cinematic, KILLZONE title, menu with the movie (`work/proof_boot_grid.png`); mission entered and played
+  as before; `KZ_IPU=off`: black front end with its panels and bars (`work/proof_off3_grid.png`; the quit script needs one extra Cross at 183 s there because the confirmation dialog
+  comes up later than the 179 s press).
+- Not changed: during the level the pause menu is still drawn with the cleared byte, so its panels and highlight bars are missing (flat grey) while the noise filter is off. Only a
+  noise-filter-specific patch (not the shared material alpha) or a pause detector would fix that.
+- The IPU/HLE code (`src/kz_ipu.cpp`, `ext/PS2Recomp` libmpeg HLE) needed no change.

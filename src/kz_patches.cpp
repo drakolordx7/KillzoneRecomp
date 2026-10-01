@@ -40,7 +40,27 @@ void kzPatchesApply(uint8_t *rdram, const KzConfig &cfg)
             w32(rdram, obj + kWidescreenFieldOffset, 1u);
     }
     // pnach "Disable noise filter in gameplay": the byte is cleared while the gate halfword reads 4 (in a level).
-    // Outside that state the game's own value is left alone (forcing 0xFF there turned the menus grey and grainy).
-    if (!cfg.noiseFilter && r16(rdram, kNoiseGate) == 0x0004u)
+    // The byte is the alpha of the engine's default 2D material (word 13 of the render state at 0x55DF38), not only the
+    // grain overlay's: the front end draws its background movie quad and the pause menu panels with it, and the game
+    // writes it once (0xFF at start-up) and never again. Left at 0 after a level, the menu's background movie was
+    // drawn fully transparent and the light bars piled up additively into a white screen. So the value the game had
+    // before the first override is put back as soon as the gate leaves 4 (measured: gate 0 in the menus, 4 in a level
+    // including its pause menu; byte 0xFF all along without this patch).
+    static bool overridden = false;
+    static uint8_t savedNoise = 0xFFu;
+    const bool inLevel = r16(rdram, kNoiseGate) == 0x0004u;
+    if (!cfg.noiseFilter && inLevel)
+    {
+        if (!overridden)
+        {
+            savedNoise = rdram[kNoiseFilter & kRamMask];
+            overridden = true;
+        }
         w8(rdram, kNoiseFilter, 0x00u);
+    }
+    else if (overridden)
+    {
+        w8(rdram, kNoiseFilter, savedNoise);
+        overridden = false;
+    }
 }
