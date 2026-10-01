@@ -20,6 +20,7 @@ extern "C" int __llvm_profile_write_file(void);
 #include "kz_ipu.h"
 #include "kz_aim.h"
 #include "kz_post.h"
+#include "kz_timefix.h"
 #include "runtime/ps2_host_arena.h"
 #include "kz_audio.h"
 
@@ -343,6 +344,7 @@ int main(int argc, char *argv[])
             return 1;
         }
         kzAimInstall(runtime);
+        kzTimeFixInstall(runtime);
         kzPostInstall(runtime);
         // Tests: a separate (e.g. empty) memory card folder. After loadELF, which resets the roots to the ELF folder.
         if (const char *mc = std::getenv("KZ_MC_ROOT"); mc && *mc)
