@@ -395,18 +395,37 @@ float4 ps_blend(VSOut i) : SV_Target
 		return true;
 	}
 
+	// SMAA was asked for but cannot run: pass the frame through unchanged (the original FXAA would blur it, which is what
+	// SMAA users are avoiding).
+	void PassThrough(GSDevice11* dev, GSTexture* sTex, GSTexture* dTex)
+	{
+		ID3D11DeviceContext* c = dev->GetD3DContext();
+		ID3D11Texture2D* src = *static_cast<GSTexture11*>(sTex);
+		ID3D11Texture2D* dst = *static_cast<GSTexture11*>(dTex);
+		if (c && src && dst && sTex->GetState() == GSTexture::State::Dirty && sTex->GetWidth() == dTex->GetWidth() &&
+			sTex->GetHeight() == dTex->GetHeight())
+		{
+			c->CopyResource(dst, src);
+			dTex->SetState(GSTexture::State::Dirty);
+		}
+		else
+			s_origDoFxaa(dev, sTex, dTex);
+	}
+
 	void KzDoFXAA(GSDevice11* dev, GSTexture* sTex, GSTexture* dTex)
 	{
-		if (s_enabled.load() && !s_failed)
+		if (s_enabled.load())
 		{
-			if (RunSmaa(dev, sTex, dTex))
+			if (!s_failed && RunSmaa(dev, sTex, dTex))
 				return;
 			// A pending-clear source is a one-off; a missing shader file or a compile error is not.
-			if (sTex->GetState() == GSTexture::State::Dirty)
+			if (!s_failed && sTex->GetState() == GSTexture::State::Dirty)
 			{
 				s_failed = true;
-				Console.Error("kzgs: SMAA failed, falling back to FXAA");
+				Console.Error("kzgs: SMAA failed, frames pass through unchanged");
 			}
+			PassThrough(dev, sTex, dTex);
+			return;
 		}
 		s_origDoFxaa(dev, sTex, dTex);
 	}
