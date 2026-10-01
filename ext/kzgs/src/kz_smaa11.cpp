@@ -43,6 +43,7 @@ namespace kzgs
 namespace
 {
 	std::atomic<bool> s_enabled{false};
+	std::atomic<float> s_threshold{0.1f}; // luma edge threshold (SMAA_THRESHOLD); the HIGH preset's value by default
 	bool s_failed = false;
 
 	using DoFxaaFn = void (*)(GSDevice11*, GSTexture*, GSTexture*);
@@ -98,6 +99,7 @@ float4 ps_blend(VSOut i) : SV_Target
 	{
 		ID3D11Device* dev = nullptr; // identity of the device these belong to
 		int w = 0, h = 0;
+		float thr = 0.0f; // threshold the shaders were compiled with
 		wil::com_ptr_nothrow<ID3D11VertexShader> vs;
 		wil::com_ptr_nothrow<ID3D11PixelShader> psEdge, psWeights, psBlend;
 		wil::com_ptr_nothrow<ID3D11ShaderResourceView> areaSRV, searchSRV;
@@ -196,14 +198,17 @@ float4 ps_blend(VSOut i) : SV_Target
 				FAILED(d->CreateBlendState(&bd, s_res.bs.put())))
 				return false;
 		}
-		if (!s_res.psEdge || s_res.w != w || s_res.h != h)
+		const float thrNow = static_cast<float>(std::atof(std::getenv("KZGS_SMAA_THRESHOLD") ? std::getenv("KZGS_SMAA_THRESHOLD") : "0")) > 0.0f
+			? static_cast<float>(std::atof(std::getenv("KZGS_SMAA_THRESHOLD"))) : s_threshold.load();
+		if (!s_res.psEdge || s_res.w != w || s_res.h != h || s_res.thr != thrNow)
 		{
 			char metrics[160];
 			std::snprintf(metrics, sizeof(metrics), "float4(%.12f, %.12f, %d.0, %d.0)", 1.0 / w, 1.0 / h, w, h);
 			// HIGH preset by default; KZGS_SMAA_THRESHOLD / _STEPS / _DIAG / _CORNER override it (measurement, docs/findings.md)
 			const auto envf = [](const char* n, double def) { const char* v = std::getenv(n); return v && *v ? std::atof(v) : def; };
 			char thr[32], steps[32], stepsDiag[32], corner[32];
-			std::snprintf(thr, sizeof(thr), "%.4f", envf("KZGS_SMAA_THRESHOLD", 0.1));
+			std::snprintf(thr, sizeof(thr), "%.4f", static_cast<double>(thrNow));
+			s_res.thr = thrNow;
 			std::snprintf(steps, sizeof(steps), "%d", static_cast<int>(envf("KZGS_SMAA_STEPS", 16)));
 			std::snprintf(stepsDiag, sizeof(stepsDiag), "%d", static_cast<int>(envf("KZGS_SMAA_DIAG", 8)));
 			std::snprintf(corner, sizeof(corner), "%d", static_cast<int>(envf("KZGS_SMAA_CORNER", 25)));
@@ -444,6 +449,11 @@ float4 ps_blend(VSOut i) : SV_Target
 		s_origDoFxaa(dev, sTex, dTex);
 	}
 } // namespace
+
+void kzgsSetSmaaThreshold(float threshold)
+{
+	s_threshold.store(threshold < 0.02f ? 0.02f : threshold > 0.5f ? 0.5f : threshold);
+}
 
 namespace kzgs
 {

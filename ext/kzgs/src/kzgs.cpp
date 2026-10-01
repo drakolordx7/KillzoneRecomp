@@ -463,6 +463,19 @@ namespace
 	static std::vector<std::array<long long, 3>> s_present_log;
 	static const char* const s_present_log_path = std::getenv("KZGS_PRESENT_LOG");
 
+	static void FillBurstInspect(KzgsBurstFrame& f)
+	{
+		f.scanmask = kzgs::ScanmaskUsed();
+		f.tcInfo = kzgs::DescribeTargets();
+		if (g_gs_renderer)
+		{
+			const auto& pc = g_gs_renderer->PCRTCDisplays.PCRTCDisplays;
+			f.rc[0] = pc[0].framebufferRect.y; f.rc[1] = pc[0].framebufferRect.w; f.rc[2] = pc[1].framebufferRect.y; f.rc[3] = pc[1].framebufferRect.w;
+			f.rc[4] = pc[0].displayRect.y; f.rc[5] = pc[0].displayRect.w; f.rc[6] = pc[1].displayRect.y; f.rc[7] = pc[1].displayRect.w;
+			f.gameDeint = ((pc[0].prevFramebufferOffsets.y != pc[0].framebufferOffsets.y) != (pc[1].prevFramebufferOffsets.y != pc[1].framebufferOffsets.y)) ? 1 : 0;
+		}
+	}
+
 	// Present-time capture (kzgsBurstArm with presentWidth < 0): called from the swap chain's Present hook on the GS thread.
 	static void BurstPresentSink(const uint8_t* rgba, int w, int h)
 	{
@@ -471,6 +484,7 @@ namespace
 		KzgsBurstFrame f;
 		f.field = s_cur_field;
 		f.seq = s_vsync_seq + 1;
+		FillBurstInspect(f);
 		f.width = w;
 		f.height = h;
 		f.rgba.assign(rgba, rgba + static_cast<size_t>(w) * h * 4);
@@ -484,11 +498,7 @@ namespace
 		KzgsBurstFrame f;
 		f.field = field;
 		f.seq = s_vsync_seq;
-		if (g_gs_renderer)
-		{
-			const auto& pc = g_gs_renderer->PCRTCDisplays.PCRTCDisplays;
-			f.gameDeint = ((pc[0].prevFramebufferOffsets.y != pc[0].framebufferOffsets.y) != (pc[1].prevFramebufferOffsets.y != pc[1].framebufferOffsets.y)) ? 1 : 0;
-		}
+		FillBurstInspect(f);
 		ReadbackRequest req;
 		req.rgba = &f.rgba;
 		req.width = &f.width;

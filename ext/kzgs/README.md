@@ -78,6 +78,9 @@ void kzgsSync();                                      // wait until the GS threa
 bool kzgsReadback(std::vector<uint8_t>& rgba, int& w, int& h,
                   int presentWidth = 0, int presentHeight = 0);  // last output frame, RGBA8; internal resolution, or as presented in a window of that size
 void kzgsSetLogCallback(KzgsLogFn fn);
+void kzgsSetSmaaThreshold(float threshold);              // SMAA luma edge threshold, 0.02..0.5 (default 0.1 = SMAA HIGH)
+void kzgsBurstArm(int count, int presentWidth, int presentHeight); // measurement: copy the next N presented frames (kzgsBurstTake)
+bool kzgsBurstTake(std::vector<KzgsBurstFrame>& out);
 ```
 
 `KzgsConfig` has these settings:
@@ -223,6 +226,11 @@ ext/kzgs/build/kzgs_replay.exe work/trace_full2.bin work/kzdbg/out --every 100 [
 - `--present WxH [--aspect 16:9|4:3|stretch] [--crop l,t,r,b]` also writes `present_<frame>.png`, the frame scaled and
   aspect-corrected as presented in a window of that size. `--adapter NAME`, `--hpo N`, `--native N`, `--fxaa`,
   `--antiblur 0|1`, `--interlace N` set the matching `KzgsConfig` fields.
+- `--window` (with `--present WxH`) opens a hidden window of that size, so the swap chain and the Bilinear Sharp pre-scale match the game.
+  `--backbuffer` then writes `bb_<frame>.png`, the swap chain's back buffer at Present: the exact final pixels (CAS included).
+  `--sharp 0|1`, `--bilinear 0|1`, `--cas N`, `--filter N` set the final-scaling and texture-filter fields. `--skip-idle` skips
+  vblanks without new GIF packets like the game does, `--single-circuit` applies the game's display-register rewrite
+  (read circuit 2 := read circuit 1, see docs/findings.md "Menu jitter and blur").
 - `--sleep MS [--sleep-from N]` waits between vsyncs, so the GS thread has idle time as in the game (a replay without
   pacing keeps the GS thread saturated and hides pacing-dependent renderer bugs).
 - `--dump-draws F:N` turns on PCSX2's own per-draw dumps (context registers, vertices, transfers) for N draws

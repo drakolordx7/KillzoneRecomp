@@ -23,6 +23,10 @@ namespace kzgs
 	using PresentSink = void (*)(const uint8_t* rgba, int width, int height);
 	bool PresentCapture(PresentSink sink);
 
+	// GSState::m_scanmask_used (src/kz_inspect.cpp): frames left in which PCSX2 treats the output as scan-masked (anti-blur is off while > 0).
+	int ScanmaskUsed();
+	std::string DescribeTargets(); // one line per render target of PCSX2's texture cache (src/kz_inspect.cpp)
+
 	void SmaaSetEnabled(bool on);
 	void SmaaInstall();
 } // namespace kzgs
