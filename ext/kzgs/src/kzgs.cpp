@@ -253,7 +253,10 @@ namespace
 		o.HWAA1 = cfg.edgeAA;
 		o.AspectRatio = ToAspect(cfg.aspect);
 		o.VsyncEnable = cfg.vsync;
-		o.LinearPresent = cfg.bilinearPresent ? GSPostBilinearMode::BilinearSmooth : GSPostBilinearMode::Off;
+		o.LinearPresent = !cfg.bilinearPresent ? GSPostBilinearMode::Off
+		                : cfg.sharpPresent ? GSPostBilinearMode::BilinearSharp : GSPostBilinearMode::BilinearSmooth;
+		o.CASMode = cfg.casSharpness > 0 ? GSCASMode::SharpenOnly : GSCASMode::Disabled;
+		o.CAS_Sharpness = static_cast<u8>(std::clamp(cfg.casSharpness, 0, 100));
 		o.UserHacks_HalfPixelOffset = static_cast<GSHalfPixelOffset>(
 			std::clamp(cfg.halfPixelOffset, 0, static_cast<int>(GSHalfPixelOffset::MaxCount) - 1));
 		o.UserHacks_NativeScaling = static_cast<GSNativeScaling>(

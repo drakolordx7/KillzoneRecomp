@@ -29,6 +29,8 @@ enum class KzVirtualAxis
     None,
     MoveForward, MoveBack, StrafeLeft, StrafeRight,
     LookUp, LookDown, LookLeft, LookRight,
+    // D-pad presses that only act outside gameplay (menus). In gameplay the D-pad is the scope zoom axis.
+    MenuUp, MenuDown, MenuLeft, MenuRight,
 };
 
 void kzInputInit(const std::filesystem::path &bindingsIni);
@@ -50,6 +52,12 @@ KzMouseDelta kzInputTakeMouseDelta();
 
 // True when the most recent input came from keyboard/mouse rather than a gamepad (pad-only assists are then disabled).
 bool kzInputUsingKeyboardMouse();
+
+// Hold-to-aim support (kz_aim): true while a key/mouse binding to R3 (the game's zoom toggle) is held and
+// [Input] AimMode=Hold; such bindings then do not press R3 themselves. kzInputPulseButton presses pad buttons for a
+// short time (the aim patch pulses R3 to bring the game's zoom state in line).
+bool kzInputZoomHeld();
+void kzInputPulseButton(uint16_t padMask, uint32_t milliseconds);
 
 // When the engine aim patch is active, mouse motion goes there; otherwise it is mapped onto the right stick.
 void kzInputSetAimPatchActive(bool active);

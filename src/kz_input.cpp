@@ -56,6 +56,8 @@ namespace
         {"StrafeLeft", KzVirtualAxis::StrafeLeft}, {"StrafeRight", KzVirtualAxis::StrafeRight},
         {"LookUp", KzVirtualAxis::LookUp}, {"LookDown", KzVirtualAxis::LookDown},
         {"LookLeft", KzVirtualAxis::LookLeft}, {"LookRight", KzVirtualAxis::LookRight},
+        {"MenuUp", KzVirtualAxis::MenuUp}, {"MenuDown", KzVirtualAxis::MenuDown},
+        {"MenuLeft", KzVirtualAxis::MenuLeft}, {"MenuRight", KzVirtualAxis::MenuRight},
     };
 
     // PC defaults, derived from the game's own default controller map (profile settings +0xEC, docs/findings.md
@@ -69,20 +71,21 @@ namespace
         {"Space", "Cross"}, {"Return", "Cross"},
         {"W", "MoveForward"}, {"S", "MoveBack"}, {"A", "StrafeLeft"}, {"D", "StrafeRight"},
         {"Up", "LookUp"}, {"Down", "LookDown"}, {"Left", "LookLeft"}, {"Right", "LookRight"},
-        // Arrow keys and WASD also press the D-pad: the menus navigate with the D-pad only (measured: a left-stick push
-        // did not move the Create Profile selection, D-pad down did). No gameplay action is on the D-pad in the default
-        // controller map.
-        {"Up", "Up"}, {"Down", "Down"}, {"Left", "Left"}, {"Right", "Right"},
-        {"W", "Up"}, {"S", "Down"}, {"A", "Left"}, {"D", "Right"},
+        // Arrow keys and WASD also press the D-pad in menus: the menus navigate with the D-pad only (measured: a
+        // left-stick push did not move the Create Profile selection, D-pad down did). Not in gameplay, where the
+        // D-pad is the scope zoom axis (controller map: zoom = axis 105 = D-pad up/down).
+        {"Up", "MenuUp"}, {"Down", "MenuDown"}, {"Left", "MenuLeft"}, {"Right", "MenuRight"},
+        {"W", "MenuUp"}, {"S", "MenuDown"}, {"A", "MenuLeft"}, {"D", "MenuRight"},
         {"Escape", "Start"}, {"Tab", "Select"}, {"Backspace", "Triangle"},
         {"1", "Up"}, {"2", "Right"}, {"3", "Down"}, {"4", "Left"},
     };
 
     // [Bindings] Version=<n>. Sections written before a version are upgraded by appending that version's additions.
-    constexpr int kBindingsVersion = 2;
+    // Version 2 added the menu D-pad keys; version 3 made them menu-only (MenuUp ... instead of Up ...).
+    constexpr int kBindingsVersion = 3;
     constexpr std::pair<const char *, const char *> kBindingsV2Additions[] = {
-        {"Up", "Up"}, {"Down", "Down"}, {"Left", "Left"}, {"Right", "Right"},
-        {"W", "Up"}, {"S", "Down"}, {"A", "Left"}, {"D", "Right"},
+        {"Up", "MenuUp"}, {"Down", "MenuDown"}, {"Left", "MenuLeft"}, {"Right", "MenuRight"},
+        {"W", "MenuUp"}, {"S", "MenuDown"}, {"A", "MenuLeft"}, {"D", "MenuRight"},
     };
 
     constexpr uint64_t kWheelPulseMs = 60; // a wheel notch holds its button this long so the game sees one press
@@ -102,6 +105,9 @@ namespace
         float stickMouseDy = 0.0f;
         bool captured = false;
         bool aimPatchActive = false;
+        uint64_t gameplayUntil = 0; // SDL ticks: the aim patch ran recently (in gameplay, not paused / in a menu)
+        uint16_t pulseMask = 0;     // kzInputPulseButton
+        uint64_t pulseUntil = 0;
         // text entry (on-screen keyboard open in the game)
         uint64_t textEntryUntil = 0; // SDL ticks; active while now < this
         std::deque<uint16_t> textQueue;
@@ -170,6 +176,8 @@ namespace
                     ev.axis = 7;
                     ev.text = what.substr(5);
                 }
+                else if (_stricmp(what.c_str(), "zoomkey") == 0)
+                    ev.axis = 8; // holds the zoom key (as a key bound to R3 would) for dur seconds
                 else if (_stricmp(what.c_str(), "textenter") == 0)
                     ev.axis = 7, ev.text = std::string(1, static_cast<char>(KZ_TEXT_ENTER));
                 else if (_stricmp(what.c_str(), "textback") == 0)
@@ -272,6 +280,7 @@ namespace
         std::ifstream in(ini);
         bool inSection = false, any = false;
         int version = 1;
+        std::vector<size_t> pendingUpgrade;
         std::string line;
         while (in && std::getline(in, line))
         {
@@ -294,6 +303,7 @@ namespace
                 }
                 pairs.emplace_back(std::move(key), trim(line.substr(eq + 1)));
                 any = true;
+                pendingUpgrade.push_back(pairs.size() - 1);
             }
         }
         if (!any)
@@ -302,6 +312,14 @@ namespace
         else if (version < 2)
             for (const auto &[k, v] : kBindingsV2Additions)
                 pairs.emplace_back(k, v);
+        else if (version < 3)
+        {
+            // Version 2 files bound W/A/S/D and the arrows straight to the D-pad.
+            for (size_t i : pendingUpgrade)
+                for (const auto &[k, v] : kBindingsV2Additions)
+                    if (_stricmp(pairs[i].first.c_str(), k) == 0 && _stricmp(pairs[i].second.c_str(), v + 4) == 0)
+                        pairs[i].second = v;
+        }
         return pairs;
     }
 
@@ -379,10 +397,13 @@ namespace
     {
         uint16_t pressed = s.padButtons;
         float mx = 0, my = 0, lx = 0, ly = 0;
+        uint16_t menuPad = 0;
         for (const Binding &b : s.bindings)
         {
             if (!sourceActive(s, b, now))
                 continue;
+            if (b.padButton == KZ_PAD_R3 && kzConfig().holdAim && s.aimPatchActive && now < s.gameplayUntil)
+                continue; // hold to aim: kz_aim drives R3 from kzInputZoomHeld()
             pressed |= b.padButton;
             switch (b.axis)
             {
@@ -394,9 +415,17 @@ namespace
             case KzVirtualAxis::LookDown: my += 1; break;
             case KzVirtualAxis::LookLeft: mx -= 1; break;
             case KzVirtualAxis::LookRight: mx += 1; break;
+            case KzVirtualAxis::MenuUp: menuPad |= KZ_PAD_UP; break;
+            case KzVirtualAxis::MenuDown: menuPad |= KZ_PAD_DOWN; break;
+            case KzVirtualAxis::MenuLeft: menuPad |= KZ_PAD_LEFT; break;
+            case KzVirtualAxis::MenuRight: menuPad |= KZ_PAD_RIGHT; break;
             default: break;
             }
         }
+        if (!s.aimPatchActive || now >= s.gameplayUntil)
+            pressed |= menuPad;
+        if (now < s.pulseUntil)
+            pressed |= s.pulseMask;
         const float dz = kzConfig().stickDeadzone;
         lx += applyDeadzone(s.lx, dz);
         ly += applyDeadzone(s.ly, dz);
@@ -507,6 +536,34 @@ void kzInputSetAimPatchActive(bool active)
     State &s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
     s.aimPatchActive = active;
+    if (active)
+        s.gameplayUntil = SDL_GetTicks() + 250; // called every gameplay frame by the aim patch
+}
+
+bool kzInputZoomHeld()
+{
+    State &s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    const uint64_t now = SDL_GetTicks();
+    for (const Binding &b : s.bindings)
+        if (b.padButton == KZ_PAD_R3 && sourceActive(s, b, now))
+            return true;
+    if (!script().empty())
+    {
+        const double t = g_scriptClock ? g_scriptClock() : SDL_GetTicks() / 1000.0;
+        for (const ScriptEvent &e : script())
+            if (e.axis == 8 && t >= e.t && t < e.t + e.dur)
+                return true;
+    }
+    return false;
+}
+
+void kzInputPulseButton(uint16_t padMask, uint32_t milliseconds)
+{
+    State &s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    s.pulseMask = padMask;
+    s.pulseUntil = SDL_GetTicks() + milliseconds;
 }
 
 void kzInputOnEvent(const SDL_Event &e)
@@ -736,6 +793,7 @@ std::vector<std::pair<std::string, std::string>> kzInputDescribeBindings(const s
         {"Circle", "Switch weapon"}, {"L1", "Throw grenade"}, {"Square", "Special item"}, {"Triangle", "Reload / back"},
         {"L2", "Crouch"}, {"L3", "Sprint"}, {"R3", "Zoom"}, {"Start", "Pause"}, {"Select", "Objectives"},
         {"Up", "D-pad up"}, {"Down", "D-pad down"}, {"Left", "D-pad left"}, {"Right", "D-pad right"},
+        {"MenuUp", "Menu up"}, {"MenuDown", "Menu down"}, {"MenuLeft", "Menu left"}, {"MenuRight", "Menu right"},
     };
     std::vector<std::pair<std::string, std::string>> out;
     for (const auto &[src, dst] : kzInputBindingPairs(bindingsIni))

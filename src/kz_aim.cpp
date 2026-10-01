@@ -5,6 +5,7 @@
 
 #include "ps2_runtime.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -19,9 +20,15 @@
 //            pitch = player+0x14C + pitchDelta (the setters clamp pitch). Called once per sim step by the player update
 //            0x21A8C8 with rate * max turn speed * dt. It also runs the camera lag (player+0x2A8/0x2AC: the view trails
 //            the aim by up to 10 degrees and eases back) and idle sway (+0x170/0x174), both enabled by byte player+0x16C.
-//            In normal walking the body heading is rebuilt from the yaw rate and player+0x148 only keeps the lag/sway
-//            offset, so a yaw added to the delta is lost: mouse yaw has to go through the rate (measured: a scripted
-//            90-degree mouse turn added to f13 did not turn the view; the right stick did).
+//            In normal walking player+0x148 only keeps the lag/sway offset, so a yaw added to the delta is lost.
+//   Body turn (in the player update 0x21A8C8): heading += turn * T * dt, with turn = the control state's turn value
+//            (ctrl+0x3C; stick right is negative, and it ramps up to about 2x while the stick is held) and
+//            T = ctl[0x190] / ctl[0x44C] (vtable +0x188 of the character controller ctl = player+0x31C: 2.0944 rad/s
+//            unzoomed; ctl+0x44C is the zoom factor). The heading angle is ctl+0x78, ctl+0x454 the aim mode
+//            (0 normal, 1 zoomed, 2 mounted). Measured: a turn value written in frame k is applied twice, once in
+//            frame k and once more in frame k+1 before that frame's player update (a latched copy), so one frame of
+//            turn changes the heading by turn * T * (dt[k] + dt[k+1]) (four mouse impulses and the stick frames
+//            match to 4 digits).
 //   0x23E9C8 pitch auto-centre while walking without look input (a gamepad assist; gated by a profile option).
 //   0x1B0DF0 on-screen keyboard: USB keyboard reader (obj). The game supports a USB keyboard for the profile name
 //            (HID codes: 0x28 enter -> obj+0x21C = 2, 0x29 escape -> 4, 0x2A backspace -> FUN_001b18d8, else add char
@@ -51,11 +58,13 @@ namespace
     bool g_log = false;
     std::chrono::steady_clock::time_point g_lastTake{};
 
-    // Mouse yaw goes in as a look rate: the game turns by rate * maxYaw * dt. maxYaw (rad/s at rate 1; lower when
-    // zoomed) is measured from every ApplyLook call with a non-zero rate: f13 / (rate * dt).
-    float g_maxYaw = 0.0f;
-    float g_lastDt = 1.0f / 60.0f;
-    float g_mouseRate = 0.0f;     // rate added this frame
+    // Mouse yaw goes in as the turn value. Because every turn value acts in two consecutive frames, the mouse keeps a
+    // debt (heading change still owed) and commands half of it per frame: the two steps of one command add up to the
+    // debt at equal frame times, and the debt is charged with the frame times that really applied, so the total is
+    // exact and nothing drifts. The effect is a two-frame average of the mouse motion.
+    float g_yawDebt = 0.0f;       // radians of heading still to apply
+    float g_prevTurn = 0.0f;      // mouse turn value commanded last frame (its second step happens this frame)
+    float g_mouseRate = 0.0f;     // turn value added this frame (log)
     float g_pendingPitch = 0.0f;  // radians, applied in the next ApplyLook
     float g_ctrlDt = 0.0f;        // frame timer dt read at the controller update
 
@@ -101,6 +110,34 @@ namespace
         return static_cast<float>(rd32(rdram, obj + 0x64)) * rdf(rdram, obj + 0x50);
     }
 
+    // Hold to aim: the game's zoom is a toggle on R3 (action "zoommode"). With [Input] AimMode=Hold the zoom key is
+    // not sent to the pad; R3 is pulsed whenever the game's zoom state (ctl+0x454 == 1) differs from the key state.
+    void updateHoldAim(const uint8_t *rdram, uint32_t ctl)
+    {
+        static std::chrono::steady_clock::time_point nextPulse{};
+        static int attempts = 0;
+        if (!kzConfig().holdAim)
+            return;
+        const uint32_t mode = rd32(rdram, ctl + 0x454);
+        if (mode > 1u)
+            return; // mounted weapon / other modes: leave alone
+        const bool want = kzInputZoomHeld();
+        if (want == (mode == 1u))
+        {
+            attempts = 0;
+            return;
+        }
+        if (!want && attempts == 0 && mode == 0u)
+            return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now < nextPulse || attempts >= 3)
+            return; // give the game time to switch; a weapon that cannot zoom is not hammered while the key is held
+        kzInputPulseButton(KZ_PAD_R3, 70);
+        nextPulse = now + std::chrono::milliseconds(300);
+        if (want)
+            ++attempts;
+    }
+
     void ctrlUpdate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
         const uint32_t ra = getRegU32(ctx, 31);
@@ -128,23 +165,39 @@ namespace
         g_mouseRate = 0.0f;
         g_pendingPitch = 0.0f;
         g_ctrlDt = frameDt(rdram);
-        if (since >= kStaleSeconds || (d.dx == 0.0f && d.dy == 0.0f))
-            return;
-        // Stick right gives a positive yaw rate, stick up a positive pitch delta (the game negates the stick Y axis);
-        // mouse down is +dy, so pitch goes the other way.
-        const float yaw = d.dx * kRadPerCount;
-        g_pendingPitch = -d.dy * kRadPerCount;
-        if (yaw != 0.0f)
+        if (g_log)
         {
-            // Until the first measurement: 2.793 rad/s, measured unzoomed in the first mission.
-            const float maxYaw = g_maxYaw > 0.0f ? g_maxYaw : 2.793f;
-            // The step that consumes the rate uses this frame's timer dt (measured equal to ApplyLook's f12 in every
-            // frame, including 2-tick frames and clamped hitches).
-            const float dt = g_ctrlDt > 0.0f ? g_ctrlDt : g_lastDt;
-            g_mouseRate = yaw / (maxYaw * dt);
-            wrf(rdram, ctrl + 0xA8, rdf(rdram, ctrl + 0xA8) + g_mouseRate);
-            wrf(rdram, ctrl + 0x3C, rdf(rdram, ctrl + 0x3C) + g_mouseRate);
+            static const bool matrix = std::getenv("KZ_AIM_LOG") && std::getenv("KZ_AIM_LOG")[0] == '2';
+            if (matrix)
+                std::printf("[kz-mtc] dt=%.5f heading=%.5f\n", g_ctrlDt, rdf(rdram, rd32(rdram, player + 0x31C) + 0x78));
         }
+        const uint32_t ctl = rd32(rdram, player + 0x31C);
+        const float zoom = rdf(rdram, ctl + 0x44C);
+        const float turnSpeed = (zoom > 0.01f) ? rdf(rdram, ctl + 0x190) / zoom : 0.0f; // rad/s at turn value 1
+        const float dt = g_ctrlDt;
+        updateHoldAim(rdram, ctl);
+        if (since >= kStaleSeconds || !(turnSpeed > 0.01f) || !(dt > 0.0f))
+        {
+            g_yawDebt = 0.0f; // menus, loading, pause: drop stale motion and any pending correction
+            g_prevTurn = 0.0f;
+            return;
+        }
+        // The second step of last frame's command happens in this frame, with this frame's dt.
+        g_yawDebt -= g_prevTurn * turnSpeed * dt;
+        // Mouse right turns right: heading decreases (stick right gives a negative turn value). Mouse down is +dy and
+        // looking up is a positive pitch delta. Zoomed, both scale with the zoom factor like the stick does.
+        const float scale = kRadPerCount / std::max(zoom, 1.0f);
+        g_yawDebt += -d.dx * scale;
+        g_pendingPitch = -d.dy * scale;
+        if (std::fabs(g_yawDebt) < 1e-7f && g_prevTurn == 0.0f)
+        {
+            g_yawDebt = 0.0f;
+            return;
+        }
+        g_mouseRate = g_yawDebt / (2.0f * turnSpeed * dt);
+        g_yawDebt -= g_mouseRate * turnSpeed * dt; // first step, this frame
+        g_prevTurn = g_mouseRate;
+        wrf(rdram, ctrl + 0x3C, rdf(rdram, ctrl + 0x3C) + g_mouseRate);
     }
 
     void applyLook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
@@ -157,12 +210,6 @@ namespace
         }
         const float dt = ctx->f[12];
         const float rate = rdf(rdram, g_ctrl + 0x24 + 0x84);
-        if (dt > 0.0f)
-        {
-            g_lastDt = dt;
-            if (std::fabs(rate) > 1e-3f && std::fabs(ctx->f[13]) > 0.0f)
-                g_maxYaw = ctx->f[13] / (rate * dt);
-        }
         ctx->f[14] += g_pendingPitch;
         const float mousePitch = g_pendingPitch;
         g_pendingPitch = 0.0f;
@@ -177,8 +224,17 @@ namespace
         {
             static int n = 0;
             if ((++n % 3) == 0 || g_mouseRate != 0.0f || mousePitch != 0.0f)
-                std::printf("[kz-aim] ctrlDt=%.5f dt=%.5f rate=%.3f mouseRate=%.3f maxYaw=%.3f dYaw=%.4f dPitch=%.4f pitch=%.4f\n", g_ctrlDt, dt,
-                            rate, g_mouseRate, g_maxYaw, ctx->f[13], ctx->f[14], rdf(rdram, g_player + 0x14C));
+                std::printf("[kz-aim] ctrlDt=%.5f dt=%.5f mouseTurn=%.3f debt=%.5f dPitch=%.4f pitch=%.4f\n", g_ctrlDt, dt,
+                            g_mouseRate, g_yawDebt, ctx->f[14], rdf(rdram, g_player + 0x14C));
+            // KZ_AIM_LOG=2: the character controller's transform (player+0x31C, matrix at +0x50) and mode (+0x454),
+            // to measure the real heading change of a turn.
+            static const bool matrix = std::getenv("KZ_AIM_LOG") && std::getenv("KZ_AIM_LOG")[0] == '2';
+            if (matrix)
+            {
+                const uint32_t ctl = rd32(rdram, g_player + 0x31C);
+                std::printf("[kz-mtx] mode=%u dt=%.5f turn=%.4f rateA8=%.4f heading=%.5f\n", rd32(rdram, ctl + 0x454), dt,
+                            rdf(rdram, g_ctrl + 0x3C), rate, rdf(rdram, ctl + 0x78));
+            }
         }
         g_origApplyLook(rdram, ctx, rt);
         if (kbm)

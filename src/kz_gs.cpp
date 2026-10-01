@@ -95,6 +95,14 @@ namespace
         k.textureFiltering = c.bilinear ? KzgsTextureFilter::PS2 : KzgsTextureFilter::Nearest;
         k.anisotropy = c.anisotropy;
         k.fxaa = c.fxaa;
+        k.sharpPresent = c.sharpScaling;
+        k.casSharpness = c.sharpen;
+        if (const char *v = std::getenv("KZ_FXAA")) // automation overrides
+            k.fxaa = std::atoi(v) != 0;
+        if (const char *v = std::getenv("KZ_SHARP_SCALING"))
+            k.sharpPresent = std::atoi(v) != 0;
+        if (const char *v = std::getenv("KZ_SHARPEN"))
+            k.casSharpness = std::clamp(std::atoi(v), 0, 100);
         switch (c.aspect)
         {
         case KzAspect::Widescreen16x9: k.aspect = KzgsAspect::Ratio16_9; break;
