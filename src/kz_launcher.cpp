@@ -281,7 +281,7 @@ namespace
                             ImGui::EndCombo();
                         }
                         toggleRow("V-Sync", "Removes tearing; adds a little input delay.", cfg.vsync);
-                        toggleRow("Skip intro movies", "Goes straight to the title screen. Story cutscenes still play.", cfg.skipIntro);
+                        toggleRow("Skip intro movies", "Skips the long intro movie after the logos. Story cutscenes still play.", cfg.skipIntro);
                         ImGui::EndTable();
                     }
                 }
