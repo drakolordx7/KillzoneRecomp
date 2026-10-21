@@ -29,6 +29,8 @@ Menus: arrow keys or W/S/A/D to move, Enter / Space / E to select, Backspace to 
 Profile name: just type it. Backspace deletes, Enter confirms, Escape cancels.
 Controllers (Xbox, DualShock, DualSense and others) work out of the box with the original PS2 layout.
 
+To skip the long intro movie at every start, switch on "Skip intro movies" in the launcher's Display tab.
+
 Settings are saved in killzone.ini next to killzone.exe. Delete it to reset everything.
 If you untick "Show this launcher at startup", the game boots straight in. To get the launcher back,
 run "killzone.exe --launcher" or set Show=1 under [Launcher] in killzone.ini.
@@ -39,7 +41,6 @@ a newer build: copy the new files over the old ones.
 Known problems in this build
 - Sniper scope: the crosshair snaps back to the centre, and the view jumps if you move the mouse hard.
 - The game can lock up on level 2, around the second sniper.
-- The intro movies can't be skipped yet.
 - Frame rate: about 120 fps at the start of the first mission on a fast PC, but busy fights drop lower
   and there is some stutter.
 - Menus and the loading screen can jitter up and down a little.
