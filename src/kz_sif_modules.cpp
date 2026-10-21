@@ -7,6 +7,7 @@
 #include "kz_sif_modules.h"
 
 #include "Syscalls/Common.h"
+#include "ps2_syscalls.h"
 
 #include <string>
 
@@ -49,6 +50,27 @@ namespace
         }
         return kUnknownModule;
     }
+}
+
+// A function bound by address (replaceFunction) is entered either by a call site (ps2CgCall / ps2DspCall) or, after the
+// guest yielded exactly at the call (the call's budget check runs before the callee is entered and leaves ctx->pc = the
+// callee), directly by the scheduler, which then continues at whatever ctx->pc is when the function returns. The runtime's
+// handlers leave ctx->pc untouched, so the scheduler entered the same function again and again: sceSifLoadModule for
+// PADMAN/MCSERV/... was repeated until "[IOP] module arena exhausted" and the boot never finished (about 1 boot in 60; every
+// yield at that call). Setting ctx->pc = $ra makes both entries return to the caller. Reproduced on demand with
+// PS2X_STRESS_YIELD=2 (docs/findings.md "Boot hang: handler bound by address").
+void kzSifLoadModuleAt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t ra = getRegU32(ctx, 31);
+    ps2_syscalls::SifLoadModule(rdram, ctx, runtime);
+    ctx->pc = ra;
+}
+
+void kzSifStopModuleAt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t ra = getRegU32(ctx, 31);
+    ps2_syscalls::SifStopModule(rdram, ctx, runtime);
+    ctx->pc = ra;
 }
 
 void kzSceSifSearchModuleByName(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

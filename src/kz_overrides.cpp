@@ -7,6 +7,7 @@
 #include "game_overrides.h"
 #include "kz_sif_modules.h"
 #include "kz_ipu.h"
+#include "kz_devtools.h"
 #include "ps2_runtime.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_timeline.h"
@@ -24,10 +25,10 @@ namespace
         const char *handler;
     };
 
-    // Stripped-ELF library functions identified by hand (docs/findings.md#library-bindings).
+    // Stripped-ELF library functions identified by hand (docs/findings.md#library-bindings). sceSifLoadModule (0x2B6060) and
+    // sceSifStopModule (0x2B5AF0, (modid, arg_len, args, *result)) are bound in kCustom below (they must set ctx->pc = $ra).
     constexpr Binding kBindings[] = {
-        {0x002B6060u, "sceSifLoadModule"},
-        {0x002B5AF0u, "SifStopModule"}, // sceSifStopModule(modid, arg_len, args, *result)
+        {0u, nullptr},
     };
 
     // Library functions the runtime has no handler for; implemented in kz_sif_modules.cpp.
@@ -50,6 +51,8 @@ namespace
         {0x002B5D88u, &kzSceSifSearchModuleByName, "sceSifSearchModuleByName"},
         {0x002B5CF8u, &kzSceSifUnloadModule, "sceSifUnloadModule"},
         {0x003D7490u, &kzLgkbmInit, "lgkbm init"},
+        {0x002B6060u, &kzSifLoadModuleAt, "sceSifLoadModule"},
+        {0x002B5AF0u, &kzSifStopModuleAt, "sceSifStopModule"},
     };
 
     // KZ_TIMELINE: wrappers that log entry/exit of the frame pipeline's guest functions (patch 0025). The wrapper takes the
@@ -101,6 +104,7 @@ namespace
 
     void applyKillzone(PS2Runtime &runtime)
     {
+        kzDevHooksInstall(runtime);
         if (const char *tl = std::getenv("KZ_TIMELINE"); tl && *tl)
         {
             tlInstall<0>(runtime, 0x001BFF10u); // frame limiter / delta
@@ -112,6 +116,8 @@ namespace
         }
         for (const Binding &b : kBindings)
         {
+            if (!b.handler)
+                continue;
             if (!ps2_game_overrides::bindAddressHandler(runtime, b.address, b.handler))
                 std::cerr << "[kz] failed to bind " << b.handler << " @0x" << std::hex << b.address << std::dec << std::endl;
         }
