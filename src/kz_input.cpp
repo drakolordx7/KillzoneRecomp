@@ -115,6 +115,10 @@ namespace
         SDL_Gamepad *gamepad = nullptr;
         // latest gamepad snapshot, taken on the window thread
         uint16_t padButtons = 0; // active-high
+        // [Input] SprintMode=Toggle (compose): latched sprint button, previous raw state, start of standing still
+        bool sprintLatched = false;
+        bool sprintWasDown = false;
+        uint64_t sprintIdleSince = 0;
         float lx = 0, ly = 0, rx = 0, ry = 0, l2 = 0, r2 = 0;
     };
 
@@ -440,6 +444,28 @@ namespace
         }
         s.stickMouseDx = s.stickMouseDy = 0.0f;
         applyScript(pressed, lx, ly, rx, ry);
+        // Toggle sprint (optional; the original sprints only while L3 is held, measured against PCSX2): a press of the sprint
+        // button latches it, the next press or 0.3 s without movement releases it. Gameplay only; menus see the raw button.
+        if (kzConfig().toggleSprint && s.aimPatchActive && now < s.gameplayUntil)
+        {
+            const bool down = (pressed & KZ_PAD_L3) != 0;
+            if (down && !s.sprintWasDown)
+                s.sprintLatched = !s.sprintLatched;
+            s.sprintWasDown = down;
+            const bool moving = std::fabs(lx) > 0.5f || std::fabs(ly) > 0.5f;
+            if (moving)
+                s.sprintIdleSince = 0;
+            else if (s.sprintIdleSince == 0)
+                s.sprintIdleSince = now;
+            if (s.sprintLatched && s.sprintIdleSince != 0 && now - s.sprintIdleSince > 300)
+                s.sprintLatched = false;
+            pressed = s.sprintLatched ? static_cast<uint16_t>(pressed | KZ_PAD_L3) : static_cast<uint16_t>(pressed & ~KZ_PAD_L3);
+        }
+        else
+        {
+            s.sprintLatched = false;
+            s.sprintWasDown = false;
+        }
         if (s.r2 > 0.5f) pressed |= KZ_PAD_R2;
         if (s.l2 > 0.5f) pressed |= KZ_PAD_L2;
 

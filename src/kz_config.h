@@ -62,6 +62,7 @@ struct KzConfig
     bool invertY = false;
     bool rawMouse = true;
     bool holdAim = true;     // hold the zoom key to aim (the game's own zoom is a toggle)
+    bool toggleSprint = false; // press sprint once to keep sprinting (the original is hold-to-sprint)
     float stickDeadzone = 0.15f;
 
     // Audio
