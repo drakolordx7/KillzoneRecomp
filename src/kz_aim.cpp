@@ -38,6 +38,7 @@ namespace
     constexpr uint32_t kCtrlUpdate = 0x0023EE08u;
     constexpr uint32_t kApplyLook = 0x0021C550u;
     constexpr uint32_t kPitchAutoCentre = 0x0023E9C8u;
+    constexpr uint32_t kAfterLookProbe = 0x00218710u; // first call the player update makes after the scope block
     constexpr uint32_t kVkKeyboard = 0x001B0DF0u;
     constexpr uint32_t kVkAddChar = 0x001B17A0u;
     constexpr uint32_t kVkBackspace = 0x001B18D8u;
@@ -48,6 +49,8 @@ namespace
     PS2Runtime::RecompiledFunction g_origCtrlUpdate = nullptr;
     PS2Runtime::RecompiledFunction g_origApplyLook = nullptr;
     PS2Runtime::RecompiledFunction g_origPitchAutoCentre = nullptr;
+    PS2Runtime::RecompiledFunction g_origAfterLook = nullptr;
+    uint32_t g_modeSwapCtl = 0; // controller whose aim mode 2 was shown to the player update as 1 (restored at 0x218710)
     PS2Runtime::RecompiledFunction g_origVkKeyboard = nullptr;
     PS2Runtime::RecompiledFunction g_vkAddChar = nullptr;
     PS2Runtime::RecompiledFunction g_vkBackspace = nullptr;
@@ -119,10 +122,12 @@ namespace
         if (!kzConfig().holdAim)
             return;
         const uint32_t mode = rd32(rdram, ctl + 0x454);
-        if (mode > 1u)
-            return; // mounted weapon / other modes: leave alone
+        if (mode > 2u)
+            return; // unknown mode: leave alone
+        // Mode 1 is the zoom of ordinary weapons, mode 2 the zoom of scope-type weapons (sniper rifle).
+        const bool zoomed = mode != 0u;
         const bool want = kzInputZoomHeld();
-        if (want == (mode == 1u))
+        if (want == zoomed)
         {
             attempts = 0;
             return;
@@ -138,8 +143,103 @@ namespace
             ++attempts;
     }
 
+    // KZ_AIM_LOG=3: scope/camera probe (research aid). Current weapon = slot set (ctl+0x1CC array, index ctl+0x1DC)
+    // -> first weapon (set+0x18 array) -> definition (weapon+8: +0x10 type, +0x20 can zoom, +0x178/+0x17C zoom min/max,
+    // +0x180 zoom time). Camera = player+0x3C: +0x6C far plane, +0x70 field of view (degrees), +0x74 aspect.
+    void probeScope(const uint8_t *rdram, uint32_t player, uint32_t ctl)
+    {
+        static const bool on = std::getenv("KZ_AIM_LOG") && std::getenv("KZ_AIM_LOG")[0] == '3';
+        static const bool fakeScope = std::getenv("KZ_FAKE_SCOPE") != nullptr;
+        if (!on && !fakeScope)
+            return;
+        static int n = 0;
+        static uint32_t lastKey = 0;
+        const uint32_t cam = rd32(rdram, player + 0x3C);
+        uint32_t def = 0;
+        uint32_t weaponObj = 0;
+        const uint32_t slotIdx = rd32(rdram, ctl + 0x1DC);
+        if (slotIdx < rd32(rdram, ctl + 0x1C4))
+        {
+            const uint32_t set = rd32(rdram, rd32(rdram, ctl + 0x1CC) + slotIdx * 4);
+            if (set && rd32(rdram, set + 0x10))
+                if (const uint32_t w = rd32(rdram, rd32(rdram, set + 0x18)))
+                {
+                    weaponObj = w;
+                    def = rd32(rdram, w + 8);
+                }
+        }
+        // KZ_FAKE_SCOPE=2: give the current weapon the game's real sniper-rifle definition (type 0x15, found by a RAM sweep
+        // for definitions with the current one's vtable), so the scope code path runs with its real data.
+        static const bool realDef = std::getenv("KZ_FAKE_SCOPE") && std::getenv("KZ_FAKE_SCOPE")[0] == '2';
+        if (realDef && def && weaponObj)
+        {
+            static uint32_t sniperDef = 0;
+            static int tries = 0;
+            if (!sniperDef && (tries++ % 240) == 0)
+            {
+                const uint32_t vt = rd32(rdram, def);
+                for (uint32_t a = 0x100000; a < 0x02000000 && !sniperDef; a += 4)
+                    if (rd32(rdram, a) == vt && rd32(rdram, a + 0x10) == 0x15u && rdf(rdram, a + 0x17C) > 5.0f)
+                        sniperDef = a;
+                if (sniperDef)
+                    std::printf("[kz] fake scope: sniper definition 0x%x (zoom %.2f..%.2f)\n", sniperDef, rdf(rdram, sniperDef + 0x178),
+                                rdf(rdram, sniperDef + 0x17C));
+            }
+            if (sniperDef && def != sniperDef)
+            {
+                wr32(const_cast<uint8_t *>(rdram), weaponObj + 8, sniperDef);
+                def = sniperDef;
+            }
+        }
+        else if (def && fakeScope)
+        {
+            // Test aid: turn the current weapon into a scope-type weapon (type 0x15, zoom 2.5..9) to exercise aim mode 2.
+            wr32(const_cast<uint8_t *>(rdram), def + 0x10, 0x15u);
+            wrf(const_cast<uint8_t *>(rdram), def + 0x178, 2.5f);
+            wrf(const_cast<uint8_t *>(rdram), def + 0x17C, 9.0f);
+            wrf(const_cast<uint8_t *>(rdram), def + 0x180, 1.0f);
+        }
+        if (!on)
+            return;
+        static bool swept = false;
+        if (def && !swept && std::getenv("KZ_SWEEP_WEAPONS"))
+        {
+            swept = true;
+            const uint32_t vt = rd32(rdram, def);
+            std::printf("[kz-weapdefs] vtable 0x%x, current def 0x%x\n", vt, def);
+            for (uint32_t a = 0x100000; a < 0x02000000; a += 4)
+                if (rd32(rdram, a) == vt)
+                {
+                    const uint32_t t = rd32(rdram, a + 0x10);
+                    if (t < 64)
+                    {
+                        char name[24] = {};
+                        const uint32_t np = rd32(rdram, a + 0x8);
+                        std::printf("[kz-weapdefs] def 0x%x type=%u canZoom=%u zmin=%.2f zmax=%.2f ztime=%.2f w4=0x%x w8=0x%x wC=0x%x w14=0x%x name=%.20s\n", a, t,
+                                    rd32(rdram, a + 0x20) & 0xFF, rdf(rdram, a + 0x178), rdf(rdram, a + 0x17C), rdf(rdram, a + 0x180),
+                                    rd32(rdram, a + 4), np, rd32(rdram, a + 0xC), rd32(rdram, a + 0x14),
+                                    (np > 0x1000 && np < 0x02000000) ? reinterpret_cast<const char *>(rdram + np) : "");
+                    }
+                }
+        }
+        const uint32_t key = rd32(rdram, ctl + 0x454) * 1000003u + def;
+        if ((++n % 60) != 0 && key == lastKey)
+            return;
+        lastKey = key;
+        std::printf("[kz-scope] mode=%u zoom=%.3f prev=%.3f camFov=%.3f camAspect=%.4f far=%.1f off164=%.4f off168=%.4f def=0x%x type=%u canZoom=%u zmin=%.3f zmax=%.3f ztime=%.3f\n",
+                    rd32(rdram, ctl + 0x454), rdf(rdram, ctl + 0x44C), rdf(rdram, ctl + 0x450), cam ? rdf(rdram, cam + 0x70) : 0.0f,
+                    cam ? rdf(rdram, cam + 0x74) : 0.0f, cam ? rdf(rdram, cam + 0x6C) : 0.0f, rdf(rdram, player + 0x164),
+                    rdf(rdram, player + 0x168), def, def ? rd32(rdram, def + 0x10) : 0u, def ? (rd32(rdram, def + 0x20) & 0xFF) : 0u,
+                    def ? rdf(rdram, def + 0x178) : 0.0f, def ? rdf(rdram, def + 0x17C) : 0.0f, def ? rdf(rdram, def + 0x180) : 0.0f);
+    }
+
     void ctrlUpdate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
+        if (g_modeSwapCtl) // safety: the restore at 0x218710 did not run (the player update ended early)
+        {
+            wr32(rdram, g_modeSwapCtl + 0x454, 2u);
+            g_modeSwapCtl = 0;
+        }
         const uint32_t ra = getRegU32(ctx, 31);
         const uint32_t ctrl = getRegU32(ctx, 4);
         const bool local = ctx->pc == kCtrlUpdate && rd32(rdram, ctrl + 0x1C) == 0u;
@@ -172,6 +272,7 @@ namespace
                 std::printf("[kz-mtc] dt=%.5f heading=%.5f\n", g_ctrlDt, rdf(rdram, rd32(rdram, player + 0x31C) + 0x78));
         }
         const uint32_t ctl = rd32(rdram, player + 0x31C);
+        probeScope(rdram, player, ctl);
         const float zoom = rdf(rdram, ctl + 0x44C);
         const float turnSpeed = (zoom > 0.01f) ? rdf(rdram, ctl + 0x190) / zoom : 0.0f; // rad/s at turn value 1
         const float dt = g_ctrlDt;
@@ -232,13 +333,44 @@ namespace
             if (matrix)
             {
                 const uint32_t ctl = rd32(rdram, g_player + 0x31C);
-                std::printf("[kz-mtx] mode=%u dt=%.5f turn=%.4f rateA8=%.4f heading=%.5f\n", rd32(rdram, ctl + 0x454), dt,
-                            rdf(rdram, g_ctrl + 0x3C), rate, rdf(rdram, ctl + 0x78));
+                std::printf("[kz-mtx] mode=%u zoom=%.3f dt=%.5f turn=%.4f rateA8=%.4f heading=%.5f off164=%.5f off168=%.5f pitch=%.5f\n",
+                            rd32(rdram, ctl + 0x454), rdf(rdram, ctl + 0x44C), dt, rdf(rdram, g_ctrl + 0x3C), rate,
+                            rdf(rdram, ctl + 0x78), rdf(rdram, g_player + 0x164), rdf(rdram, g_player + 0x168),
+                            rdf(rdram, g_player + 0x14C));
             }
         }
+        const uint32_t ra = getRegU32(ctx, 31);
         g_origApplyLook(rdram, ctx, rt);
         if (kbm)
             rdram[lagFlag] = savedFlag;
+        // Scope-type weapons (aim mode 2, e.g. the sniper rifle): right after ApplyLook the player update runs a reticle
+        // block that treats the turn value as a stick deflection, keeps a reticle offset (player+0x164/0x168) that tracks
+        // the stick, swallows the turn inside 45 % of the half field of view and rescales it beyond. A mouse turn command
+        // is not a stick position, so small moves vanished into the offset and the view sprang back, and big moves were
+        // clamped and rescaled. With keyboard/mouse the block is skipped: the player update sees mode 1 for that stretch
+        // (reticle offsets are then written as 0 and the turn value passes through like unzoomed), and the real mode is
+        // put back at the next call it makes (0x218710).
+        static const bool fix = !(std::getenv("KZ_SCOPE_FIX") && std::getenv("KZ_SCOPE_FIX")[0] == '0');
+        if (fix && kbm && ctx->pc == ra)
+        {
+            const uint32_t ctl = rd32(rdram, g_player + 0x31C);
+            if (ctl && rd32(rdram, ctl + 0x454) == 2u)
+            {
+                wr32(rdram, ctl + 0x454, 1u);
+                g_modeSwapCtl = ctl;
+            }
+        }
+    }
+
+    // First call after the scope block of the player update: put aim mode 2 back (see applyLook).
+    void afterLook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
+    {
+        if (g_modeSwapCtl)
+        {
+            wr32(rdram, g_modeSwapCtl + 0x454, 2u);
+            g_modeSwapCtl = 0;
+        }
+        g_origAfterLook(rdram, ctx, rt);
     }
 
     void pitchAutoCentre(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
@@ -341,6 +473,7 @@ void kzAimInstall(PS2Runtime &runtime)
     g_log = std::getenv("KZ_AIM_LOG") != nullptr;
     const bool ok = hook(runtime, kCtrlUpdate, &ctrlUpdate, g_origCtrlUpdate) &&
                     hook(runtime, kApplyLook, &applyLook, g_origApplyLook) &&
-                    hook(runtime, kPitchAutoCentre, &pitchAutoCentre, g_origPitchAutoCentre);
+                    hook(runtime, kPitchAutoCentre, &pitchAutoCentre, g_origPitchAutoCentre) &&
+                    hook(runtime, kAfterLookProbe, &afterLook, g_origAfterLook);
     std::printf("[kz] mouse aim patch: %s\n", ok ? "installed" : "FAILED (mouse drives the right stick)");
 }
