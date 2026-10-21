@@ -1,6 +1,7 @@
 #include "kz_patches.h"
 
 #include "kz_config.h"
+#include "kz_devtools.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,7 @@ namespace
 
 void kzPatchesApply(uint8_t *rdram, const KzConfig &cfg)
 {
+    kzDevOnVsync(rdram);
     static const bool disabled = std::getenv("KZ_NO_PATCHES") != nullptr; // debugging
     if (!rdram || disabled)
         return;
