@@ -119,7 +119,9 @@ namespace
     {
         static std::chrono::steady_clock::time_point nextPulse{};
         static int attempts = 0;
-        if (!kzConfig().holdAim)
+        // A gamepad keeps the original toggle on R3: the setting is for the mouse/keyboard zoom key only. (Applied to a
+        // pad it pulsed R3 off again right after the player toggled zoom on, so the pad had to hold R3: issue #6.)
+        if (!kzConfig().holdAim || !kzInputUsingKeyboardMouse())
             return;
         const uint32_t mode = rd32(rdram, ctl + 0x454);
         if (mode > 2u)
