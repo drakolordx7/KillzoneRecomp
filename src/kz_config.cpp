@@ -127,6 +127,7 @@ KzConfig kzLoadConfig(const std::filesystem::path &path)
     if (auto v = get("Input.InvertY")) c.invertY = parseBool(*v, c.invertY);
     if (auto v = get("Input.RawMouse")) c.rawMouse = parseBool(*v, c.rawMouse);
     if (auto v = get("Input.AimMode")) c.holdAim = _stricmp(v->c_str(), "Toggle") != 0;
+    if (auto v = get("Input.SprintMode")) c.toggleSprint = _stricmp(v->c_str(), "Toggle") == 0;
     if (auto v = get("Input.StickDeadzone")) c.stickDeadzone = std::clamp(static_cast<float>(std::atof(v->c_str())), 0.0f, 0.9f);
     if (auto v = get("Audio.MasterVolume")) c.masterVolume = std::clamp(std::atoi(v->c_str()), 0, 100);
     if (auto v = get("Game.SkipIntro")) c.skipIntro = parseBool(*v, c.skipIntro);
@@ -149,6 +150,7 @@ bool kzSaveConfig(const std::filesystem::path &path, const KzConfig &c)
       << "\nRenderDistance=" << c.renderDistance << "\nLodScale=" << c.lodScale << "\n\n"
       << "[Input]\nMouseSensitivity=" << c.mouseSensitivity << "\nInvertY=" << (c.invertY ? 1 : 0)
       << "\nRawMouse=" << (c.rawMouse ? 1 : 0) << "\nAimMode=" << (c.holdAim ? "Hold" : "Toggle")
+      << "\nSprintMode=" << (c.toggleSprint ? "Toggle" : "Hold")
       << "\nStickDeadzone=" << c.stickDeadzone << "\n\n"
       << "[Audio]\nMasterVolume=" << c.masterVolume << "\n\n"
       << "[Game]\nSkipIntro=" << (c.skipIntro ? 1 : 0) << "\n\n"

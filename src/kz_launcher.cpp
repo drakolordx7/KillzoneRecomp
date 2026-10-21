@@ -395,6 +395,8 @@ namespace
                         ImGui::SliderFloat("##sens", &cfg.mouseSensitivity, 0.1f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
                         toggleRow("Invert vertical look", nullptr, cfg.invertY);
                         toggleRow("Aim", "Right mouse button by default.", cfg.holdAim, "Hold to aim", "Press to toggle (as on PS2)");
+                        toggleRow("Sprint", "Left Shift / L3. Toggle: press once, sprint stops when you stop moving or press again. Also applies to controllers.",
+                                  cfg.toggleSprint, "Press to toggle", "Hold to sprint (as on PS2)");
                         ImGui::EndTable();
                     }
                     section("Controller");
