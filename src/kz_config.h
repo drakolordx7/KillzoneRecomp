@@ -67,6 +67,9 @@ struct KzConfig
     // Audio
     int masterVolume = 100; // 0..100
 
+    // Game
+    bool skipIntro = false; // skip the boot intro movie (story cutscenes still play)
+
     // Paths
     std::string isoPath; // user's Killzone (USA) disc image
 
