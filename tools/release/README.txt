@@ -39,7 +39,6 @@ Your saves are in disc\mc0 next to killzone.exe. Keep that folder (and killzone.
 a newer build: copy the new files over the old ones.
 
 Known problems in this build
-- Sniper scope: the crosshair snaps back to the centre, and the view jumps if you move the mouse hard.
 - The game can lock up on level 2, around the second sniper.
 - Frame rate: about 120 fps at the start of the first mission on a fast PC, but busy fights drop lower
   and there is some stutter.
