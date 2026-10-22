@@ -341,19 +341,18 @@ namespace
                             rdf(rdram, g_player + 0x14C));
             }
         }
-        const uint32_t ra = getRegU32(ctx, 31);
-        g_origApplyLook(rdram, ctx, rt);
-        if (kbm)
-            rdram[lagFlag] = savedFlag;
         // Scope-type weapons (aim mode 2, e.g. the sniper rifle): right after ApplyLook the player update runs a reticle
         // block that treats the turn value as a stick deflection, keeps a reticle offset (player+0x164/0x168) that tracks
         // the stick, swallows the turn inside 45 % of the half field of view and rescales it beyond. A mouse turn command
         // is not a stick position, so small moves vanished into the offset and the view sprang back, and big moves were
-        // clamped and rescaled. With keyboard/mouse the block is skipped: the player update sees mode 1 for that stretch
+        // clamped and rescaled. With keyboard/mouse the block is skipped: the player update sees mode 1 from here on
         // (reticle offsets are then written as 0 and the turn value passes through like unzoomed), and the real mode is
-        // put back at the next call it makes (0x218710).
+        // put back at the next call it makes after the block (0x218710). The swap is made before ApplyLook, not after it:
+        // when the guest yields inside ApplyLook this wrapper returns early and the rest of the update runs without it, so
+        // a swap after the call was skipped for that frame (reticle offset back for a frame under load). ApplyLook itself
+        // reads the mode only to choose "no camera lag", which the cleared lag flag above already selects with the mouse.
         static const bool fix = !(std::getenv("KZ_SCOPE_FIX") && std::getenv("KZ_SCOPE_FIX")[0] == '0');
-        if (fix && kbm && ctx->pc == ra)
+        if (fix && kbm)
         {
             const uint32_t ctl = rd32(rdram, g_player + 0x31C);
             if (ctl && rd32(rdram, ctl + 0x454) == 2u)
@@ -362,6 +361,9 @@ namespace
                 g_modeSwapCtl = ctl;
             }
         }
+        g_origApplyLook(rdram, ctx, rt);
+        if (kbm)
+            rdram[lagFlag] = savedFlag;
     }
 
     // First call after the scope block of the player update: put aim mode 2 back (see applyLook).
