@@ -388,12 +388,22 @@ namespace
         return static_cast<uint8_t>(std::lround(127.5f + v * 127.5f));
     }
 
-    float applyDeadzone(float v, float dz)
+    // One stick from a modern controller to the range of a DualShock 2. The dead zone is radial (an axis-wise dead zone
+    // also slowed diagonals). Modern sticks report a circle, so a full diagonal is only 0.71 per axis; a DualShock 2 reaches
+    // nearly full on both axes in the corners, and Killzone cubes the stick value, so a diagonal walked or turned at about
+    // a third of full speed (GitHub issue #11). Scaling by `range` (default 1.33, PCSX2's recommendation for modern pads)
+    // and clamping each axis gives the PS2 pad's square-ish range; straight pushes are unchanged (clamped at 1).
+    void stickToPs2(float x, float y, float dz, float range, float &ox, float &oy)
     {
-        const float a = std::fabs(v);
-        if (a <= dz)
-            return 0.0f;
-        return std::copysign((a - dz) / (1.0f - dz), v);
+        const float m = std::sqrt(x * x + y * y);
+        if (m <= dz || m <= 0.0f)
+        {
+            ox = oy = 0.0f;
+            return;
+        }
+        const float k = std::min(1.0f, (m - dz) / (1.0f - dz)) / m * range;
+        ox = std::clamp(x * k, -1.0f, 1.0f);
+        oy = std::clamp(y * k, -1.0f, 1.0f);
     }
 
     // Compose the 32-byte DualShock 2 reply from current state. Caller holds the mutex.
@@ -431,10 +441,14 @@ namespace
         if (now < s.pulseUntil)
             pressed |= s.pulseMask;
         const float dz = kzConfig().stickDeadzone;
-        lx += applyDeadzone(s.lx, dz);
-        ly += applyDeadzone(s.ly, dz);
-        float rx = applyDeadzone(s.rx, dz) + mx;
-        float ry = applyDeadzone(s.ry, dz) + my;
+        const float range = kzConfig().stickRange;
+        float plx, ply, prx, pry;
+        stickToPs2(s.lx, s.ly, dz, range, plx, ply);
+        stickToPs2(s.rx, s.ry, dz, range, prx, pry);
+        lx += plx;
+        ly += ply;
+        float rx = prx + mx;
+        float ry = pry + my;
         if (!s.aimPatchActive)
         {
             // Fallback until the engine aim patch is active: mouse counts per pad read -> right stick deflection.

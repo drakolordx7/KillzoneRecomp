@@ -67,6 +67,8 @@ struct KzConfig
     bool holdAim = true;     // hold the zoom key to aim (the game's own zoom is a toggle)
     bool toggleSprint = false; // press sprint once to keep sprinting (the original is hold-to-sprint)
     float stickDeadzone = 0.15f;
+    float stickRange = 1.33f; // stick scale before clamping each axis: modern pads report a circle, a DualShock 2 reaches
+                              // (almost) full on both axes in the corners; 1.33 is PCSX2's recommendation for modern pads
 
     // Audio
     int masterVolume = 100; // 0..100

@@ -407,6 +407,8 @@ namespace
                     {
                         row("Stick dead zone", "Controllers are detected automatically (PS2 layout).");
                         ImGui::SliderFloat("##deadzone", &cfg.stickDeadzone, 0.0f, 0.5f, "%.2f");
+                        row("Stick range", "1.33 gives full speed on diagonals like a PS2 pad. 1.00 = the controller's raw circle.");
+                        ImGui::SliderFloat("##range", &cfg.stickRange, 1.0f, 1.5f, "%.2f");
                         ImGui::EndTable();
                     }
                     section("Keys");
