@@ -358,7 +358,10 @@ int main(int argc, char *argv[])
         kzAimInstall(runtime);
         kzTimeFixInstall(runtime);
         kzPostInstall(runtime);
-        kzWideInstall(runtime);
+        // Ultrawide hooks only when an ultrawide aspect is chosen (or forced for tests): other aspects keep the game's own path.
+        if (cfg.aspect == KzAspect::UltrawideAuto || cfg.aspect == KzAspect::Ultrawide21x9 || cfg.aspect == KzAspect::Ultrawide32x9 ||
+            std::getenv("KZ_WIDE_ASPECT"))
+            kzWideInstall(runtime);
         kzMoviesInstall(runtime);
         // Tests: a separate (e.g. empty) memory card folder. After loadELF, which resets the roots to the ELF folder.
         if (const char *mc = std::getenv("KZ_MC_ROOT"); mc && *mc)
