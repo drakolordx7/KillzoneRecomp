@@ -540,15 +540,28 @@ namespace
         static const bool presentAll = std::getenv("KZ_GS_PRESENT_ALL") && std::getenv("KZ_GS_PRESENT_ALL")[0] == '1';
         static uint8_t lastDisplayRegs[0xF0] = {};
         static bool presentedOnce = false;
-        const bool newPackets = g_packetsSinceVsync.exchange(0, std::memory_order_relaxed) != 0;
+        // This runs on the VIF1/GIF worker and the EE waits for that worker (every VIF register write in the vblank handler
+        // is a barrier), so it must never wait for the GS thread: when Present is slow (an external frame limiter such as
+        // RTSS sleeps inside it, or a display slower than the guest vblank rate) a blocking kzgsVsync stalled the whole EE and
+        // the loading screen crawled or hung (issue #9). A busy GS drops this vblank's presentation; the next one shows the
+        // newest frame (the packets and register changes stay pending). KZ_GS_BLOCK=1 restores the blocking throttle.
+        static const bool blockingThrottle = std::getenv("KZ_GS_BLOCK") && std::getenv("KZ_GS_BLOCK")[0] == '1';
+        const bool newPackets = g_packetsSinceVsync.load(std::memory_order_relaxed) != 0;
         const bool regsChanged = std::memcmp(lastDisplayRegs, s.privRegs, sizeof(lastDisplayRegs)) != 0;
         bool didPresent = false;
         if (presentAll || !presentedOnce || newPackets || regsChanged)
         {
-            didPresent = true;
-            std::memcpy(lastDisplayRegs, s.privRegs, sizeof(lastDisplayRegs));
-            presentedOnce = true;
-            kzgsVsync(field, regsChanged || !presentedOnce, job->wide);
+            const bool firstPresent = !presentedOnce;
+            if (blockingThrottle)
+                kzgsVsync(field, regsChanged || firstPresent, job->wide), didPresent = true;
+            else
+                didPresent = kzgsVsyncTry(field, regsChanged || firstPresent, job->wide);
+            if (didPresent)
+            {
+                g_packetsSinceVsync.store(0, std::memory_order_relaxed);
+                std::memcpy(lastDisplayRegs, s.privRegs, sizeof(lastDisplayRegs));
+                presentedOnce = true;
+            }
         }
         if (didPresent)
             ++s.presentedSeq;

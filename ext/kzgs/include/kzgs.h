@@ -123,6 +123,12 @@ void kzgsGifTransfer(int path, const uint8_t* data, uint32_t qwords);
 // frames are stretched to that aspect ratio, other frames use KzgsConfig::aspect (pillarboxed in a wider window).
 void kzgsVsync(int field, bool regsWritten = true, bool wide = false);
 
+// Non-blocking kzgsVsync() for callers that must not stall (the VIF1/GIF worker, which the EE waits for): when the GS thread
+// still has more than maxQueuedFrames frames to finish (slow Present: an external frame limiter, a display slower than the
+// guest vblank rate) nothing is queued and false is returned: the caller keeps its pending state and tries again at the
+// next vblank. At most one thread may call kzgsVsync/kzgsVsyncTry.
+bool kzgsVsyncTry(int field, bool regsWritten = true, bool wide = false);
+
 // Aspect ratio (width / height, e.g. 64.0f / 27.0f) that wide frames are presented at; 0 = off (every frame uses KzgsConfig::aspect).
 void kzgsSetWideRatio(float ratio);
 
