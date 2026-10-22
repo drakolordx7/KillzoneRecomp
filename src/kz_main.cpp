@@ -33,6 +33,7 @@ extern "C" int __llvm_profile_write_file(void);
 #endif
 #include <windows.h>
 #include <cstdio>
+#include <io.h>
 
 #include <algorithm>
 #include <chrono>
@@ -192,8 +193,12 @@ namespace
         std::filesystem::rename(log, kzConfigPath().parent_path() / "killzone.prev.log", ec);
         if (!std::freopen(log.string().c_str(), "w", stdout))
             return false;
-        std::freopen(log.string().c_str(), "a", stderr);
-        std::setvbuf(stdout, nullptr, _IOLBF, 4096);
+        // stderr shares stdout's file handle (one file position): a second handle opened in append mode let stdout's
+        // flushes overwrite what stderr had appended.
+        _dup2(_fileno(stdout), _fileno(stderr));
+        // Both unbuffered: the log must survive a hang or a kill. (The Microsoft CRT treats _IOLBF as fully buffered, so
+        // a line-buffered stdout held up to 4 KB back, and the lines just before a hang are the ones that matter.)
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
         std::setvbuf(stderr, nullptr, _IONBF, 0);
         std::ios::sync_with_stdio(true);
         // A console that exists only for this process (double-click start) is not needed any more.

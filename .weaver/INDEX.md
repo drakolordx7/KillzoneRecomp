@@ -8,3 +8,10 @@
 - STATUS.md / CHANGELOG.md: project snapshot and per-batch changes.
 - disasm.py: MIPS disassembly of SCUS_974.02 (capstone): python .weaver\disasm.py 0x16e420 [count]. Shows which float/int registers a function takes (Ghidra's signatures are often wrong).
 - crlf_edit.py: edit()/edit_inline() helpers for exact text edits that keep a file's CRLF/LF endings (several src files are CRLF or mixed). Do not write backslash-n inside a bash heredoc string: the shell tool turns it into a real newline.
+- wide_check.py: ultrawide flicker checker for KZ_SHOT_BURST_PRESENT=2 captures (gb_*.png): classifies each presented frame wide / stretched / pillarbox (HUD ammo-digit template), or with --static finds frames that differ from the burst median in a motionless scene; --expect-wide prints BAD frames and PASS/FAIL. python .weaver\wide_check.py <dir> [--expect-wide|--static] [--keep-bad] [-v]
+- uw_run.ps1: level 2 gameplay at 21:9 with scripted walking (or -Idle: motionless), bursts of 48 consecutive presented frames, then wide_check.py: .weaver\uw_run.ps1 -Name x -Fps 120 [-Vsync 1 -Fifo 144] [-Idle] [-EnvSet "A=1|B=2"] [-Seconds 330 -From 170]
+- uw_ab.ps1: issue #10 A/B without images: per fps/vsync case counts the world views built with the wrong aspect in frames flagged wide (KZ_WIDE_LOG viewbuild trace); KZ_WIDE_DEFER=0 old behaviour, 1 fixed: .weaver\uw_ab.ps1 -Cases "60,1,60;144,0," -Defer 0,1
+- i4run.ps1: issue #4 headless run from a fresh copy of the reporter card (work\saves\issue4_reporter\mc0), menu path Start/Game/Campaign/profile/Continue; -Script extra input, -EnvSet, -Extra (e.g. "--sample 10"), -ExeDir.
+- i4hunt.ps1: repeats i4run (walk forward + KZ_KILLALL clears the waves + PS2X_HEARTBEAT_THREADS=1) until the vif counter stalls; logs work\i4h_N.
+- closetest.py: start the game on a private desktop, close its window (Alt+F4 equivalent) and check killzone.log kept every line.
+- capmatrix.py / capmatrix_all.py (wip branch): runs under an emulated external frame cap (KZ_TEST_PRESENT_FPS etc.), issue #9.

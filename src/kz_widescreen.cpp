@@ -35,6 +35,7 @@ namespace
     constexpr uint32_t kBufferIndex = 0x0055A6B4u;
     constexpr uint32_t kText = 0x00167718u;
     constexpr uint32_t kRect = 0x0015CF60u;
+    constexpr uint32_t kViewBuild = 0x003C8E70u; // builds the render camera's planes/matrices from the view struct that 0x1C1960 filled (trace only)
     constexpr float kFrameWidth = 512.0f; // viewport of the render context (0x559118 -> scratchpad 0x70003A00, +0x10..+0x1C)
     constexpr float kNativeAspect = 16.0f / 9.0f;
 
@@ -49,9 +50,22 @@ namespace
     bool g_built = false; // something was drawn since the last limiter call
     std::atomic<bool> g_latched{false};
     bool g_inViewmodel = false;
+    // Wrappers that change something around a call of the original and undo it afterwards are only correct when the original ran to its end.
+    // The guest yields at call checkpoints (vblank handler, thread switches: 100+ per second), the original then returns at once with
+    // ctx->pc somewhere inside the function (or at a callee it was about to call) and continues later through the function table, not through
+    // the wrapper. Undoing the change right then lets the rest of the call run unmodified: 0x1C1960 yielded before it had built the view
+    // from the camera in a few percent of the frames, which were then built with the 16:9 camera and presented stretched (GitHub issue
+    // #10, a flicker between the widened and the stretched 16:9 world). A change is therefore only undone at once when the call completed
+    // (ctx->pc == $ra) and otherwise stays pending until the next hook that runs after the call has finished (flushPending).
+    uint32_t g_pendCam = 0; // camera object whose aspect (+0x74) is still widened
+    float g_pendCamAspect = 0.0f;
+    uint32_t g_pendScale = 0; // text scale pointer whose x scale is still divided
+    float g_pendScaleValue = 0.0f;
+    uint32_t g_yields = 0;
+    bool g_defer = true; // KZ_WIDE_DEFER=0: undo at once even after a yield (the behaviour before the issue #10 fix, for A/B runs)
     float g_k = 1.0f; // aspect factor of the widened view, valid while g_worldWide
 
-    PS2Runtime::RecompiledFunction g_origWorld = nullptr, g_origViewmodel = nullptr, g_origFrustum = nullptr, g_origOrtho = nullptr, g_origKick = nullptr, g_origText = nullptr, g_origLimiter = nullptr, g_origRect = nullptr;
+    PS2Runtime::RecompiledFunction g_origViewBuild = nullptr, g_origWorld = nullptr, g_origViewmodel = nullptr, g_origFrustum = nullptr, g_origOrtho = nullptr, g_origKick = nullptr, g_origText = nullptr, g_origLimiter = nullptr, g_origRect = nullptr;
 
     uint32_t rd32(const uint8_t *rdram, uint32_t a)
     {
@@ -67,6 +81,21 @@ namespace
     }
     void wrF(uint8_t *rdram, uint32_t a, float v) { std::memcpy(rdram + (a & kRamMask), &v, 4); }
     bool ramPtr(uint32_t a) { return a >= 0x00100000u && a < 0x02000000u; }
+
+    void flushPending(uint8_t *rdram)
+    {
+        if (g_pendCam)
+        {
+            wrF(rdram, g_pendCam + 0x74, g_pendCamAspect);
+            g_pendCam = 0;
+        }
+        if (g_pendScale)
+        {
+            wrF(rdram, g_pendScale, g_pendScaleValue);
+            g_pendScale = 0;
+        }
+        g_inViewmodel = false;
+    }
 
     float factor()
     {
@@ -88,6 +117,7 @@ namespace
         bool widened = false;
         if (entry)
         {
+            flushPending(rdram);
             logEv("world", rd32(rdram, 0x0055A6B4u), 0.0f);
             const float k = factor();
             if (k > 1.0f && ramPtr(cam))
@@ -102,9 +132,32 @@ namespace
                 }
             }
         }
+        const uint32_t ra = getRegU32(ctx, 31);
         g_origWorld(rdram, ctx, rt);
         if (widened)
-            wrF(rdram, cam + 0x74, saved);
+        {
+            if (ctx->pc == ra || !g_defer)
+                wrF(rdram, cam + 0x74, saved);
+            else // the guest yielded inside: the camera stays widened until the call has really finished
+            {
+                g_pendCam = cam;
+                g_pendCamAspect = saved;
+                ++g_yields;
+                logEv("world-yield", ctx->pc, 1.0f);
+            }
+        }
+    }
+
+    void viewBuild(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
+    {
+        const uint32_t s = getRegU32(ctx, 5);
+        if (g_log && ctx->pc == kViewBuild && getRegU32(ctx, 31) == 0x001C1A64u && ramPtr(s))
+        {
+            // struct +0x30..0x3C = left, right, top, bottom of the view window at the near plane: (right - left) / (top - bottom) is the aspect
+            const float w = rdF(rdram, s + 0x34) - rdF(rdram, s + 0x30), h = rdF(rdram, s + 0x38) - rdF(rdram, s + 0x3C);
+            std::printf("[kz-wide] viewbuild wide=%d aspect=%.4f\n", g_worldWide ? 1 : 0, h != 0.0f ? w / h : 0.0f);
+        }
+        g_origViewBuild(rdram, ctx, rt);
     }
 
     void viewmodel(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
@@ -112,11 +165,13 @@ namespace
         const bool entry = ctx->pc == kViewmodel;
         if (entry)
         {
+            flushPending(rdram);
             logEv("viewmodel");
             g_inViewmodel = g_worldWide;
         }
+        const uint32_t ra = getRegU32(ctx, 31);
         g_origViewmodel(rdram, ctx, rt);
-        if (entry)
+        if (entry && (ctx->pc == ra || !g_defer)) // when it yielded inside, the flag stays set until the next flush
             g_inViewmodel = false;
     }
 
@@ -135,6 +190,7 @@ namespace
     {
         if (ctx->pc == kOrtho)
         {
+            flushPending(rdram);
             g_built = true;
             // The render context lives in scratchpad (0x70003A00), so the viewport width is not read: the frame is 512 wide.
             const float vw = kFrameWidth;
@@ -154,6 +210,9 @@ namespace
     void text(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
         const uint32_t scalePtr = getRegU32(ctx, 4);
+        const uint32_t ra = getRegU32(ctx, 31);
+        if (ctx->pc == kText && g_pendScale)
+            flushPending(rdram); // a previous string yielded in the middle: its scale is put back first
         const bool apply = ctx->pc == kText && g_worldWide && ramPtr(scalePtr);
         float savedScale = 0.0f;
         if (apply)
@@ -165,11 +224,23 @@ namespace
         }
         g_origText(rdram, ctx, rt);
         if (apply)
-            wrF(rdram, scalePtr, savedScale);
+        {
+            if (ctx->pc == ra || !g_defer)
+                wrF(rdram, scalePtr, savedScale);
+            else // yielded inside the string: the rest of it still needs the compressed scale
+            {
+                g_pendScale = scalePtr;
+                g_pendScaleValue = savedScale;
+            }
+        }
     }
 
     void limiter(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
+        if (ctx->pc == kLimiter)
+            flushPending(rdram);
+        if (ctx->pc == kLimiter)
+            logEv("limiter", (rd32(rdram, kBufferIndex) & 1u) | (g_built ? 0x10u : 0u) | (g_worldWide ? 0x100u : 0u));
         if (ctx->pc == kLimiter && g_built)
         {
             g_built = false;
@@ -280,6 +351,7 @@ bool kzWideTakeFrameFlag() { return g_latched.load(std::memory_order_relaxed); }
 void kzWideInstall(PS2Runtime &runtime)
 {
     g_log = std::getenv("KZ_WIDE_LOG") != nullptr;
+    g_defer = !(std::getenv("KZ_WIDE_DEFER") && std::getenv("KZ_WIDE_DEFER")[0] == '0');
     if (const char *v = std::getenv("KZ_WIDE_ASPECT")) // automation: view aspect ratio of the widened frames
         kzWideSetTargetAspect(static_cast<float>(std::atof(v)));
     const bool ok = hook(runtime, kWorld, &world, g_origWorld) && hook(runtime, kViewmodel, &viewmodel, g_origViewmodel) &&
@@ -287,6 +359,7 @@ void kzWideInstall(PS2Runtime &runtime)
                     hook(runtime, kKick, &kick, g_origKick) && hook(runtime, kLimiter, &limiter, g_origLimiter) && hook(runtime, kText, &text, g_origText) && hook(runtime, kRect, &rect, g_origRect);
     if (g_log)
     {
+        hook(runtime, kViewBuild, &viewBuild, g_origViewBuild);
         traceInstall<0>(runtime, 0x001C0148u, "renderframe");
         traceInstall<1>(runtime, 0x0026B340u, "hud");
         traceInstall<2>(runtime, 0x001EF640u, "postfx");

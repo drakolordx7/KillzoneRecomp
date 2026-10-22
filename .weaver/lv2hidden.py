@@ -10,12 +10,14 @@ args = sys.argv[1:]
 name, seconds = args[0], float(args[1])
 level, exe_dir, extra = 2, r'D:\KillzoneRecomp\build\agentw', ''
 env = {}
+sample = []
 i = 2
 while i < len(args):
     a = args[i]
     if a == '--level': level = int(args[i + 1]); i += 2
     elif a == '--exe': exe_dir = args[i + 1]; i += 2
     elif a == '--script': extra = args[i + 1]; i += 2
+    elif a == '--sample': sample = ['--sample', args[i + 1]]; i += 2  # stack sampler -> <exe dir>\work\stacks.txt
     else:
         k, v = a.split('=', 1); env[k] = v; i += 1
 mc = r'D:\KillzoneRecomp\work\saves\%s_mc' % name
@@ -31,7 +33,7 @@ os.environ.update({'KZ_IPU': 'off', 'KZ_MC_ROOT': mc, 'KZ_INPUT_SCRIPT': s, 'KZ_
 os.environ.update(env)
 os.environ.pop('PS2X_HEADLESS', None)
 iso = r'C:\Users\drakolord\Downloads\Killzone (USA)\Killzone (USA).iso'
-p = HiddenProcess(os.path.join(exe_dir, 'killzone.exe'), ['--no-launcher', '--iso', iso], exe_dir, desktop='kz_hidden_run_' + name)
+p = HiddenProcess(os.path.join(exe_dir, 'killzone.exe'), ['--no-launcher', '--iso', iso] + sample, exe_dir, desktop='kz_hidden_run_' + name)
 t0 = time.time()
 while time.time() - t0 < seconds and p.alive():
     time.sleep(2)
