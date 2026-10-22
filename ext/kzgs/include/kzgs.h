@@ -118,7 +118,13 @@ void kzgsGifTransfer(int path, const uint8_t* data, uint32_t qwords);
 // window. `field` is the interlace field being displayed (0 = even, 1 = odd; PCSX2 derives it from !(CSR & 0x2000)).
 // `regsWritten` = whether the game wrote any privileged register since the last vsync (PCSX2 uses it to decide whether
 // an idle frame still needs presenting; pass true if unsure).
-void kzgsVsync(int field, bool regsWritten = true);
+//
+// `wide`: the frame was drawn for an ultrawide display (3D view widened by the caller). With a wide ratio set by kzgsSetWideRatio such
+// frames are stretched to that aspect ratio, other frames use KzgsConfig::aspect (pillarboxed in a wider window).
+void kzgsVsync(int field, bool regsWritten = true, bool wide = false);
+
+// Aspect ratio (width / height, e.g. 64.0f / 27.0f) that wide frames are presented at; 0 = off (every frame uses KzgsConfig::aspect).
+void kzgsSetWideRatio(float ratio);
 
 // Write to GS CSR (0x12001000). Only the RESET bit (bit 9) has an effect on the GS itself.
 void kzgsWriteCSR(uint32_t csr);

@@ -20,6 +20,7 @@ extern "C" int __llvm_profile_write_file(void);
 #include "kz_ipu.h"
 #include "kz_aim.h"
 #include "kz_post.h"
+#include "kz_widescreen.h"
 #include "kz_movies.h"
 #include "kz_timefix.h"
 #include "runtime/ps2_host_arena.h"
@@ -336,7 +337,7 @@ int main(int argc, char *argv[])
         const bool cpuGs = std::getenv("KZ_GS") && std::strcmp(std::getenv("KZ_GS"), "cpu") == 0; // debug: software GS
         if (cpuGs)
             std::cout << "[kz] KZ_GS=cpu: using the runtime's software GS (PS2X_HEADLESS_SHOTS for frames)" << std::endl;
-        else if (!kzGsAttach(runtime, hwnd, winH, cfg, &gsError))
+        else if (!kzGsAttach(runtime, hwnd, winH, cfg, &gsError, winW))
         {
             const std::string msg = "Could not start the renderer: " + gsError;
             std::cerr << "[kz] " << msg << std::endl;
@@ -357,6 +358,7 @@ int main(int argc, char *argv[])
         kzAimInstall(runtime);
         kzTimeFixInstall(runtime);
         kzPostInstall(runtime);
+        kzWideInstall(runtime);
         kzMoviesInstall(runtime);
         // Tests: a separate (e.g. empty) memory card folder. After loadELF, which resets the roots to the ELF folder.
         if (const char *mc = std::getenv("KZ_MC_ROOT"); mc && *mc)

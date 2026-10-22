@@ -358,6 +358,31 @@ namespace
 	// ---------------------------------------------------------------------------------------------------------------
 	// GS thread
 	// ---------------------------------------------------------------------------------------------------------------
+	// Ultrawide: frames the caller flags as wide (the 3D world was drawn with a widened camera) are presented stretched to the
+	// custom aspect ratio s_wide_ratio (PCSX2's RAuto4_3_3_2 with CurrentCustomAspectRatio); all other frames (menus, movies) use the
+	// configured aspect, so they are pillarboxed in a wider window.
+	static std::atomic<float> s_wide_ratio{0.0f};
+	static void ApplyFrameAspect(bool wide)
+	{
+		const float ratio = s_wide_ratio.load(std::memory_order_relaxed);
+		static int s_dbg_n = 0, s_dbg_w = 0;
+		static const bool s_dbg_on = std::getenv("KZGS_ASPECT_LOG") != nullptr;
+		if (s_dbg_on && (++s_dbg_n, s_dbg_w += wide ? 1 : 0, s_dbg_n % 120 == 0))
+			std::fprintf(stderr, "[kzgs] aspect: %d of last 120 vsyncs wide, ratio %.4f\n", s_dbg_w, ratio), s_dbg_w = 0;
+		if (ratio <= 0.0f)
+			return;
+		if (wide)
+		{
+			EmuConfig.CurrentAspectRatio = AspectRatioType::RAuto4_3_3_2;
+			EmuConfig.CurrentCustomAspectRatio = ratio;
+		}
+		else
+		{
+			EmuConfig.CurrentAspectRatio = EmuConfig.GS.AspectRatio;
+			EmuConfig.CurrentCustomAspectRatio = 0.0f;
+		}
+	}
+
 	static void ApplyVsyncRegs(const VsyncPayload& p)
 	{
 		std::memcpy(s_gs_regs, p.regset1, sizeof(p.regset1));
@@ -582,7 +607,8 @@ namespace
 					LARGE_INTEGER t0, t1, fq;
 					if (s_present_log_path) QueryPerformanceCounter(&t0);
 					s_cur_field = static_cast<int>(hdr.a);
-					GSvsync(hdr.a, hdr.b != 0);
+					ApplyFrameAspect((hdr.b & 2u) != 0);
+					GSvsync(hdr.a, (hdr.b & 1u) != 0);
 					if (s_present_log_path)
 					{
 						QueryPerformanceCounter(&t1);
@@ -823,7 +849,12 @@ void kzgsGifTransfer(int path, const uint8_t* data, uint32_t qwords)
 	}
 }
 
-void kzgsVsync(int field, bool regsWritten)
+void kzgsSetWideRatio(float ratio)
+{
+	s_wide_ratio.store(ratio > 0.0f ? ratio : 0.0f, std::memory_order_relaxed);
+}
+
+void kzgsVsync(int field, bool regsWritten, bool wide)
 {
 	if (!s_open.load(std::memory_order_relaxed))
 		return;
@@ -841,7 +872,7 @@ void kzgsVsync(int field, bool regsWritten)
 		s_stat_push_ns[s_stat_push_count.fetch_add(1) % 64].store(StatNowNs(), std::memory_order_release);
 		s_stat_hist[std::min<s32>(queued, 7)].fetch_add(1);
 	}
-	Push(Cmd::Vsync, static_cast<u32>(field & 1), regsWritten ? 1u : 0u, &p, sizeof(p));
+	Push(Cmd::Vsync, static_cast<u32>(field & 1), (regsWritten ? 1u : 0u) | (wide ? 2u : 0u), &p, sizeof(p));
 	Trace(9, static_cast<u32>(queued));
 	const bool throttled = queued > s_max_queued_frames;
 	if (throttled)

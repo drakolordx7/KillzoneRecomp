@@ -2,6 +2,7 @@
 #include "kz_timing.h"
 #include "kz_patches.h"
 #include "kz_gpu.h"
+#include "kz_widescreen.h"
 
 #include "kzgs.h"
 
@@ -64,6 +65,7 @@ namespace
         bool configPending = false;
         KzgsConfig pendingConfig;
         int windowHeight = 0;
+        int windowWidth = 0;
 
         std::string shotDir;
         int shotInterval = 0;
@@ -85,7 +87,7 @@ namespace
         return s;
     }
 
-    KzgsConfig toKzgs(const KzConfig &c, int windowHeight)
+    KzgsConfig toKzgs(const KzConfig &c, int windowHeight, int windowWidth = 0)
     {
         KzgsConfig k;
         switch (c.renderer)
@@ -98,6 +100,10 @@ namespace
             k.renderer = _stricmp(r, "d3d12") == 0 ? KzgsRenderer::D3D12 : _stricmp(r, "vulkan") == 0 ? KzgsRenderer::Vulkan : KzgsRenderer::D3D11;
         // Auto: smallest multiple of 448 lines that covers the window height.
         k.upscale = c.upscale > 0 ? c.upscale : std::clamp((std::max(windowHeight, 448) + 447) / 448, 1, 8);
+        // Ultrawide: the 512-wide frame is stretched over the whole window, so the width also sets the auto resolution (at most 1.5 window
+        // pixels per internal pixel, capped at 6x).
+        if (c.upscale == 0 && kzWideTargetAspect() > 0.0f && windowWidth > 0)
+            k.upscale = std::max(k.upscale, std::min(6, (windowWidth + 767) / 768));
         if (const char *u = std::getenv("KZ_UPSCALE")) // automation override
             k.upscale = std::clamp(std::atoi(u), 1, 8);
         k.textureFiltering = c.bilinear ? KzgsTextureFilter::PS2 : KzgsTextureFilter::Nearest;
@@ -130,7 +136,10 @@ namespace
             k.casSharpness = std::clamp(std::atoi(v), 0, 100);
         switch (c.aspect)
         {
-        case KzAspect::Widescreen16x9: k.aspect = KzgsAspect::Ratio16_9; break;
+        case KzAspect::Widescreen16x9:
+        case KzAspect::UltrawideAuto: // wide frames are stretched to the wide ratio in kzgs, the others pillarboxed at 16:9
+        case KzAspect::Ultrawide21x9:
+        case KzAspect::Ultrawide32x9: k.aspect = KzgsAspect::Ratio16_9; break;
         case KzAspect::Classic4x3: k.aspect = KzgsAspect::Ratio4_3; break;
         case KzAspect::Stretch: k.aspect = KzgsAspect::Stretch; break;
         }
@@ -468,6 +477,7 @@ namespace
     struct VsyncJob
     {
         int field = 0;
+        bool wide = false; // frame drawn with a widened 3D view (kz_widescreen.cpp)
         alignas(16) uint8_t regs[0x2000] = {};
     };
 
@@ -538,7 +548,7 @@ namespace
             didPresent = true;
             std::memcpy(lastDisplayRegs, s.privRegs, sizeof(lastDisplayRegs));
             presentedOnce = true;
-            kzgsVsync(field, regsChanged || !presentedOnce);
+            kzgsVsync(field, regsChanged || !presentedOnce, job->wide);
         }
         if (didPresent)
             ++s.presentedSeq;
@@ -593,6 +603,7 @@ namespace
         kzPatchesApply(s.runtime->memory().getRDRAM(), kzConfig());
         auto *job = new VsyncJob;
         job->field = field;
+        job->wide = kzWideTakeFrameFlag();
         snapshotPrivRegs(s, job->regs);
         ps2RunAfterQueuedGif(&runVsync, job);
     }
@@ -605,7 +616,7 @@ namespace
     }
 }
 
-bool kzGsAttach(PS2Runtime &runtime, void *hwnd, int windowHeight, const KzConfig &cfg, std::string *error)
+bool kzGsAttach(PS2Runtime &runtime, void *hwnd, int windowHeight, const KzConfig &cfg, std::string *error, int windowWidth)
 {
     GsState &s = gs();
     s.runtime = &runtime;
@@ -613,8 +624,10 @@ bool kzGsAttach(PS2Runtime &runtime, void *hwnd, int windowHeight, const KzConfi
     if (const char *tl = std::getenv("KZ_TIMELINE"); tl && *tl) // the hook costs a clock read per GS idle wait: only when recording
         kzgsSetTraceHook(&onKzgsTrace);
     s.windowHeight = windowHeight;
+    s.windowWidth = windowWidth;
+    kzWideConfigure(cfg.aspect, windowWidth, windowHeight);
     snapshotPrivRegs(s, s.privRegs);
-    KzgsConfig kc = toKzgs(cfg, windowHeight);
+    KzgsConfig kc = toKzgs(cfg, windowHeight, windowWidth);
     if (!kzgsOpen(hwnd, kc, s.privRegs, error))
         return false;
     runtime.gs().setRasterBackend(std::make_unique<SkipDrawBackend>());
@@ -653,13 +666,16 @@ void kzGsResize(int width, int height)
     s.resizeW = width;
     s.resizeH = height;
     s.windowHeight = height;
+    s.windowWidth = width;
+    kzWideConfigure(kzConfig().aspect, width, height);
 }
 
 void kzGsApplyConfig(const KzConfig &cfg)
 {
     GsState &s = gs();
     std::lock_guard<std::mutex> lock(s.pendingMutex);
-    s.pendingConfig = toKzgs(cfg, s.windowHeight);
+    kzWideConfigure(cfg.aspect, s.windowWidth, s.windowHeight);
+    s.pendingConfig = toKzgs(cfg, s.windowHeight, s.windowWidth);
     s.configPending = true;
 }
 

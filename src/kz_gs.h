@@ -14,7 +14,7 @@ class PS2Runtime;
 
 // hwnd = Win32 window to render into, or nullptr for an offscreen (headless) device. windowHeight drives the
 // automatic internal resolution.
-bool kzGsAttach(PS2Runtime &runtime, void *hwnd, int windowHeight, const KzConfig &cfg, std::string *error);
+bool kzGsAttach(PS2Runtime &runtime, void *hwnd, int windowHeight, const KzConfig &cfg, std::string *error, int windowWidth = 0);
 void kzGsDetach();
 
 // Main-thread notifications; applied on the game thread at the next vblank.

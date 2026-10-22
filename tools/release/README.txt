@@ -29,6 +29,9 @@ Menus: arrow keys or W/S/A/D to move, Enter / Space / E to select, Backspace to 
 Profile name: just type it. Backspace deletes, Enter confirms, Escape cancels.
 Controllers (Xbox, DualShock, DualSense and others) work out of the box with the original PS2 layout.
 
+Ultrawide monitors (21:9, 32:9): pick "Ultrawide: match window" under Aspect ratio in the launcher's Graphics tab.
+You see more of the world at the sides; the HUD stays in the middle 16:9 part, menus and movies get side bars.
+
 To skip the long intro movie at every start, switch on "Skip intro movies" in the launcher's Display tab.
 
 Settings are saved in killzone.ini next to killzone.exe. Delete it to reset everything.
