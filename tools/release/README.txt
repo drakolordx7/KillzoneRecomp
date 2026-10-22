@@ -1,5 +1,5 @@
-KILLZONE PC PORT - alpha {VERSION}
-==========================================
+KILLZONE PC PORT, alpha {VERSION}
+=================================
 
 A native Windows version of Killzone for the PlayStation 2, made by recompiling the game's code for PC.
 You need your own copy of the game. No game data (levels, models, textures, sound, video) is included;
@@ -28,6 +28,7 @@ Controls (defaults; listed in the launcher's Controls tab, change them in killzo
 Menus: arrow keys or W/S/A/D to move, Enter / Space / E to select, Backspace to go back.
 Profile name: just type it. Backspace deletes, Enter confirms, Escape cancels.
 Controllers (Xbox, DualShock, DualSense and others) work out of the box with the original PS2 layout.
+Sprint is hold to sprint, like the original. For toggle sprint, set Sprint to "Press to toggle" in the launcher's Controls tab.
 
 Ultrawide monitors (21:9, 32:9): pick "Ultrawide: match window" under Aspect ratio in the launcher's Graphics tab.
 You see more of the world at the sides; the HUD stays in the middle 16:9 part, menus and movies get side bars.

@@ -19,5 +19,4 @@
 ## Decisions that still matter
 - Untested 2026-10-01 WIP (adaptive pacing, KZ_PACING) parked on branch wip/2026-10-01-stopped-agents (super 6884b86, submodule 3723a7d).
 - build\RelWithDebInfo fails with C1041 PDB errors at -j>1 since 2026-10-21; build\agentv builds with -j 1. Releases built from build\agentv.
-- Commits no longer carry the "Made by drakolord and assisted with Claude Code." line (from 2026-10-21).
 - Release notes must not @mention people (GitHub lists them as contributors).
