@@ -32,7 +32,8 @@ void kzPatchesApply(uint8_t *rdram, const KzConfig &cfg)
         return;
     // Writing the pnach's absolute heap address corrupted render state here (the runtime's heap layout differs from
     // the PS2's), so the flag is reached through the game object pointer instead.
-    if (cfg.aspect == KzAspect::Widescreen16x9)
+    if (cfg.aspect == KzAspect::Widescreen16x9 || cfg.aspect == KzAspect::UltrawideAuto || cfg.aspect == KzAspect::Ultrawide21x9 ||
+        cfg.aspect == KzAspect::Ultrawide32x9) // the ultrawide modes build on the native 16:9 mode (kz_widescreen.cpp)
     {
         uint32_t obj;
         std::memcpy(&obj, rdram + (kGameObjectPtr & kRamMask), 4);

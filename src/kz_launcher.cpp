@@ -318,11 +318,14 @@ namespace
                         const char *scales[] = {"Auto (match display)", "1x (PS2 native 640x448)", "2x", "3x (about 1080p)", "4x (about 1440p)",
                                                 "5x", "6x (about 4K)", "7x", "8x"};
                         ImGui::Combo("##upscale", &cfg.upscale, scales, IM_ARRAYSIZE(scales));
-                        row("Aspect ratio");
+                        row("Aspect ratio", "Ultrawide: more of the world at the sides, HUD stays in the middle 16:9, menus and movies get side bars.");
                         enumCombo<KzAspect>("##aspect", cfg.aspect,
                                             {{KzAspect::Widescreen16x9, "16:9 widescreen (native)"},
                                              {KzAspect::Classic4x3, "4:3 original"},
-                                             {KzAspect::Stretch, "Stretch to window"}});
+                                             {KzAspect::Stretch, "Stretch to window"},
+                                             {KzAspect::UltrawideAuto, "Ultrawide: match window (more view at the sides)"},
+                                             {KzAspect::Ultrawide21x9, "Ultrawide 21:9"},
+                                             {KzAspect::Ultrawide32x9, "Ultrawide 32:9"}});
                         row("Scaling to the screen", "How the picture is fitted to your display.");
                         int scaling = cfg.sharpScaling ? 0 : 1;
                         const char *scalings[] = {"Sharp (crisp pixels)", "Smooth (softer)"};

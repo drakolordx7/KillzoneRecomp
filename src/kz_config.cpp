@@ -33,7 +33,8 @@ namespace
     constexpr EnumName<KzRenderer> kRenderers[] = {
         {KzRenderer::D3D11, "d3d11"}, {KzRenderer::D3D12, "d3d12"}, {KzRenderer::Vulkan, "vulkan"}};
     constexpr EnumName<KzAspect> kAspects[] = {
-        {KzAspect::Widescreen16x9, "16:9"}, {KzAspect::Classic4x3, "4:3"}, {KzAspect::Stretch, "stretch"}};
+        {KzAspect::Widescreen16x9, "16:9"}, {KzAspect::Classic4x3, "4:3"}, {KzAspect::Stretch, "stretch"},
+        {KzAspect::UltrawideAuto, "auto"}, {KzAspect::Ultrawide21x9, "21:9"}, {KzAspect::Ultrawide32x9, "32:9"}};
 
     template <typename E, size_t N>
     const char *toName(const EnumName<E> (&table)[N], E v)
@@ -73,9 +74,16 @@ std::filesystem::path kzConfigPath()
 KzConfig kzLoadConfig(const std::filesystem::path &path)
 {
     KzConfig c;
+    const auto envOverrides = [&c]() {
+        if (const char *e = std::getenv("KZ_ASPECT")) // automation: 16:9, 4:3, stretch, auto, 21:9, 32:9
+            c.aspect = fromName(kAspects, e, c.aspect);
+    };
     std::ifstream in(path);
     if (!in)
+    {
+        envOverrides();
         return c;
+    }
     std::map<std::string, std::string> kv;
     std::string section, line;
     while (std::getline(in, line))
@@ -133,6 +141,7 @@ KzConfig kzLoadConfig(const std::filesystem::path &path)
     if (auto v = get("Game.SkipIntro")) c.skipIntro = parseBool(*v, c.skipIntro);
     if (auto v = get("Paths.ISO")) c.isoPath = *v;
     if (auto v = get("Launcher.Show")) c.showLauncher = parseBool(*v, c.showLauncher);
+    envOverrides();
     return c;
 }
 

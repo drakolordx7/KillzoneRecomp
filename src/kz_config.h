@@ -25,6 +25,9 @@ enum class KzAspect
     Widescreen16x9, // game's native widescreen mode (FOV + HUD handled by the engine)
     Classic4x3,
     Stretch,
+    UltrawideAuto,  // 3D view as wide as the window (more at the sides), HUD in the middle 16:9, menus and movies pillarboxed; docs/findings.md "Ultrawide"
+    Ultrawide21x9,
+    Ultrawide32x9,
 };
 
 struct KzConfig
