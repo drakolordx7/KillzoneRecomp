@@ -400,6 +400,8 @@ namespace
                         toggleRow("Aim", "Right mouse button by default.", cfg.holdAim, "Hold to aim", "Press to toggle (as on PS2)");
                         toggleRow("Sprint", "Left Shift / L3. Toggle: press once, sprint stops when you stop moving or press again. Also applies to controllers.",
                                   cfg.toggleSprint, "Press to toggle", "Hold to sprint (as on PS2)");
+                        toggleRow("Button prompts", "The game's on-screen button pictures. Auto shows your keys and mouse buttons while you use them and the PlayStation buttons after controller input.",
+                                  cfg.buttonPrompts, "Auto (keys and mouse buttons)", "Always PlayStation buttons");
                         ImGui::EndTable();
                     }
                     section("Controller");

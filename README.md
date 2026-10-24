@@ -44,7 +44,7 @@ Port by [drakolordx7](https://github.com/drakolordx7). Built on [PS2Recomp](http
 
 Testing and reports: mcdermott87, Ash01Live, Lockefinder1, VGEsoterica, Mister-Mannered and everyone who sent logs.
 
-Third-party: PCSX2, SDL3, Dear ImGui, FFmpeg and PCSX2's Windows dependencies.
+Third-party: PCSX2, SDL3, Dear ImGui, FFmpeg, PCSX2's Windows dependencies and Kenney Input Prompts (CC0) for the keyboard and mouse button pictures.
 
 ## License
 

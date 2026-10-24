@@ -30,6 +30,10 @@ Profile name: just type it. Backspace deletes, Enter confirms, Escape cancels.
 Controllers (Xbox, DualShock, DualSense and others) work out of the box with the original PS2 layout.
 Sprint is hold to sprint, like the original. For toggle sprint, set Sprint to "Press to toggle" in the launcher's Controls tab.
 
+Button prompts: the game's on-screen button pictures ("Press the [button] to reload", the menu hints) show your keys and mouse
+buttons while you play with the keyboard and mouse, following your [Bindings], and switch back to the PlayStation buttons as soon as
+you use a controller. The launcher's Controls tab can turn this off. Pictures: Kenney Input Prompts (CC0), licence in resources\prompts.
+
 Ultrawide monitors (21:9, 32:9): pick "Ultrawide: match window" under Aspect ratio in the launcher's Graphics tab.
 You see more of the world at the sides; the HUD stays in the middle 16:9 part, menus and movies get side bars.
 

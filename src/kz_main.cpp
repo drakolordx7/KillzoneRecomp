@@ -21,6 +21,7 @@ extern "C" int __llvm_profile_write_file(void);
 #include "kz_aim.h"
 #include "kz_post.h"
 #include "kz_widescreen.h"
+#include "kz_prompts.h"
 #include "kz_movies.h"
 #include "kz_timefix.h"
 #include "runtime/ps2_host_arena.h"
@@ -367,6 +368,7 @@ int main(int argc, char *argv[])
         if (cfg.aspect == KzAspect::UltrawideAuto || cfg.aspect == KzAspect::Ultrawide21x9 || cfg.aspect == KzAspect::Ultrawide32x9 ||
             std::getenv("KZ_WIDE_ASPECT"))
             kzWideInstall(runtime);
+        kzPromptsInstall(runtime); // after kzWideInstall: wraps the same text function
         kzMoviesInstall(runtime);
         // Tests: a separate (e.g. empty) memory card folder. After loadELF, which resets the roots to the ELF folder.
         if (const char *mc = std::getenv("KZ_MC_ROOT"); mc && *mc)

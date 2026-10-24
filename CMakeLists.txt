@@ -110,6 +110,11 @@ endif()
 # Copy FFmpeg runtime DLLs next to killzone.exe (helper from ps2xRuntime).
 ps2x_stage_ffmpeg_runtime_dlls(killzone)
 kzgs_stage_resources(killzone)
+# Keyboard and mouse button prompt pictures (Kenney Input Prompts, CC0; the licence file stays next to them): src/kz_prompts.cpp
+add_custom_command(TARGET killzone POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/resources/prompts" "$<TARGET_FILE_DIR:killzone>/resources/prompts"
+    COMMENT "Staging the button prompt pictures"
+    VERBATIM)
 add_custom_command(TARGET killzone POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:SDL3::SDL3> $<TARGET_FILE_DIR:killzone>)
 
