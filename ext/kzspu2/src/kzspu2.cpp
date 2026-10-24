@@ -435,3 +435,20 @@ const uint16_t* kzspu2Memory()
 {
 	return reinterpret_cast<const uint16_t*>(_spu2mem);
 }
+
+KzSpu2VoiceInfo kzspu2VoiceInfo(int core, int voice)
+{
+	KzSpu2VoiceInfo i{};
+	if (!s_init || core < 0 || core > 1 || voice < 0 || voice > 23)
+		return i;
+	const V_Voice& v = Cores[core].Voices[voice];
+	i.phase = v.ADSR.Phase;
+	i.startA = v.StartA;
+	i.nextA = v.NextA;
+	i.loopA = v.LoopStartA;
+	i.envx = v.ADSR.Value;
+	i.volL = v.Volume.Left.Value;
+	i.volR = v.Volume.Right.Value;
+	i.pitch = v.Pitch;
+	return i;
+}

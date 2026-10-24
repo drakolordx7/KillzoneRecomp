@@ -84,6 +84,66 @@ namespace
         g_wav = nullptr;
     }
 
+    // ---- voice monitor (KZ_AUDIO_VOICES=1, with KZ_AUDIO_STATS): key-on / key-off counts and long-running voices ------------
+    bool g_voiceMon = false;
+    uint64_t g_konCount[2] = {}, g_koffCount[2] = {}, g_konTotal[2] = {}, g_koffTotal[2] = {};
+    uint32_t g_konHist[2][24] = {};
+    std::chrono::steady_clock::time_point g_konTime[2][24];
+    uint16_t g_konLo[2] = {}, g_koffLo[2] = {};
+
+    void voiceMonWrite(uint32_t r, uint16_t v)
+    {
+        const int core = (r & 0x400) ? 1 : 0;
+        const uint32_t reg = r & 0x3FF;
+        if (reg == 0x1A0 || reg == 0x1A2)
+        {
+            const int base = reg == 0x1A0 ? 0 : 16;
+            const uint32_t mask = reg == 0x1A0 ? v : (v & 0xFFu);
+            for (int b = 0; b < (reg == 0x1A0 ? 16 : 8); ++b)
+                if (mask >> b & 1)
+                {
+                    ++g_konCount[core];
+                    ++g_konTotal[core];
+                    ++g_konHist[core][base + b];
+                    g_konTime[core][base + b] = std::chrono::steady_clock::now();
+                }
+        }
+        else if (reg == 0x1A4 || reg == 0x1A6)
+        {
+            const uint32_t mask = reg == 0x1A4 ? v : (v & 0xFFu);
+            for (int b = 0; b < (reg == 0x1A4 ? 16 : 8); ++b)
+                if (mask >> b & 1)
+                {
+                    ++g_koffCount[core];
+                    ++g_koffTotal[core];
+                }
+        }
+    }
+
+    void voiceMonPrint(double now)
+    {
+        const auto t = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "[kz_voices] t=%.0fs kon %llu/%llu koff %llu/%llu (total %llu/%llu, %llu/%llu)", now,
+                     (unsigned long long)g_konCount[0], (unsigned long long)g_konCount[1], (unsigned long long)g_koffCount[0],
+                     (unsigned long long)g_koffCount[1], (unsigned long long)g_konTotal[0], (unsigned long long)g_konTotal[1],
+                     (unsigned long long)g_koffTotal[0], (unsigned long long)g_koffTotal[1]);
+        for (int c = 0; c < 2; ++c)
+        {
+            std::fprintf(stderr, " | core%d:", c);
+            for (int v = 0; v < 24; ++v)
+            {
+                const KzSpu2VoiceInfo i = kzspu2VoiceInfo(c, v);
+                if (!i.phase)
+                    continue;
+                const double age = std::chrono::duration<double>(t - g_konTime[c][v]).count();
+                std::fprintf(stderr, " v%d(ph%u age%.0f env%d s%05x vol%d/%d p%04x)", v, i.phase, age, i.envx, i.startA, i.volL,
+                             i.volR, i.pitch);
+            }
+        }
+        std::fprintf(stderr, "\n");
+        g_konCount[0] = g_konCount[1] = g_koffCount[0] = g_koffCount[1] = 0;
+    }
+
     void printStats(double now)
     {
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_statsLast).count();
@@ -101,6 +161,8 @@ namespace
                      static_cast<unsigned long long>(g_underrunFrames.load()),
                      static_cast<unsigned long long>(g_skippedFrames.load()), g_pace ? g_factor : 1.0,
                      static_cast<unsigned long long>(g_feedCalls.load()), static_cast<unsigned long long>(g_feedFrames.load()));
+        if (g_voiceMon)
+            voiceMonPrint(now);
         g_statsFrames = 0;
         g_sumSq[0] = g_sumSq[1] = 0;
         g_peak[0] = g_peak[1] = 0;
@@ -270,6 +332,8 @@ namespace
             if (g_traceWrites++ < g_trace || key)
                 std::fprintf(stderr, "[kz_audio] w %03x = %04x @%llu\n", r, v, static_cast<unsigned long long>(c));
         }
+        if (g_voiceMon)
+            voiceMonWrite(a & 0x7FF, v);
         kzspu2Write16(a, v, toSpu(c));
     }
     void hookDmaStart(int core, uint16_t *ram, uint32_t madr, uint32_t halfwords, bool toSpu2, uint64_t c)
@@ -369,6 +433,7 @@ bool kzAudioInstall(bool outputDevice)
     }
     if (const char *s = std::getenv("KZ_AUDIO_STATS"); s && *s)
         g_statsInterval = std::atof(s);
+    g_voiceMon = envFlag("KZ_AUDIO_VOICES", false) && g_statsInterval > 0;
 
     // Not derived from PS2X_HEADLESS: kz_main sets that for the runtime in every run (the runtime's own window is
     // never used), which is why the device was never opened in real play.
@@ -394,3 +459,4 @@ bool kzAudioActive()
 {
     return g_active;
 }
+

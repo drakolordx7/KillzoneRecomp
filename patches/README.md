@@ -660,3 +660,8 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
     `PS2X_MPEG_SYNC_AUDIO=0` restores the old dispatch; calls made outside guest execution (unit tests) keep it.
   - `Stubs/MPEG.cpp`: PTS -> vsync tick conversion and picture intervals assumed one tick per NTSC field; with the host's raised guest vblank rate
     (`ps2SetVblankPeriodMicros`, 120+ Hz) movies were paced that many times too fast. Both are scaled by 16667 us / vblank period (1.0 at the native rate).
+- **0028-iop-heap-reuse.patch** - the emulated IOP heap (`IopMemory::allocate`, 0x120000-0x1F0000, behind `AllocSysMemory` and heaplib `Malloc`) searched from a cursor that only moved
+  forward, so freed blocks were never reused: every level load cost ~70 KB for good and the heap ran dry after a few missions, after which PSOUND_R could not reserve its ADPCM streaming
+  structures and enemy / world sounds stayed silent until a restart (issue #17; docs/findings.md "Enemy audio cuts out for good"). The search now starts at the heap base (first fit) and
+  `QueryMaxFreeMemSize` reports the largest free gap. `PS2X_IOP_HEAP_REUSE=0` = old allocator; `PS2X_IOP_HEAP_END=<hex>` ends the heap early (out-of-memory tests); `PS2X_IOP_MEMLOG=1`
+  logs every allocation / free with the IRX's return address and `ALLOC FAILED` lines. Files: `ps2xIOP/src/emulator/core/iop_memory.cpp`, `imports/iop_sysmem.cpp`, `imports/iop_heaplib.cpp`.

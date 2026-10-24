@@ -73,4 +73,7 @@ uint32_t kzspu2SkipFrames(uint32_t frames);                   // consumer-side d
 
 // ---- inspection ------------------------------------------------------------------------------------------------------------
 KzSpu2Status kzspu2GetStatus(bool resetPeak = false);
+// Diagnostics: one voice's state (core 0/1, voice 0-23). phase: 0 stopped, 1 attack, 2 decay, 3 sustain, 4 release (PCSX2 PHASE_*).
+struct KzSpu2VoiceInfo { uint32_t phase, startA, nextA, loopA; int32_t envx, volL, volR; uint16_t pitch; };
+KzSpu2VoiceInfo kzspu2VoiceInfo(int core, int voice);
 const uint16_t* kzspu2Memory(); // SPU2 RAM, 1M halfwords (2 MB)

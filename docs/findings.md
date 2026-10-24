@@ -1394,3 +1394,40 @@ Frame rate: at the same internal resolution (4x) 16:9 and 21:9 gave 51 / 56 / 39
 
 ## Controller diagonals (2026-10-22, GitHub issue #11)
 Modern pads report a circular stick range (full diagonal = 0.71 per axis); a DualShock 2 reaches nearly full on both axes in the corners, and Killzone shrinks small stick values, so diagonals with a modern pad moved and turned at about half speed. Measured (level 1, scripted stick, peak speed over 0.5 s): forward 5.26, strafe 3.89, corner (1,1) 3.76, diagonal 0.71/0.71 1.89, diagonal 0.94/0.94 3.62 to 4.10. Fix (src/kz_input.cpp stickToPs2): radial dead zone, then scale by [Input] StickRange (default 1.33, PCSX2's recommended analog sensitivity for modern pads) and clamp each axis: a full diagonal becomes 0.94/0.94, straight pushes are unchanged. Launcher: Controls tab, Stick range.
+
+## Enemy audio cuts out for good: the IOP heap never reused freed memory (2026-10-24, GitHub issue #17)
+**Symptom.** After a few missions, enemy and world sounds (voices, hit and death cries, weapon fire) stop and do not come back until the game is restarted. The player's
+own and HUD sounds keep working, music and movies are fine.
+
+**Cause.** `IopMemory::allocate` (ps2xIOP, backs `AllocSysMemory` and heaplib `Malloc`) searched for space from `m_heapCursor`, which only ever moved forward. A freed block was
+never handed out again, so the 832 KB IOP heap (0x120000-0x1F0000) shrank for good with every allocation, freed or not. Measured with `PS2X_IOP_MEMLOG=1` (every alloc / free,
+with the IRX's `ra`): boot to the menu takes ~96 KB, loading level 2 ~73 KB (the first level load; later ones were not measured), and gameplay another 30-80 B/s (a 36-byte block, 48 aligned, allocated and freed by the IRX at 0x13268; the
+rate rose with the frame rate: 31 B/s at 120 fps, 80 B/s at 240 fps with `KZ_KILLALL` clearing waves). The level-load share is the one that matters: at ~73 KB each, about nine level loads (a
+chapter with restarts; an estimate) would leave nothing, and the sound driver (PSOUND_R) then fails to reserve its streaming structures (`gPS2StartADPCMStream: Error: Out of IOP memory allocating ADPCM
+struct`, `sSetupADPCMStream: Error: Out of IOP memory while reserving streaming structure`, `Prebuffering failed`). The level's streamed sounds (enemies, weapons, world) are the ones that
+need them; the resident player/HUD samples do not, which is why only those survive. The driver does not retry, so the loss lasts until the heap is rebuilt by a restart.
+The two driver lists the first guess pointed at are fine: the EE's sound resource (512) and instance (1024) tables stay at 94-118 / 4-22 used in a 1000 s run, and no unconsumed
+feedback reply was overwritten (0 of 16 000 `fn 0x600` replies), SPU2 voices cycle normally (the 5-6 voices left in sustain are the music stream).
+
+**Reproduce in minutes.** The default heap is too big to run dry in a test, so end it early: `PS2X_IOP_HEAP_END=148000` (hex address, must be inside the heap) with the old allocator
+(`PS2X_IOP_HEAP_REUSE=0`). Level 2, 120 vblank/s, walking script, `KZ_GOD=1`, `KZ_AUDIO_STATS=10 KZ_AUDIO_VOICES=1 KZ_AUDIO_DEVICE=0 PS2X_IOP_MEMLOG=1`, 260 s, SPU2 key-ons per 10 s
+from t=110 (gameplay):
+
+| allocator | key-ons per 10 s | failed allocations | sound resources in the game's table |
+|---|---|---|---|
+| old (`PS2X_IOP_HEAP_REUSE=0`) | 172 195 256 84 198 236 95 178 108, then 1 6 7 0 0 0 0 from t=200 | 5 307 | 109, then 54, 27 |
+| reuse (default) | 274 281 264 316 305 417 401 387 343 410 390 373 346 353 | 0 | 94-151 |
+
+The game keeps running in the old case (DMA and VIF advance) and the key-ons stay at ~0: exactly the report. With the heap ended at 0x14C000 the old allocator ran dry late in the run (the periodic
+36-byte allocation of the module at 0x13268 failed) and the game was frozen (`threads=1`, DMA/VIF stopped, vsync ticking: the same picture as the open issue #4 hang, worth checking there with
+`PS2X_IOP_MEMLOG=1`; the freeze in that run began ~190 s before the heap was empty, so it was not caused by the exhaustion itself).
+
+**Fix.** Free blocks are reused: the search starts at the heap base (first fit, the same overlap scan) instead of the cursor, and `QueryMaxFreeMemSize` / heaplib `QueryMaxFreeSize` report
+the largest free gap instead of "heap end minus cursor" (patch 0028, `PS2X_IOP_HEAP_REUSE=0` restores the old allocator). Live use stays small: with the fix a 1000 s run at 240 vblank/s
+ends with 795 KB free (cursor 0x12DC00), and a game that fits in a heap ended at 0x14C000 (180 KB) shows no failure in 500 s.
+
+**Verified.** (all headless, level 2 from the unlock-all save, `KZ_KILLALL=140,7` clearing waves, `KZ_GOD=1`): 1000 s at 240 vblank/s, default heap: 0 failed allocations, key-ons
+per 10 s 257-485 at every 40 s sample through the end, WAV RMS alive in every 100 s window to t=993; 500 s at 120 vblank/s with the heap ended at 0x14C000: 0 failures, key-ons 119-537 per 10 s to the end (old
+allocator, same limit: key-ons 0 from t=230 on, failures from t=420); movie audio: boot to the menu, `KZ_AUDIO_WAV`, RMS fades in from t=30 s and reaches -16 dBFS as in "FMV audio" above.
+a local test script <log>` summarises a log (failed allocations, out-of-memory lines, key-ons per interval).
+**Not verified.** A real multi-hour session (no way to run one here); other than level 2 no other levels were run with the heap ended early.
