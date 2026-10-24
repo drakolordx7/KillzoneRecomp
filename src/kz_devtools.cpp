@@ -271,6 +271,19 @@ namespace
 
 namespace
 {
+    // any character entity: a game object (vtable in the game's data range) whose +0x31C is a character controller (vt 0x524B50)
+    bool isChar(const uint8_t *ram, uint32_t a)
+    {
+        const uint32_t vt = rdw(ram, a);
+        if (vt < 0x500000u || vt >= 0x580000u)
+            return false;
+        const uint32_t c = rdw(ram, a + 0x31C);
+        return c >= 0x100000u && c < 0x01FFF000u && rdw(ram, c) == 0x524B50u;
+    }
+}
+
+namespace
+{
     // KZ_ACTORS=<period seconds>: every period, log every character controller (vtable 0x524B50) with position/heading.
     void logActors(const uint8_t *ram, double t)
     {
@@ -287,6 +300,25 @@ namespace
                     std::memcpy(&f[i], &w, 4);
                 }
                 std::fprintf(stderr, " [%06x %.1f,%.1f,%.1f h%.2f]", a, f[0], f[1], f[2], f[3]);
+                ++n;
+            }
+        std::fprintf(stderr, "\n");
+        // character entities (vt 0x525710): address, health (+0x30C), controller position
+        std::fprintf(stderr, "[ents] t=%.1f", t);
+        n = 0;
+        for (uint32_t a = 0x100000; a + 0x320 < 0x02000000u && n < 64; a += 4)
+            if (isChar(ram, a))
+            {
+                const uint32_t c = rdw(ram, a + 0x31C);
+                float hp, x = 0, y = 0, z = 0;
+                const uint32_t wh = rdw(ram, a + 0x30C);
+                std::memcpy(&hp, &wh, 4);
+                if (c >= 0x100000u && c < 0x01FFF000u)
+                {
+                    const uint32_t wx = rdw(ram, c + 0x50), wy = rdw(ram, c + 0x54), wz = rdw(ram, c + 0x58);
+                    std::memcpy(&x, &wx, 4), std::memcpy(&y, &wy, 4), std::memcpy(&z, &wz, 4);
+                }
+                std::fprintf(stderr, " [%06x vt=%x hp=%.0f %.0f,%.0f,%.0f]", a, rdw(ram, a), hp, x, y, z);
                 ++n;
             }
         std::fprintf(stderr, "\n");
@@ -361,9 +393,35 @@ namespace
     }
 }
 
+namespace
+{
+    // KZ_KILLALL="start[,period]": from wall second start, every period seconds (default 2) sets the health (+0x30C) of every
+    // character entity (vt 0x525710) except the player to 0 (testing aid: clears the waves so the level scripts advance).
+    void killAll(uint8_t *ram)
+    {
+        const uint32_t pl = findPlayer(ram);
+        int n = 0;
+        const uint32_t zero = 0;
+        for (uint32_t a = 0x100000; a + 0x320 < 0x02000000u; a += 4)
+            if (a != pl && isChar(ram, a))
+            {
+                float hp;
+                const uint32_t wh = rdw(ram, a + 0x30C);
+                std::memcpy(&hp, &wh, 4);
+                if (hp > 0.0f)
+                {
+                    std::memcpy(ram + ((a + 0x30C) & kRamMask), &zero, 4);
+                    ++n;
+                }
+            }
+        if (n)
+            std::fprintf(stderr, "[killall] t=%.1f killed %d\n", nowSec(), n);
+    }
+}
+
 void kzDevOnVsync(uint8_t *rdram)
 {
-    static const bool any = std::getenv("KZ_GOD") || std::getenv("KZ_PLAYERPOKE") || std::getenv("KZ_POKE") || std::getenv("KZ_PEEK") || std::getenv("KZ_TELEPORT") || std::getenv("KZ_ACTORS");
+    static const bool any = std::getenv("KZ_GOD") || std::getenv("KZ_PLAYERPOKE") || std::getenv("KZ_POKE") || std::getenv("KZ_PEEK") || std::getenv("KZ_TELEPORT") || std::getenv("KZ_ACTORS") || std::getenv("KZ_KILLALL");
     static const double actorPeriod = std::getenv("KZ_ACTORS") ? std::atof(std::getenv("KZ_ACTORS")) : 0.0;
     static double nextActors = 0.0;
     if (!any || !rdram)
@@ -374,6 +432,17 @@ void kzDevOnVsync(uint8_t *rdram)
             for (const PP &p : pps())
                 if (t >= p.t)
                     std::memcpy(rdram + ((pl + p.off) & kRamMask), &p.value, 4);
+    if (const char *k = std::getenv("KZ_KILLALL"))
+    {
+        static const double start = std::atof(k);
+        static const double period = [k]() { const char *c = std::strchr(k, ','); return c ? std::atof(c + 1) : 2.0; }();
+        static double nextKill = start;
+        if (t >= nextKill)
+        {
+            nextKill = t + period;
+            killAll(rdram);
+        }
+    }
     if (actorPeriod > 0.0 && t >= nextActors)
     {
         nextActors = t + actorPeriod;

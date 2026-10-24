@@ -1,76 +1,51 @@
-# KillzoneRecomp
+# Killzone for Windows (native PC port)
 
-A native Windows port of Killzone (PlayStation 2, 2004). The game's PS2 code is statically recompiled to C++ with
-[PS2Recomp](https://github.com/ran-j/PS2Recomp), and PCSX2's hardware renderer, microVU, IPU and SPU2 are linked in as
-libraries.
+A native Windows port of Killzone (PlayStation 2, 2004) by [drakolordx7](https://github.com/drakolordx7). The game's code is recompiled to C++ with [PS2Recomp](https://github.com/ran-j/PS2Recomp), so it runs as a PC program with mouse and keyboard aim, high frame rates, higher resolutions and ultrawide support.
 
-No game code or data is in this repository. You need your own disc image of Killzone NTSC-U (SCUS-97402).
+[Download the latest build](https://github.com/drakolordx7/KillzoneRecomp/releases/latest)
 
-To play, grab the latest zip from the [releases page](https://github.com/drakolordx7/KillzoneRecomp/releases), unzip it,
-run `killzone.exe` and point the launcher at your .iso. Findings, measurements and the reasoning behind each change are
-in [`docs/findings.md`](docs/findings.md) and [`patches/README.md`](patches/README.md).
+No game files are included; you need your own disc image of Killzone, US version (SCUS-97402). Not affiliated with Sony or Guerrilla Games.
 
-## Status
+## Requirements
 
-Alpha. Boot, menus, profile creation and the first mission's gameplay are verified in automated runs. Longer
-play-throughs and hands-on testing are ongoing, and the known problems are listed in each release's notes.
+- Windows 10 or 11, 64-bit
+- CPU with AVX2: Intel 4th gen (Haswell), AMD Ryzen or newer
+- GPU with Direct3D 11, Direct3D 12 or Vulkan
 
-- Frame rate: runs at the monitor's refresh rate. Measured in gameplay, that is about 117-120 fps at 120 Hz and about
-  130-140 fps at 144 Hz. At 120 Hz the game's clock still runs at real time (the frame timer is rescaled, not sped up).
-- Mouse and keyboard: mouse aim is an engine patch. Raw counts go into the game's own look rate, so there is no stick
-  acceleration or dead zone. Keys are fully rebindable. Controllers work through SDL3 with the original PS2 layout.
-- Graphics: internal resolution up to 8x (supersampling), native 16:9 plus 21:9 and 32:9 ultrawide, sharp scaling,
-  anisotropic filtering, optional FXAA, and D3D11, D3D12 or Vulkan.
-- Launcher: display, graphics, controls and audio settings. It checks that the disc image is the supported version.
-- Killzone Online (LOADER.ELF and the network modules) is not included. Its servers are long gone.
+## Usage
 
-## Default controls
+1. Unzip the build into a folder and run `killzone.exe`.
+2. In the launcher, browse to your Killzone `.iso`.
+3. Pick your settings and press Play.
 
-| | |
-|---|---|
-| Mouse | aim |
-| Left / right / middle mouse | fire / hold to aim / secondary fire |
-| W A S D | move (menus: navigate) |
-| Left Shift / C or Left Ctrl | sprint / crouch |
-| R / G / Q or wheel | reload / grenade / switch weapon |
-| E or F / X or Mouse4 | use / special item |
-| Escape / Tab | pause / objectives |
-| Arrow keys, Enter | menus |
+Settings are in `killzone.ini` and saves in `disc\mc0`, both next to `killzone.exe`. To update, unzip a new build over the old one; settings and saves stay.
 
-The profile name can be typed directly on the game's on-screen keyboard. Bindings live in `killzone.ini` under
-`[Bindings]`.
+Mouse and keyboard work out of the box, and so do controllers with the original PS2 layout. The launcher's Controls tab lists the keys; change them in `killzone.ini` under `[Bindings]`. Ultrawide, intro skip, toggle sprint and the graphics options are in the launcher too; `README.txt` in the zip lists the controls.
 
-## Building
+## Reporting problems
 
-Windows x64, Visual Studio 2022 or later (MSVC), CMake 3.21+, Ninja, Python 3, a CPU with AVX2.
+[Open an issue](https://github.com/drakolordx7/KillzoneRecomp/issues) with `killzone.log` from the game folder (the next start overwrites it; the one before is kept as `killzone.prev.log`). Say which level you were on and what you were doing.
 
-1. Clone with submodules: `git clone --recursive https://github.com/drakolordx7/KillzoneRecomp`.
-   `ext/PS2Recomp` is the `killzone` branch of [drakolordx7/PS2Recomp](https://github.com/drakolordx7/PS2Recomp).
-2. Dependencies that are not committed:
-   - PCSX2 source in `ext/pcsx2` (verified against commit `646df006a4`), unmodified.
-   - [pcsx2-windows-dependencies](https://github.com/PCSX2/pcsx2-windows-dependencies/releases/tag/latest-windows-dependencies)
-     extracted to `ext/kzgs/deps`.
-   - SDL3 3.4.16 (VC development package) in `ext/sdl3`.
-3. Extract `SCUS_974.02` from your disc image into `game/`.
-4. Build the recompiler: `tools\scripts\build_ps2recomp.bat`.
-5. Recompile the game: `python tools\scripts\regen.py` (writes `generated/`, about 20k C++ files).
-6. Build with `tools\scripts\build.bat RelWithDebInfo`. The result is `build\RelWithDebInfo\killzone.exe`.
-7. Optionally, `tools\scripts\package.ps1` makes a player folder in `dist\Killzone`.
+## Contributing
 
-`killzone.exe --selftest` runs the unit checks. `tools\scripts\run_headless.ps1` runs the game without a window, with
-scripted input (`KZ_INPUT_SCRIPT`) and periodic screenshots. That is how everything here was verified.
+- `master` is the main branch and what releases are built from. Open pull requests against it.
+- `ext/PS2Recomp` is the `killzone` branch of [drakolordx7/PS2Recomp](https://github.com/drakolordx7/PS2Recomp). General runtime fixes also go upstream as pull requests.
+- Building needs Windows x64, Visual Studio 2022 or later, CMake, Ninja and Python 3:
+  1. `git clone --recursive https://github.com/drakolordx7/KillzoneRecomp`
+  2. Put the PCSX2 source in `ext/pcsx2` (commit `646df006a4`), the [PCSX2 Windows dependencies](https://github.com/PCSX2/pcsx2-windows-dependencies/releases/tag/latest-windows-dependencies) in `ext/kzgs/deps` and the SDL3 VC development package in `ext/sdl3`.
+  3. Copy `SCUS_974.02` from your disc into `game/`.
+  4. `tools\scripts\build_ps2recomp.bat`, then `python tools\scripts\regen.py` (writes about 20,000 C++ files to `generated/`), then `tools\scripts\build.bat RelWithDebInfo`.
+  5. `tools\scripts\make_release.ps1 -Version x.y.z -From build\RelWithDebInfo` makes the release zip.
+- Reverse-engineering notes and measurements are in [`docs/findings.md`](docs/findings.md); runtime changes are described in [`patches/README.md`](patches/README.md).
 
-## Layout
+## Credits
 
-- `src/`: the port itself. Game overrides and patches, input, mouse aim, timing, launcher, config and the GS, VU, IPU and SPU2 glue.
-- `ext/kzgs`, `ext/kzvu`, `ext/kzipu`, `ext/kzspu2`: PCSX2's GS, microVU, IPU and SPU2 built as static libraries.
-- `ext/PS2Recomp`: recompiler and runtime (fork, `killzone` branch).
-- `patches/`: the runtime changes as patches, with a description and measurements for each.
-- `config/killzone.toml`: PS2Recomp configuration for SCUS-97402.
-- `tools/`: build, test, profiling and Ghidra helper scripts.
-- `docs/`: findings and performance research.
+Port by [drakolordx7](https://github.com/drakolordx7). Built on [PS2Recomp](https://github.com/ran-j/PS2Recomp) by ran-j and contributors, and on [PCSX2](https://github.com/PCSX2/pcsx2)'s GS renderer, microVU, IPU and SPU2, linked in as libraries.
+
+Testing and reports: mcdermott87, Ash01Live, Lockefinder1, VGEsoterica, Mister-Mannered and everyone who sent logs.
+
+Third-party: PCSX2, SDL3, Dear ImGui, FFmpeg and PCSX2's Windows dependencies.
 
 ## License
 
-GPL-3.0 (see `LICENSE`). The port links PCSX2 (GPL-3.0-or-later) and PS2Recomp (GPL-3.0).
-Killzone is a trademark of Sony Interactive Entertainment; this project is not affiliated with Sony or Guerrilla Games.
+GPL-3.0, see [LICENSE](LICENSE). PCSX2 is GPL-3.0-or-later and PS2Recomp is GPL-3.0. Killzone is a trademark of Sony Interactive Entertainment.

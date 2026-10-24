@@ -564,6 +564,49 @@ namespace
 			_mm_pause();
 	}
 
+	// Test aid emulating an external frame limiter (RivaTuner/RTSS, the driver's limiter): those cap by blocking inside the
+	// game's Present call. KZ_TEST_PRESENT_FPS=<fps>: successive presents are at least 1/fps apart (sleep, then spin the last
+	// 2 ms, like RTSS). KZ_TEST_PRESENT_SLEEP_US=<us>: a plain sleep of that length per present. KZ_TEST_PRESENT_STALL=<n>,<ms>:
+	// every n-th present additionally blocks for <ms> (a hitch). Called on the GS thread after each presented frame.
+	static void ExternalCapPresent()
+	{
+		struct Cfg
+		{
+			double fps = 0.0;
+			long sleep_us = 0;
+			long stall_every = 0;
+			long stall_ms = 0;
+		};
+		static const Cfg cfg = []() {
+			Cfg c;
+			if (const char* v = std::getenv("KZ_TEST_PRESENT_FPS"))
+				c.fps = std::atof(v);
+			if (const char* v = std::getenv("KZ_TEST_PRESENT_SLEEP_US"))
+				c.sleep_us = std::atol(v);
+			if (const char* v = std::getenv("KZ_TEST_PRESENT_STALL"))
+				std::sscanf(v, "%ld,%ld", &c.stall_every, &c.stall_ms);
+			return c;
+		}();
+		if (cfg.fps <= 0.0 && cfg.sleep_us <= 0 && cfg.stall_every <= 0)
+			return;
+		using clock = std::chrono::steady_clock;
+		static clock::time_point next = clock::now();
+		static long count = 0;
+		if (cfg.fps > 0.0)
+		{
+			next += std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(1.0 / cfg.fps));
+			if (clock::now() > next + std::chrono::milliseconds(50)) // far behind: don't try to catch up with a burst
+				next = clock::now();
+			std::this_thread::sleep_until(next - std::chrono::milliseconds(2));
+			while (clock::now() < next)
+				_mm_pause();
+		}
+		if (cfg.sleep_us > 0)
+			std::this_thread::sleep_for(std::chrono::microseconds(cfg.sleep_us));
+		if (cfg.stall_every > 0 && ++count % cfg.stall_every == 0)
+			std::this_thread::sleep_for(std::chrono::milliseconds(cfg.stall_ms));
+	}
+
 	static void GSThreadLoop()
 	{
 		u64 r = s_read_pos.load(std::memory_order_relaxed);
@@ -616,6 +659,7 @@ namespace
 						s_present_log.push_back({static_cast<long long>(t1.QuadPart * 1000000000ll / fq.QuadPart), static_cast<long long>(hdr.a), static_cast<long long>((t1.QuadPart - t0.QuadPart) * 1000000ll / fq.QuadPart)});
 					}
 					FakeFifoPresent();
+					ExternalCapPresent();
 					if (s_stats_on)
 					{
 						const s64 lat = StatNowNs() - s_stat_push_ns[s_vsync_seq % 64].load(std::memory_order_acquire);
@@ -887,6 +931,28 @@ void kzgsVsync(int field, bool regsWritten, bool wide)
 		s_stat_throttle_ns.fetch_add(StatNowNs() - throttle_t0);
 	if (throttled)
 		Trace(6);
+}
+
+bool kzgsVsyncTry(int field, bool regsWritten, bool wide)
+{
+	if (!s_open.load(std::memory_order_relaxed))
+		return true;
+	if (s_queued_frames.load(std::memory_order_acquire) > s_max_queued_frames)
+		return false;
+	VsyncPayload p;
+	std::memcpy(p.regset1, s_caller_regs, sizeof(p.regset1));
+	std::memcpy(&p.csr, s_caller_regs + 0x1000, sizeof(p.csr));
+	std::memcpy(&p.imr, s_caller_regs + 0x1010, sizeof(p.imr));
+	std::memcpy(&p.siglblid, s_caller_regs + 0x1080, sizeof(p.siglblid));
+	const s32 queued = s_queued_frames.fetch_add(1, std::memory_order_acq_rel) + 1;
+	if (s_stats_on)
+	{
+		s_stat_push_ns[s_stat_push_count.fetch_add(1) % 64].store(StatNowNs(), std::memory_order_release);
+		s_stat_hist[std::min<s32>(queued, 7)].fetch_add(1);
+	}
+	Push(Cmd::Vsync, static_cast<u32>(field & 1), (regsWritten ? 1u : 0u) | (wide ? 2u : 0u), &p, sizeof(p));
+	Trace(9, static_cast<u32>(queued));
+	return true;
 }
 
 void kzgsWriteCSR(uint32_t csr)
