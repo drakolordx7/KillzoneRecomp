@@ -101,6 +101,20 @@ if(KZ_GENERATED_PAL_DIR AND EXISTS "${KZ_GENERATED_PAL_DIR}/register_functions.c
     # and would not link: it is left out.
     file(STRINGS "${KZ_GENERATED_PAL_DIR}/register_functions.cpp" _kz_pal_register REGEX "kzPalRegisterFunctionTable" LIMIT_COUNT 1)
     if(_kz_pal_register)
+        # The PAL set fills the US live table at boot, so the US table must reach past the end of the PAL code
+        # (config/killzone.toml table_end_min). Checked here so a PAL regen that grew can't ship a PAL disc that fails at boot.
+        file(STRINGS "${KZ_GENERATED_PAL_DIR}/register_functions.cpp" _kz_pal_end REGEX "kzPalRegisterFunctionTableEnd = 0x" LIMIT_COUNT 1)
+        file(STRINGS "${KZ_GENERATED_DIR}/register_functions.cpp" _kz_us_end REGEX "g_ps2RecompiledFunctionTableEnd = 0x" LIMIT_COUNT 1)
+        string(REGEX MATCH "0x[0-9a-fA-F]+" _kz_pal_end "${_kz_pal_end}")
+        string(REGEX MATCH "0x[0-9a-fA-F]+" _kz_us_end "${_kz_us_end}")
+        if(_kz_pal_end AND _kz_us_end)
+            math(EXPR _kz_pal_end_n "${_kz_pal_end}")
+            math(EXPR _kz_us_end_n "${_kz_us_end}")
+            if(_kz_pal_end_n GREATER _kz_us_end_n)
+                message(FATAL_ERROR "Killzone: the PAL code ends at ${_kz_pal_end} but the US function table ends at ${_kz_us_end}: "
+                                    "raise table_end_min in config/killzone.toml to at least ${_kz_pal_end} and regenerate the US set")
+            endif()
+        endif()
         file(GLOB KZ_GENERATED_PAL_SRC CONFIGURE_DEPENDS "${KZ_GENERATED_PAL_DIR}/*.cpp")
         list(LENGTH KZ_GENERATED_PAL_SRC KZ_GENERATED_PAL_COUNT)
         set(KZ_HAVE_PAL ON)

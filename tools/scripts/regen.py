@@ -3,7 +3,7 @@
 Steps: merge SCE library bindings from ps2_analyzer and missed function starts from find_code_pointers.py into the
 config (work/killzone.merged.toml), run ps2_recomp into work/gen_tmp, then copy changed/new files to generated/ and
 delete stale ones.
-Usage: python tools/scripts/regen.py
+Usage: python tools/scripts/regen.py [--pal]
 """
 import filecmp, os, re, shutil, subprocess, sys, tomllib
 
@@ -16,18 +16,36 @@ os.environ.setdefault('PS2X_CODEGEN_FOLD', '1')
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-# KZ_CONFIG / KZ_ELF / KZ_ANALYZER_TOML / KZ_CODE_POINTERS / KZ_CODE_POINTERS_REJECT (and KZ_FUNCS_CSV for
-# find_code_pointers.py) select another ELF's inputs, e.g. the PAL set (config/killzone_pal.toml, issue #15).
+# --pal (or KZ_CONFIG=config/killzone_pal.toml) regenerates the PAL set (issue #15). Every input and output path comes from
+# one preset per config, so a PAL run can never write into generated/ or reuse the US analyzer/code-pointer files. The
+# ELF, the output folder and the function list are read from the config's input / output / ghidra_output. Each path can
+# still be overridden with its env var (KZ_ELF, KZ_GEN_DIR, KZ_FUNCS_CSV, KZ_ANALYZER_TOML, KZ_CODE_POINTERS,
+# KZ_CODE_POINTERS_REJECT, KZ_MERGED, KZ_GEN_TMP, KZ_RECOMP_LOG); KZ_RECOMP_EXE picks another ps2_recomp.
+if "--pal" in sys.argv[1:]:
+    os.environ.setdefault("KZ_CONFIG", str(ROOT / "config" / "killzone_pal.toml"))
 CFG = Path(os.environ.get("KZ_CONFIG", ROOT / "config" / "killzone.toml"))
-ELF = Path(os.environ.get("KZ_ELF", ROOT / "game" / "SCUS_974.02"))
-ANALYZER_TOML = Path(os.environ.get("KZ_ANALYZER_TOML", ROOT / "work" / "analyzer.toml"))
-CODE_POINTERS = Path(os.environ.get("KZ_CODE_POINTERS", ROOT / "work" / "code_pointers.txt"))
-REJECT = Path(os.environ.get("KZ_CODE_POINTERS_REJECT", ROOT / "config" / "code_pointers_reject.txt"))
-# KZ_GEN_DIR / KZ_GEN_TMP / KZ_MERGED / KZ_RECOMP_EXE redirect the run (used for alternative code generators, e.g.
-# PS2X_CODEGEN=locals into work/generated_cg) without touching generated/.
-MERGED = Path(os.environ.get("KZ_MERGED", ROOT / "work" / "killzone.merged.toml"))
-TMP = Path(os.environ.get("KZ_GEN_TMP", ROOT / "work" / "gen_tmp"))
-GEN = Path(os.environ.get("KZ_GEN_DIR", ROOT / "generated"))
+PRESETS = {
+    "killzone": dict(KZ_ANALYZER_TOML="work/analyzer.toml", KZ_CODE_POINTERS="work/code_pointers.txt",
+                     KZ_CODE_POINTERS_REJECT="config/code_pointers_reject.txt", KZ_MERGED="work/killzone.merged.toml",
+                     KZ_GEN_TMP="work/gen_tmp", KZ_RECOMP_LOG="work/recomp.log"),
+    "killzone_pal": dict(KZ_ANALYZER_TOML="work/pal/analyzer_pal.toml", KZ_CODE_POINTERS="work/pal/code_pointers_pal.txt",
+                         KZ_CODE_POINTERS_REJECT="work/pal/code_pointers_reject_pal.txt",
+                         KZ_MERGED="work/pal/killzone_pal.merged.toml", KZ_GEN_TMP="work/pal/gen_tmp",
+                         KZ_RECOMP_LOG="work/pal/recomp_pal.log"),
+}
+if CFG.stem not in PRESETS:
+    sys.exit(f"[regen] no path preset for {CFG.name}; add one to PRESETS in regen.py")
+_gen = tomllib.loads(CFG.read_text())["general"]
+for _k, _v in {**PRESETS[CFG.stem], "KZ_ELF": _gen["input"], "KZ_GEN_DIR": _gen["output"],
+               "KZ_FUNCS_CSV": _gen["ghidra_output"]}.items():
+    os.environ.setdefault(_k, str(ROOT / _v) if not Path(_v).is_absolute() else _v)  # find_code_pointers.py reads these too
+ELF = Path(os.environ["KZ_ELF"])
+ANALYZER_TOML = Path(os.environ["KZ_ANALYZER_TOML"])
+CODE_POINTERS = Path(os.environ["KZ_CODE_POINTERS"])
+REJECT = Path(os.environ["KZ_CODE_POINTERS_REJECT"])
+MERGED = Path(os.environ["KZ_MERGED"])
+TMP = Path(os.environ["KZ_GEN_TMP"])
+GEN = Path(os.environ["KZ_GEN_DIR"])
 RECOMP = Path(os.environ.get("KZ_RECOMP_EXE", ROOT / "build" / "ps2recomp" / "ps2xRecomp" / "ps2_recomp.exe"))
 ANALYZER = ROOT / "build" / "ps2recomp" / "ps2xAnalyzer" / "ps2_analyzer.exe"
 
@@ -71,7 +89,7 @@ def main() -> int:
     MERGED.write_text(merged_config())
     if TMP.exists():
         shutil.rmtree(TMP)
-    log = Path(os.environ.get("KZ_RECOMP_LOG", ROOT / "work" / "recomp.log"))
+    log = Path(os.environ["KZ_RECOMP_LOG"])
     with log.open("w") as f:
         r = subprocess.run([str(RECOMP), str(MERGED)], stdout=f, stderr=subprocess.STDOUT)
     if r.returncode != 0:

@@ -4,7 +4,7 @@ A native Windows port of Killzone (PlayStation 2, 2004) by [drakolordx7](https:/
 
 [Download the latest build](https://github.com/drakolordx7/KillzoneRecomp/releases/latest)
 
-No game files are included; you need your own disc image of Killzone, US version (SCUS-97402). Not affiliated with Sony or Guerrilla Games.
+No game files are included; you need your own disc image of Killzone: the US version (SCUS-97402) or the European version (SCES-52893, English/Russian/Greek). The game detects which one you have. Not affiliated with Sony or Guerrilla Games.
 
 ## Requirements
 
@@ -18,7 +18,7 @@ No game files are included; you need your own disc image of Killzone, US version
 2. In the launcher, browse to your Killzone `.iso`.
 3. Pick your settings and press Play.
 
-Settings are in `killzone.ini` and saves in `disc\mc0`, both next to `killzone.exe`. To update, unzip a new build over the old one; settings and saves stay.
+Settings are in `killzone.ini` and saves in `disc\mc0` (US) or `disc_pal\mc0` (Europe), all next to `killzone.exe`. To update, unzip a new build over the old one; settings and saves stay.
 
 Mouse and keyboard work out of the box, and so do controllers with the original PS2 layout. The launcher's Controls tab lists the keys; change them in `killzone.ini` under `[Bindings]`. Ultrawide, intro skip, toggle sprint and the graphics options are in the launcher too; `README.txt` in the zip lists the controls.
 
@@ -33,8 +33,8 @@ Mouse and keyboard work out of the box, and so do controllers with the original 
 - Building needs Windows x64, Visual Studio 2022 or later, CMake, Ninja and Python 3:
   1. `git clone --recursive https://github.com/drakolordx7/KillzoneRecomp`
   2. Put the PCSX2 source in `ext/pcsx2` (commit `646df006a4`), the [PCSX2 Windows dependencies](https://github.com/PCSX2/pcsx2-windows-dependencies/releases/tag/latest-windows-dependencies) in `ext/kzgs/deps` and the SDL3 VC development package in `ext/sdl3`.
-  3. Copy `SCUS_974.02` from your disc into `game/`.
-  4. `tools\scripts\build_ps2recomp.bat`, then `python tools\scripts\regen.py` (writes about 20,000 C++ files to `generated/`), then `tools\scripts\build.bat RelWithDebInfo`.
+  3. Copy `SCUS_974.02` from your disc into `game/`. For European disc support, also put `SCES_528.93` in `work/pal/elf/` (optional; without it the build is US only).
+  4. `tools\scripts\build_ps2recomp.bat`, then `python tools\scripts\regen.py` (writes about 20,000 C++ files to `generated/`; `regen.py --pal` writes the European set to `generated_pal/`), then `tools\scripts\build.bat RelWithDebInfo`.
   5. `tools\scripts\make_release.ps1 -Version x.y.z -From build\RelWithDebInfo` makes the release zip.
 - Reverse-engineering notes and measurements are in [`docs/findings.md`](docs/findings.md); runtime changes are described in [`patches/README.md`](patches/README.md).
 
