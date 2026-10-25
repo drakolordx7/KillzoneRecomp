@@ -6,7 +6,7 @@ You need your own copy of the game. No game data (levels, models, textures, soun
 it's all read from your disc image.
 
 What you need
-- Killzone for PS2, US version (SCUS-97402), as an .iso you dumped from your own disc.
+- Killzone for PS2, US version (SCUS-97402) or European version (SCES-52893), as an .iso you dumped from your own disc.
   Other regions don't work yet.
 - Windows 10 or 11, 64-bit, a CPU with SSE4.1 (Intel Core 2 Penryn / AMD FX or newer), and a GPU with Direct3D 11, Direct3D 12 or Vulkan.
 
@@ -14,7 +14,7 @@ First start
 1. Unzip the folder anywhere and run killzone.exe. The launcher opens.
 2. Browse to your Killzone .iso. The launcher checks that it's the supported version.
 3. Pick display, graphics and control settings and press PLAY.
-   A few small boot files are copied from your disc into the "disc" folder. Everything else is read
+   A few small boot files are copied from your disc into the "disc" folder ("disc_pal" for the European version). Everything else is read
    straight from the .iso.
 
 Controls (defaults; listed in the launcher's Controls tab, change them in killzone.ini under [Bindings])
