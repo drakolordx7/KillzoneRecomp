@@ -170,7 +170,7 @@ namespace
 	// MSVC accepts _mm_aesenc_si128 without any /arch flag; clang wants the target feature on the function.
 	__attribute__((target("aes")))
 #endif
-	MemoKey memoHash(const u8* p)
+	MemoKey memoHashAes(const u8* p)
 	{
 		const __m128i* q = reinterpret_cast<const __m128i*>(p);
 		__m128i a0 = _mm_set_epi64x(0x243F6A8885A308D3ll, 0x13198A2E03707344ll);
@@ -201,6 +201,35 @@ namespace
 		k.a = static_cast<u64>(_mm_cvtsi128_si64(r));
 		k.b = static_cast<u64>(_mm_extract_epi64(r, 1));
 		return k;
+	}
+
+	// Same kind of key for CPUs without AES-NI (Core 2 / Penryn, Nehalem, Phenom: the SSE4.1 baseline, issue #8): two
+	// independent multiply-rotate lanes per 8-byte word, folded at the end. Slower than the AES path but only a few microseconds
+	// per VU1 code change.
+	MemoKey memoHashScalar(const u8* p)
+	{
+		constexpr u64 K1 = 0x9E3779B97F4A7C15ull, K2 = 0xC2B2AE3D27D4EB4Full, K3 = 0x165667B19E3779F9ull, K4 = 0xD6E8FEB86659FD93ull;
+		u64 a = 0x243F6A8885A308D3ull, b = 0x13198A2E03707344ull;
+		for (size_t i = 0; i < 0x4000; i += 8)
+		{
+			u64 w;
+			std::memcpy(&w, p + i, 8);
+			a = _rotl64(a ^ (w * K1), 31) * K2;
+			b = _rotl64(b + (w ^ K3) * K4, 27) * K1 + i;
+		}
+		auto fin = [](u64 h) { h ^= h >> 33; h *= 0xFF51AFD7ED558CCDull; h ^= h >> 33; h *= 0xC4CEB9FE1A85EC53ull; return h ^ (h >> 33); };
+		MemoKey k;
+		k.a = fin(a ^ _rotl64(b, 17));
+		k.b = fin(b + a * K3);
+		return k;
+	}
+
+	MemoKey memoHash(const u8* p)
+	{
+		static const bool aes = [] { // KZ_VU_HASH_SCALAR=1 tests the non-AES path
+			const char* e = std::getenv("KZ_VU_HASH_SCALAR");
+			int r[4]; __cpuid(r, 1); return ((r[2] >> 25) & 1) != 0 && !(e && *e == '1'); }();
+		return aes ? memoHashAes(p) : memoHashScalar(p);
 	}
 
 	// The ranges the program was compiled from equal `mem` (the program's own copy of them is prog.data).
