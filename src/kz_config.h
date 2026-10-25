@@ -59,6 +59,10 @@ struct KzConfig
     // View distance (docs/findings.md "Draw distance and LOD"). 1 = original.
     float renderDistance = 1.0f; // multiplies each render zone's far plane and fog start/end
     float lodScale = 1.0f;       // multiplies the LOD detail scale (higher = detailed meshes farther away)
+    // Field of view (src/kz_widescreen.cpp "Field of view"), horizontal degrees measured at 16:9; 0 = the game's own.
+    // Native: world 87.1 (56.25 vertical), first-person weapon 72.7 (45 vertical). Zoom keeps its magnification.
+    float fov = 0.0f;       // 0 or 60..130
+    float weaponFov = 0.0f; // 0 or 50..120; higher shows more of the gun and arms (the model looks smaller)
 
     // Input
     float mouseSensitivity = 1.0f;

@@ -2,6 +2,7 @@
 
 #include "kz_iso.h"
 #include "kz_input.h"
+#include "kz_widescreen.h"
 
 #include <SDL3/SDL.h>
 #include <imgui.h>
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cfloat>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -164,6 +166,26 @@ namespace
         ImGui::SetNextItemWidth(-FLT_MIN);
     }
 
+    // Field of view row: a slider in horizontal degrees at 16:9 and a button back to the game's own value (stored as 0).
+    void fovRow(const char *label, const char *help, float &value, float native, float lo, float hi)
+    {
+        row(label, help);
+        ImGui::PushID(label);
+        const ImGuiStyle &style = ImGui::GetStyle();
+        const float buttonWidth = ImGui::CalcTextSize("Original").x + style.FramePadding.x * 2.0f;
+        ImGui::SetNextItemWidth(-(buttonWidth + style.ItemSpacing.x));
+        float v = value > 0.0f ? value : native;
+        const bool original = value <= 0.0f;
+        if (ImGui::SliderFloat("##v", &v, lo, hi, original ? "%.0f (original)" : "%.0f"))
+            value = std::fabs(v - native) < 0.5f ? 0.0f : std::round(v);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(original);
+        if (ImGui::Button("Original"))
+            value = 0.0f;
+        ImGui::EndDisabled();
+        ImGui::PopID();
+    }
+
     // On/off row; `onText` / `offText` say what each state means.
     void toggleRow(const char *label, const char *help, bool &value, const char *onText = "On", const char *offText = "Off")
     {
@@ -305,7 +327,7 @@ namespace
                     {
                         cfg.fxaa = false; cfg.smaa = false; cfg.sharpScaling = false; cfg.bilinear = true;
                         cfg.noiseFilter = true; cfg.motionBlur = true; cfg.glow = true; cfg.lensBlur = true;
-                        cfg.renderDistance = 1.0f; cfg.lodScale = 1.0f; cfg.sharpen = 0;
+                        cfg.renderDistance = 1.0f; cfg.lodScale = 1.0f; cfg.sharpen = 0; cfg.fov = 0.0f; cfg.weaponFov = 0.0f;
                     }
 
                     section("Output");
@@ -331,6 +353,16 @@ namespace
                         const char *scalings[] = {"Sharp (crisp pixels)", "Smooth (softer)"};
                         if (ImGui::Combo("##scaling", &scaling, scalings, 2))
                             cfg.sharpScaling = scaling == 0;
+                        ImGui::EndTable();
+                    }
+
+                    section("Field of view");
+                    if (beginRows("fov"))
+                    {
+                        fovRow("Field of view", "Degrees across a 16:9 screen; ultrawide adds more at the sides. Zoom keeps its magnification.",
+                               cfg.fov, kzFovNativeWorld(), 60.0f, 130.0f);
+                        fovRow("Weapon field of view", "Higher shows more of the gun and arms (they look smaller). Lower brings the gun closer.",
+                               cfg.weaponFov, kzFovNativeWeapon(), 50.0f, 120.0f);
                         ImGui::EndTable();
                     }
 

@@ -6,3 +6,8 @@
 class PS2Runtime;
 
 void kzAimInstall(PS2Runtime &runtime);
+
+#include <cstdint>
+
+// Local player 0's entity (0 until its controller has run once). EE thread only. Its camera object is player+0x3C.
+uint32_t kzAimPlayer();

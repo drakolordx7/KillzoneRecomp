@@ -144,12 +144,14 @@ namespace
         a.aspect = KzAspect::Classic4x3;
         a.mouseSensitivity = 2.5f;
         a.invertY = true;
+        a.fov = 100.0f;
+        a.weaponFov = 85.0f;
         a.isoPath = "C:/games/Killzone (USA).iso";
         const auto tmp = std::filesystem::temp_directory_path() / "kz_selftest.ini";
         if (!kzSaveConfig(tmp, a)) { std::cerr << "[selftest] FAIL: save config" << std::endl; ++failures; }
         const KzConfig b = kzLoadConfig(tmp);
         if (b.windowMode != a.windowMode || b.fpsLimit != 144 || b.upscale != 4 || b.aspect != a.aspect ||
-            b.mouseSensitivity != 2.5f || !b.invertY || b.isoPath != a.isoPath)
+            b.mouseSensitivity != 2.5f || !b.invertY || b.isoPath != a.isoPath || b.fov != 100.0f || b.weaponFov != 85.0f)
         {
             std::cerr << "[selftest] FAIL: config round-trip" << std::endl;
             ++failures;
@@ -364,9 +366,11 @@ int main(int argc, char *argv[])
         kzAimInstall(runtime);
         kzTimeFixInstall(runtime);
         kzPostInstall(runtime);
-        // Ultrawide hooks only when an ultrawide aspect is chosen (or forced for tests): other aspects keep the game's own path.
+        // Ultrawide hooks only when an ultrawide aspect or a field of view other than the game's is chosen (or forced for tests):
+        // otherwise the game's own path is kept. The field of view uses the same render hooks (kz_widescreen.cpp).
+        kzWideSetFov(cfg.fov, cfg.weaponFov);
         if (cfg.aspect == KzAspect::UltrawideAuto || cfg.aspect == KzAspect::Ultrawide21x9 || cfg.aspect == KzAspect::Ultrawide32x9 ||
-            std::getenv("KZ_WIDE_ASPECT"))
+            cfg.fov > 0.0f || cfg.weaponFov > 0.0f || std::getenv("KZ_WIDE_ASPECT"))
             kzWideInstall(runtime);
         kzPromptsInstall(runtime); // after kzWideInstall: wraps the same text function
         kzMoviesInstall(runtime);

@@ -1,8 +1,10 @@
 #include "kz_widescreen.h"
 
+#include "kz_aim.h"
 #include "kzgs.h"
 #include "ps2_runtime.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -23,6 +25,13 @@
 //   0x167718 text (f12 x, f13 y, a0 -> float x/y scale, a1 string, a2 font, a3 colour): glyph positions are computed on the CPU in pixels.
 //   0x15CF60 screen rectangle fill (f12 x, f13 y, f14 width, f15 height): full-width rectangles are extended over the widened area.
 //   0x150090 the frame kick (D1 CHCR store).
+//
+// Field of view (FieldOfView / WeaponFieldOfView): the same hooks change the vertical field of view for rendering only.
+//   World: camera +0x70 (vertical degrees) is changed next to the aspect in 0x1C1960 and held like it (sky, skyline and
+//   the culling planes follow; the game logic keeps the original value). Only the local player's camera (player+0x3C)
+//   is changed, so cutscene cameras keep their framing. Weapon: f12 of the weapon's 0x16E2D8 call. Both are scaled in
+//   tangent space, tan(fov'/2) = tan(fov/2) * s, so the zoom levels (which lower the camera's fov) keep their
+//   magnification relative to the new unzoomed view and the transitions stay smooth.
 namespace
 {
     constexpr uint32_t kRamMask = 0x01FFFFFFu;
@@ -69,6 +78,29 @@ namespace
     // had yielded inside 0x1C1960 (camera still widened, see above) were they right: that was the flicker. The camera therefore stays widened until the
     // first hook after the world pass (first-person weapon, 2D setup, frame limiter, next view setup). KZ_WIDE_HOLD=0: undo at once (old behaviour, A/B).
     bool g_hold = true;
+    // Field of view: tangent scale factors (1 = the game's own), set from the settings.
+    std::atomic<float> g_fovScale{1.0f};
+    std::atomic<float> g_weaponFovScale{1.0f};
+    uint32_t g_pendCamFovOn = 0; // the pending camera also has its fov (+0x70) changed
+    float g_pendCamFov = 0.0f;
+    bool g_vmWide = false;   // the weapon pass belongs to a widened frame (its aspect is widened)
+    bool g_vmLogged = false;
+    constexpr float kPi = 3.14159265358979f;
+    // Native fields of view, horizontal at 16:9 from the game's vertical ones (findings: 75 and 60 at 4:3 = 56.25 and 45 vertical).
+    float hFrom(float vDeg) { return 2.0f * std::atan(std::tan(vDeg * kPi / 360.0f) * (16.0f / 9.0f)) * 360.0f / kPi; }
+    float tanScale(float userH, float nativeH)
+    {
+        return userH > 1.0f ? std::tan(userH * kPi / 360.0f) / std::tan(nativeH * kPi / 360.0f) : 1.0f;
+    }
+    // fov' with tan(fov'/2) = tan(fov/2) * s; radians when fov < pi (the unit of a value is not documented for every caller).
+    float scaleFov(float fov, float s)
+    {
+        const bool deg = fov > 3.2f;
+        const float half = deg ? fov * kPi / 360.0f : fov * 0.5f;
+        float r = 2.0f * std::atan(std::tan(half) * s);
+        r = std::min(r, 170.0f * kPi / 180.0f);
+        return deg ? r * 180.0f / kPi : r;
+    }
 
     PS2Runtime::RecompiledFunction g_origViewBuild = nullptr, g_origWorld = nullptr, g_origViewmodel = nullptr, g_origFrustum = nullptr, g_origOrtho = nullptr, g_origKick = nullptr, g_origText = nullptr, g_origLimiter = nullptr, g_origRect = nullptr;
 
@@ -92,7 +124,10 @@ namespace
         if (g_pendCam)
         {
             wrF(rdram, g_pendCam + 0x74, g_pendCamAspect);
+            if (g_pendCamFovOn)
+                wrF(rdram, g_pendCam + 0x70, g_pendCamFov);
             g_pendCam = 0;
+            g_pendCamFovOn = 0;
         }
         if (g_pendScale)
         {
@@ -100,6 +135,7 @@ namespace
             g_pendScale = 0;
         }
         g_inViewmodel = false;
+        g_vmWide = false;
     }
 
     float factor()
@@ -118,8 +154,8 @@ namespace
     {
         const bool entry = ctx->pc == kWorld;
         const uint32_t cam = getRegU32(ctx, 6);
-        float saved = 0.0f;
-        bool widened = false;
+        float saved = 0.0f, savedFov = 0.0f;
+        bool widened = false, fovChanged = false;
         if (entry)
         {
             flushPending(rdram);
@@ -138,17 +174,36 @@ namespace
                     g_k = k;
                 }
             }
+            const float s = g_fovScale.load(std::memory_order_relaxed);
+            const uint32_t player = kzAimPlayer();
+            if (s != 1.0f && ramPtr(cam) && ramPtr(player) && rd32(rdram, player + 0x3C) == cam)
+            {
+                savedFov = rdF(rdram, cam + 0x70);
+                if (savedFov > 1.0f && savedFov < 170.0f)
+                {
+                    if (!widened)
+                        saved = rdF(rdram, cam + 0x74);
+                    wrF(rdram, cam + 0x70, scaleFov(savedFov, s));
+                    fovChanged = true;
+                }
+            }
         }
         const uint32_t ra = getRegU32(ctx, 31);
         g_origWorld(rdram, ctx, rt);
-        if (widened)
+        if (widened || fovChanged)
         {
             if ((ctx->pc == ra && !g_hold) || !g_defer)
+            {
                 wrF(rdram, cam + 0x74, saved);
-            else // the guest yielded inside: the camera stays widened until the call has really finished
+                if (fovChanged)
+                    wrF(rdram, cam + 0x70, savedFov);
+            }
+            else // the guest yielded inside, or the sky passes after it still need it: the camera stays changed until the next flush
             {
                 g_pendCam = cam;
-                g_pendCamAspect = saved;
+                g_pendCamAspect = saved; // unchanged value when only the fov was changed
+                g_pendCamFovOn = fovChanged ? 1u : 0u;
+                g_pendCamFov = savedFov;
                 ++g_yields;
                 logEv("world-yield", ctx->pc, 1.0f);
             }
@@ -174,12 +229,16 @@ namespace
         {
             flushPending(rdram);
             logEv("viewmodel");
-            g_inViewmodel = g_worldWide;
+            g_vmWide = g_worldWide;
+            g_inViewmodel = g_worldWide || g_weaponFovScale.load(std::memory_order_relaxed) != 1.0f;
         }
         const uint32_t ra = getRegU32(ctx, 31);
         g_origViewmodel(rdram, ctx, rt);
         if (entry && (ctx->pc == ra || !g_defer)) // when it yielded inside, the flag stays set until the next flush
+        {
             g_inViewmodel = false;
+            g_vmWide = false;
+        }
     }
 
     void frustum(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
@@ -188,7 +247,21 @@ namespace
         {
             logEv("frustum", 0, ctx->f[13]);
             if (g_inViewmodel)
-                ctx->f[13] *= g_k;
+            {
+                if (g_vmWide)
+                    ctx->f[13] *= g_k;
+                const float s = g_weaponFovScale.load(std::memory_order_relaxed);
+                if (s != 1.0f && ctx->f[12] > 0.0f && ctx->f[12] < 170.0f)
+                {
+                    const float before = ctx->f[12];
+                    ctx->f[12] = scaleFov(before, s);
+                    if (!g_vmLogged)
+                    {
+                        std::printf("[kz] weapon field of view: %.3f -> %.3f\n", before, ctx->f[12]);
+                        g_vmLogged = true;
+                    }
+                }
+            }
         }
         g_origFrustum(rdram, ctx, rt);
     }
@@ -355,6 +428,19 @@ void kzWideSetTargetAspect(float aspect)
 
 bool kzWideTakeFrameFlag() { return g_latched.load(std::memory_order_relaxed); }
 
+float kzFovNativeWorld() { return hFrom(56.25f); }
+float kzFovNativeWeapon() { return hFrom(45.0f); }
+
+void kzWideSetFov(float worldDegrees, float weaponDegrees)
+{
+    const float sw = tanScale(worldDegrees, kzFovNativeWorld()), sv = tanScale(weaponDegrees, kzFovNativeWeapon());
+    // Within a fraction of a degree of native: off, so the game's own values pass through untouched.
+    g_fovScale.store(std::fabs(sw - 1.0f) < 0.005f ? 1.0f : sw, std::memory_order_relaxed);
+    g_weaponFovScale.store(std::fabs(sv - 1.0f) < 0.005f ? 1.0f : sv, std::memory_order_relaxed);
+    std::printf("[kz] field of view: world %.1f (x%.3f), weapon %.1f (x%.3f)\n", worldDegrees > 0.0f ? worldDegrees : kzFovNativeWorld(),
+                g_fovScale.load(), weaponDegrees > 0.0f ? weaponDegrees : kzFovNativeWeapon(), g_weaponFovScale.load());
+}
+
 void kzWideInstall(PS2Runtime &runtime)
 {
     g_log = std::getenv("KZ_WIDE_LOG") != nullptr;
@@ -373,5 +459,5 @@ void kzWideInstall(PS2Runtime &runtime)
         traceInstall<2>(runtime, 0x001EF640u, "postfx");
         traceInstall<3>(runtime, 0x001C3040u, "c3040");
     }
-    std::printf("[kz] ultrawide hooks: %s\n", ok ? "installed" : "FAILED");
+    std::printf("[kz] ultrawide/fov hooks: %s\n", ok ? "installed" : "FAILED");
 }
