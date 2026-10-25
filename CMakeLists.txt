@@ -101,7 +101,7 @@ add_library(kz_port STATIC
     "${KZ_IMGUI_DIR}/backends/imgui_impl_sdl3.cpp"
     "${KZ_IMGUI_DIR}/backends/imgui_impl_sdlrenderer3.cpp")
 target_include_directories(kz_port PRIVATE "${CMAKE_SOURCE_DIR}/src" "${KZ_IMGUI_DIR}" "${KZ_IMGUI_DIR}/backends")
-target_link_libraries(kz_port PRIVATE ps2_runtime SDL3::SDL3 imgui kzgs kzvu kzipu kzspu2)
+target_link_libraries(kz_port PRIVATE ps2_runtime SDL3::SDL3 imgui kz_pcsx2_libs) # kzgs kzvu kzipu kzspu2, see below
 target_compile_definitions(kz_port PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 # The CPU check runs before the C runtime on any x64 CPU, so it is built without AVX2 (src/kz_cpucheck.cpp, issue #14).
 # KZ_CPUCHECK_ISA tells it which instructions this build needs: 0 = MULTI, 1 = SSE4, 2 = AVX2.
@@ -122,20 +122,36 @@ if(KZ_CLANG_CL AND KZ_CLANG_PGO_GEN)
     target_compile_definitions(kz_port PRIVATE KZ_PGO_GEN=1)
 endif()
 
-# KZ_ISA=MULTI: the per-ISA libraries of kzgs, kzipu and kzspu2, linked whole-archive with every SSE4.1 copy first, then
-# every AVX copy, then every AVX2 copy. The linker keeps the first copy of an inline function it loads, so a function the
-# baseline code calls never resolves to an AVX/AVX2 build of it (see the MULTI section of ext/kzgs/CMakeLists.txt).
-add_library(kz_multi_isa INTERFACE)
+# The PCSX2 libraries as the exe links them: kz_pcsx2_libs (kzgs, kzvu, kzipu, kzspu2) for the game, kz_gs_libs (kzgs) for
+# kz_gs_replay.
+# KZ_ISA=MULTI: the AVX/AVX2 copies of the per-ISA files emit their own out-of-line copies of inline functions from the
+# shared headers (STL, fmt, GSVector, ...) under the same names as the baseline code, and the linker keeps one copy of
+# each (COMDAT "select any"). link.exe keeps the copy from the object it loads first; /WHOLEARCHIVE members are loaded
+# like objects named on the command line, in command-line order, before any library member pulled in on demand. So the
+# shared kzgs, kzipu and kzspu2 libraries are whole-archived first, then every SSE4.1 copy, then every AVX copy, then
+# every AVX2 copy: a function the baseline code of those libraries uses resolves to a baseline build of it. (kz_port is
+# whole-archived by the exe ahead of these.) kzvu cannot be whole-archived (it carries the same pcsx2/common objects as
+# kzgs, LNK2005), so it, ps2_runtime and imgui are still pulled on demand after the per-ISA copies; a function only they
+# and an AVX copy emit out of line could still resolve to the AVX copy, which a scan of the linked exe catches.
+add_library(kz_pcsx2_libs INTERFACE)
+add_library(kz_gs_libs INTERFACE)
 if(KZ_ISA STREQUAL "MULTI")
     set(_kz_isa_libs "")
+    set(_kz_gs_isa_libs "")
     foreach(_isa sse4 avx avx2)
         get_property(_libs GLOBAL PROPERTY KZ_MULTI_ISA_LIBS_${_isa})
         list(APPEND _kz_isa_libs ${_libs})
+        list(FILTER _libs INCLUDE REGEX "^kzgs_")
+        list(APPEND _kz_gs_isa_libs ${_libs})
     endforeach()
     list(JOIN _kz_isa_libs "," _kz_isa_libs)
-    target_link_libraries(kz_multi_isa INTERFACE "$<LINK_LIBRARY:WHOLE_ARCHIVE,${_kz_isa_libs}>")
+    list(JOIN _kz_gs_isa_libs "," _kz_gs_isa_libs)
+    target_link_libraries(kz_pcsx2_libs INTERFACE "$<LINK_LIBRARY:WHOLE_ARCHIVE,kzgs,kzipu,kzspu2,${_kz_isa_libs}>" kzvu)
+    target_link_libraries(kz_gs_libs INTERFACE "$<LINK_LIBRARY:WHOLE_ARCHIVE,kzgs,${_kz_gs_isa_libs}>")
+else()
+    target_link_libraries(kz_pcsx2_libs INTERFACE kzgs kzvu kzipu kzspu2)
+    target_link_libraries(kz_gs_libs INTERFACE kzgs)
 endif()
-target_link_libraries(kz_port PRIVATE kz_multi_isa)
 
 add_executable(killzone
     ${KZ_GENERATED_SRC}
@@ -174,7 +190,7 @@ add_custom_command(TARGET killzone POST_BUILD
 
 # Offline GS trace replay (tools/gs_replay): renders a KZ_GS_TRACE recording through kzgs.
 add_executable(kz_gs_replay tools/gs_replay/gs_replay.cpp)
-target_link_libraries(kz_gs_replay PRIVATE kzgs SDL3::SDL3 kz_multi_isa)
+target_link_libraries(kz_gs_replay PRIVATE kz_gs_libs SDL3::SDL3)
 target_compile_features(kz_gs_replay PRIVATE cxx_std_20)
 add_executable(kz_gs_replay_cpu tools/gs_replay/gs_replay_cpu.cpp)
 target_link_libraries(kz_gs_replay_cpu PRIVATE ps2_runtime)

@@ -152,3 +152,10 @@ namespace BuildVersion
 	int GitTagMid = 0;
 	int GitTagLo = 0;
 } // namespace BuildVersion
+
+// common/Windows/WinHostSys.cpp references this (its page fault handler, which kzgs never installs). Needed when kzgs.lib
+// is linked whole-archive (KZ_ISA=MULTI, see the top-level CMakeLists.txt).
+PageFaultHandler::HandlerResult PageFaultHandler::HandlePageFault(void*, void*, bool)
+{
+	return HandlerResult::ExecuteNextHandler;
+}

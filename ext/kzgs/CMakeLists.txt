@@ -334,10 +334,10 @@ target_include_directories(kzgs PRIVATE "${KZGS_ROOT}/third_party/smaa")
 # MULTI: the unshared sources as three static libraries, as in PCSX2 (GS-sse4 / GS-avx / GS-avx2). Code in them is only
 # reached through MULTI_ISA_SELECT, so the AVX/AVX2 copies never run on a CPU without those instructions. Inline
 # functions from shared headers (STL, GSVector, ...) are emitted in every copy under the same name, and the linker keeps
-# the first copy it loads, so the libraries are linked whole-archive, oldest ISA first, before the on-demand objects of
-# kzgs.lib. Each library is appended to the global property KZ_MULTI_ISA_LIBS_<isa>; inside the game build the top-level
-# CMakeLists.txt links all sse4 libraries (kzgs, kzipu, kzspu2), then all avx, then all avx2. A standalone kzgs build
-# links its own three here.
+# the first copy it loads, so the shared libraries and then the per-ISA ones are linked whole-archive, oldest ISA first.
+# Each library is appended to the global property KZ_MULTI_ISA_LIBS_<isa>; inside the game build the top-level
+# CMakeLists.txt (kz_pcsx2_libs) links kzgs, kzipu, kzspu2, then all sse4 libraries, then all avx, then all avx2.
+# A standalone kzgs build links its own three here.
 # ---------------------------------------------------------------------------------------------------------------------
 if(KZGS_ISA STREQUAL "MULTI")
 	set(KZGS_ARCH_sse4 "")
