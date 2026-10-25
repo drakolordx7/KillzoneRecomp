@@ -36,9 +36,7 @@ void kzPatchesApply(uint8_t *rdram, const KzConfig &cfg)
     if (cfg.aspect == KzAspect::Widescreen16x9 || cfg.aspect == KzAspect::UltrawideAuto || cfg.aspect == KzAspect::Ultrawide21x9 ||
         cfg.aspect == KzAspect::Ultrawide32x9) // the ultrawide modes build on the native 16:9 mode (kz_widescreen.cpp)
     {
-        uint32_t obj;
-        std::memcpy(&obj, rdram + (kzAddrs().gameObjectPtr & kRamMask), 4);
-        if (obj >= 0x00100000u && obj < 0x02000000u)
+        if (const uint32_t obj = kzLiveGameObject(rdram)) // only through a live game object (kz_addrs.h)
             w32(rdram, obj + kWidescreenFieldOffset, 1u);
     }
     // The film grain is switched in kz_post.cpp (the post-process object's own noise strength). The community pnach

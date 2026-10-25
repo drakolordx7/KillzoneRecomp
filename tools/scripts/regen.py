@@ -61,6 +61,10 @@ def merged_config() -> str:
     lines = "".join(f'  "{s}",\n' for s in extra)
     text = re.sub(r"(stubs = \[\n)", lambda m: m.group(1) + lines, text, count=1)
     text = re.sub(r'^output = .*$', f'output = "{TMP.as_posix()}"', text, count=1, flags=re.M)
+    # The config's paths are relative to the repo root; ps2_recomp gets them absolute.
+    text = re.sub(r'^input = .*$', lambda m: f'input = "{ELF.resolve().as_posix()}"', text, count=1, flags=re.M)
+    text = re.sub(r'^ghidra_output = .*$', lambda m: f'ghidra_output = "{Path(os.environ["KZ_FUNCS_CSV"]).resolve().as_posix()}"',
+                  text, count=1, flags=re.M)
     print(f"[regen] +{len(extra)} SCE library bindings from ps2_analyzer")
     subprocess.run([sys.executable, str(ROOT / "tools" / "scripts" / "find_code_pointers.py")], check=True)
     entries = [l.strip() for l in CODE_POINTERS.read_text().splitlines() if l.strip()]

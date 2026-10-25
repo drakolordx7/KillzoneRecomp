@@ -1,5 +1,8 @@
 #include "kz_addrs.h"
 
+#include <cstdio>
+#include <cstring>
+
 // US: SCUS_974.02 (the addresses the code always used). PAL: SCES_528.93, from work/pal/hookmap.csv, each checked
 // against the PAL ELF (issue #15):
 //  - code: the PAL function has the same instructions as the US one apart from relocated immediates (jal targets,
@@ -16,6 +19,7 @@
 
 const KzAddrs kKzAddrsUs = {
     .gameObjectPtr = 0x00559178u,
+    .gameObjectVtable = 0x005222B8u,
     .bufferIndex = 0x0055A6B4u,
     .vsyncCounter = 0x0055A6E0u,
     .secondsPerVsync = 0x0055A6E4u,
@@ -94,6 +98,7 @@ const KzAddrs kKzAddrsUs = {
 
 const KzAddrs kKzAddrsPal = {
     .gameObjectPtr = 0x00559F78u,
+    .gameObjectVtable = 0x00522F38u, // same function pointers as US 0x5222B8, relocated
     .bufferIndex = 0x0055B4B4u,
     .vsyncCounter = 0x0055B4E0u,
     .secondsPerVsync = 0x0055B4E4u,
@@ -173,4 +178,29 @@ const KzAddrs kKzAddrsPal = {
 namespace kz_detail
 {
     const KzAddrs *g_addrs = &kKzAddrsUs;
+}
+
+uint32_t kzLiveGameObject(const uint8_t *rdram)
+{
+    if (!rdram)
+        return 0;
+    uint32_t obj, vt;
+    std::memcpy(&obj, rdram + (kzAddrs().gameObjectPtr & 0x01FFFFFFu), 4);
+    if (obj < 0x00100000u || obj >= 0x02000000u || (obj & 3u))
+        return 0;
+    std::memcpy(&vt, rdram + obj, 4);
+    if (vt == kzAddrs().gameObjectVtable)
+        return obj;
+    // Log each distinct rejected vtable once (a few at most), so a missed live object would show in killzone.log.
+    static uint32_t seen[8];
+    static int nSeen = 0;
+    for (int i = 0; i < nSeen; ++i)
+        if (seen[i] == vt)
+            return 0;
+    if (nSeen < 8)
+    {
+        seen[nSeen++] = vt;
+        std::fprintf(stderr, "[kz] game object pointer 0x%08X names vtable 0x%08X, not the game object; skipped\n", obj, vt);
+    }
+    return 0;
 }
