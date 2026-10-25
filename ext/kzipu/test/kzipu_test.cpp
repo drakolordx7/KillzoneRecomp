@@ -36,6 +36,7 @@ extern "C" {
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -1029,7 +1030,7 @@ private:
 // ---------------------------------------------------------------------------------------------------------------------
 int main(int argc, char** argv)
 {
-	std::string iso = "<path to Killzone (USA).iso>";
+	std::string iso = std::getenv("KZ_ISO") ? std::getenv("KZ_ISO") : "";
 	fs::path outDir = fs::path(__FILE__).parent_path() / "out";
 	size_t videos = 2, maxFrames = 20, esMb = 10;
 	for (int i = 1; i < argc; i++)

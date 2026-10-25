@@ -1,7 +1,7 @@
 # One headless gameplay run (same protocol as perf_run.ps1) with PS2X_VIF1_STATS=1 so vif_metric.py can read worker ms/frame.
 #   vif_run.ps1 -Name x [-Config pd] [-EnvSet "A=1;B=2"] [-Profile] [-Seconds 235] [-Ipu] [-NoStats] [-Exe killzone.exe]
 param([string]$Name, [string]$Config = 'pd', [string]$EnvSet = '', [switch]$Profile, [int]$Seconds = 235, [switch]$Ipu, [string]$Exe = "killzone.exe", [switch]$NoStats)
-$wd = '<repo>'; $iso = '<path to Killzone (USA).iso>'
+$wd = '<repo>'; $iso = $(if ($env:KZ_ISO) { $env:KZ_ISO } else { (Select-String '<repo>\dist\Killzone\killzone.ini' -Pattern '^ISO=(.*)').Matches[0].Groups[1].Value })
 $out = "$wd\work\$Name"; Remove-Item -Recurse -Force $out -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force $out | Out-Null
 $env:KZ_FPS = '120'
 if ($Ipu) { Remove-Item env:KZ_IPU -ErrorAction SilentlyContinue } else { $env:KZ_IPU = 'off' }

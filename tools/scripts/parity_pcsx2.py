@@ -18,7 +18,7 @@ from pcsx2_hidden import HiddenProcess
 
 ROOT = r'<repo>'
 PCSX2 = os.path.join(ROOT, 'tools', 'pcsx2_par')
-ISO = r'<path to Killzone (USA).iso>'
+ISO = os.environ.get('KZ_ISO') or next((l.split('=', 1)[1].strip() for l in open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'dist', 'Killzone', 'killzone.ini'), encoding='utf-8', errors='replace') if l.startswith('ISO=')), '')
 PORT = 28111
 SPU2_MUTED = ('\n\n[SPU2/Output]\nBackend = Null\nOutputMuted = true\nStandardVolume = 0\n'
               'FastForwardVolume = 0\nOutputVolume = 0\n')

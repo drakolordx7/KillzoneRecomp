@@ -137,13 +137,6 @@ Nothing here was built or run. Effort: S = days or less, M = about a week, L = w
 - **Effort:** M per handful of routines.
 - **Payoff:** 5-20% if the top of the guest profile is concentrated, else little.
 
-### 16. Automated perf loop over the codegen, with a differential harness
-- **Idea:** Give a search loop the profile, the codegen templates and a strict differential test (the existing kzvu/interpreter comparisons, ps2xTest, savestate checksums). Let it propose and measure codegen variants and hook implementations, keeping only bit-identical wins.
-- **Source:** Other recomp ports are now built this way (Wave Race 64, Pilotwings 64: https://github.com/elliotttate/wave-race-64-recomp, https://github.com/danielgomesvieira2000/pilotwings-64-recomp). ICO-recomp's Rust translator ships a reference interpreter specifically for this kind of checking: https://github.com/nathanialf/ico-recomp.
-- **Why here:** The bottleneck in #3, #5, #7 and #15 is careful, tedious, verifiable work, which suits automation. The risk is silent behaviour drift, so the differential harness is non-negotiable.
-- **Effort:** M (harness) plus ongoing.
-- **Payoff:** Multiplies the other items; not a gain by itself.
-
 ### 17. OS and CPU placement tuning
 - **Idea:** Pin the EE thread to the fastest P-core (or the best CCD), set it out of EcoQoS, raise timer resolution, use a high-resolution waitable timer for pacing, and consider large pages or a pre-touched guest RAM block. Keep IOP/SPU2/GS threads off the EE thread's SMT sibling.
 - **Source:** Windows hybrid scheduling notes and `SetThreadInformation`/EcoQoS: https://aloiskraus.wordpress.com/2024/02/08/hybrid-cpu-performance-on-windows-10-and-11/ and https://comcomponent.com/en/blog/2026/06/03/000-windows-app-cpu-priority-affinity-power/.
@@ -188,5 +181,5 @@ Nothing here was built or run. Effort: S = days or less, M = about a week, L = w
 2. #2 (IOP/SPU2 offload) and #8 (lazy timers, scheduler), then re-profile.
 3. #12 (sim at native 30 Hz) together with #4 (late-latch camera).
 4. #1 (GS-stream interpolation) with #19 pacing and #18 as needed.
-5. #3 (lean codegen) and #7 (fast memory), driven by #16's differential harness, in parallel with the above.
+5. #3 (lean codegen) and #7 (fast memory), checked with a differential test harness, in parallel with the above.
 6. #11 and #13 only if #1's heuristics prove too fragile.

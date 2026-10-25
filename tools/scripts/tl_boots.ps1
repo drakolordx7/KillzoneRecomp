@@ -3,7 +3,7 @@
 # Boots run Parallel at a time (more than one instance also stresses the start-up race the IOP module loader has under load).
 param([string]$Tag = 'boot', [int]$N = 12, [int]$Seconds = 50, [int]$Parallel = 3, [string]$Config = 'tl', [string]$EnvSet = 'KZ_FPS=120')
 $wd = '<repo>'
-$iso = '<path to Killzone (USA).iso>'
+$iso = $(if ($env:KZ_ISO) { $env:KZ_ISO } else { (Select-String '<repo>\dist\Killzone\killzone.ini' -Pattern '^ISO=(.*)').Matches[0].Groups[1].Value })
 $sb = {
     param($wd, $iso, $name, $seconds, $config, $envset)
     $out = "$wd\work\$name"; Remove-Item -Recurse -Force $out -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force $out | Out-Null

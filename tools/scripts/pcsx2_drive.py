@@ -20,7 +20,7 @@ from pine import Pine
 ROOT = r'<repo>'
 W = os.path.join(ROOT, 'work', 'pcsx2_drive')
 PCSX2 = os.path.join(ROOT, 'tools', 'pcsx2')
-ISO = r'<path to Killzone (USA).iso>'
+ISO = os.environ.get('KZ_ISO') or next((l.split('=', 1)[1].strip() for l in open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'dist', 'Killzone', 'killzone.ini'), encoding='utf-8', errors='replace') if l.startswith('ISO=')), '')
 PNACH_SRC = os.path.join(ROOT, 'tools', 'scripts', 'pcsx2_pad_hook.pnach')
 PNACH_DST = os.path.join(PCSX2, 'patches', 'SCUS-97402_CAAEC49C.pnach')
 INI = os.path.join(PCSX2, 'inis', 'PCSX2.ini')
