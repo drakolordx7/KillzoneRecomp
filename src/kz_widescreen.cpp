@@ -1,4 +1,5 @@
 #include "kz_widescreen.h"
+#include "kz_region.h"
 
 #include "kzgs.h"
 #include "ps2_runtime.h"
@@ -340,6 +341,8 @@ void kzWideConfigure(KzAspect aspect, int windowWidth, int windowHeight)
     }
     if (const char *v = std::getenv("KZ_WIDE_ASPECT")) // automation override
         target = static_cast<float>(std::atof(v));
+    if (kKzPal)
+        target = 0.0f; // PAL test build: the ultrawide hooks are not installed (kz_region.h)
     const float before = kzWideTargetAspect();
     kzWideSetTargetAspect(target);
     if (kzWideTargetAspect() != before)

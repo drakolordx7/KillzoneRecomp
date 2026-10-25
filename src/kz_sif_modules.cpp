@@ -5,6 +5,7 @@
 // tracker (g_sif_modules_by_id / g_sif_module_id_by_path, filled by sceSifLoadModule).
 
 #include "kz_sif_modules.h"
+#include "kz_region.h"
 
 #include "Syscalls/Common.h"
 #include "ps2_syscalls.h"
@@ -115,15 +116,18 @@ void kzLgkbmInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     const int32_t maxMouse = std::min<int32_t>(static_cast<int32_t>(getRegU32(ctx, 5)), 4);
     auto w32 = [rdram](uint32_t addr, uint32_t v) { std::memcpy(rdram + (addr & PS2_RAM_MASK), &v, 4); };
     auto w16 = [rdram](uint32_t addr, uint16_t v) { std::memcpy(rdram + (addr & PS2_RAM_MASK), &v, 2); };
-    w32(0x00590DD0u, static_cast<uint32_t>(maxKbd));
-    w32(0x00590DD4u, static_cast<uint32_t>(maxMouse));
+    // PAL test build (kz_region.h): the library state block moved from 0x590D90 to 0x591B90 (the PAL init at 0x3D80E0
+    // addresses it as 0x1B90(s4) where the US one uses 0x0D90(s4)); the layout inside it is the same.
+    constexpr uint32_t d = KZ_GADDR(0u, 0xE00u);
+    w32(d + 0x00590DD0u, static_cast<uint32_t>(maxKbd));
+    w32(d + 0x00590DD4u, static_cast<uint32_t>(maxMouse));
     for (int i = 0; i < 4; ++i)
     {
-        w16(0x00590E1Cu + i * 0x110u, 0xFFFFu); // keyboard slot device id
-        w32(0x00590E34u + i * 0x110u, 0u);      // keyboard slot state: not connected
-        w16(0x0059125Cu + i * 0x68u, 0xFFFFu);  // mouse slot device id
+        w16(d + 0x00590E1Cu + i * 0x110u, 0xFFFFu); // keyboard slot device id
+        w32(d + 0x00590E34u + i * 0x110u, 0u);      // keyboard slot state: not connected
+        w16(d + 0x0059125Cu + i * 0x68u, 0xFFFFu);  // mouse slot device id
     }
-    w32(0x00590DC4u, 1u); // library initialized
+    w32(d + 0x00590DC4u, 1u); // library initialized
     RUNTIME_LOG("[kz] lgkbm init HLE: maxKbd=" << maxKbd << " maxMouse=" << maxMouse << " (no USB devices)");
     setReturnS32(ctx, 0);
 }

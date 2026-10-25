@@ -1,4 +1,5 @@
 #include "kz_iso.h"
+#include "kz_region.h"
 
 #include <algorithm>
 #include <cctype>
@@ -8,6 +9,14 @@
 namespace
 {
     constexpr uint32_t kSector = 2048;
+    // Boot ELF and its PCSX2-style XOR CRC (kz_region.h: KZ_PAL_SPIKE builds take the PAL disc instead of the US one).
+#if defined(KZ_PAL_SPIKE)
+    constexpr const char *kBootElf = "SCES_528.93";
+    constexpr uint32_t kBootElfXorCrc = 0x69FE9BB6u;
+#else
+    constexpr const char *kBootElf = "SCUS_974.02";
+    constexpr uint32_t kBootElfXorCrc = 0xCAAEC49Cu;
+#endif
 
     uint32_t le32(const uint8_t *p)
     {
@@ -129,13 +138,14 @@ KzDiscCheck kzCheckDisc(const std::filesystem::path &isoPath)
         return r;
     }
     const std::string text(cnf.begin(), cnf.end());
-    if (text.find("SCUS_974.02") == std::string::npos)
+    if (text.find(kBootElf) == std::string::npos)
     {
-        r.message = "This is a different game or region. Killzone NTSC-U (SCUS-97402) is required.";
+        r.message = kKzPal ? "This is a different game or region. This test build needs Killzone PAL (SCES-52893)."
+                           : "This is a different game or region. Killzone NTSC-U (SCUS-97402) is required.";
         return r;
     }
     std::vector<uint8_t> elf;
-    const auto elfFile = iso.find("SCUS_974.02");
+    const auto elfFile = iso.find(kBootElf);
     if (!elfFile || !iso.read(*elfFile, elf))
     {
         r.message = "The game executable could not be read from the disc image.";
@@ -145,13 +155,14 @@ KzDiscCheck kzCheckDisc(const std::filesystem::path &isoPath)
     uint32_t crc = 0;
     for (size_t i = 0; i < elf.size(); i += 4)
         crc ^= le32(&elf[i]);
-    if (crc != 0xCAAEC49Cu)
+    if (crc != kBootElfXorCrc)
     {
-        r.message = "Killzone NTSC-U found, but a different revision than v1.00; it is not supported.";
+        r.message = kKzPal ? "Killzone PAL found, but a different revision; it is not supported."
+                           : "Killzone NTSC-U found, but a different revision than v1.00; it is not supported.";
         return r;
     }
     r.ok = true;
-    r.message = "Killzone (USA) v1.00 - SCUS-97402 - OK";
+    r.message = kKzPal ? "Killzone (Europe) - SCES-52893 - OK (PAL test build)" : "Killzone (USA) v1.00 - SCUS-97402 - OK";
     return r;
 }
 
@@ -167,7 +178,10 @@ std::filesystem::path kzPrepareDiscFiles(const std::filesystem::path &isoPath, c
     if (!iso.open(isoPath, error))
         return {};
     static const char *kFiles[] = {
-        "SYSTEM.CNF", "SCUS_974.02",
+        "SYSTEM.CNF", kBootElf,
+#if defined(KZ_PAL_SPIKE)
+        "IOP/IOPRP300.IMG", // the PAL disc's IOP reboot image (the US disc has DNAS300.IMG, not extracted)
+#endif
         "IOP/DEV9.IRX", "IOP/EZNETCNF.IRX", "IOP/EZNETCTL.IRX", "IOP/INET.IRX", "IOP/INETCTL.IRX", "IOP/LGAUD.IRX",
         "IOP/LGKBM.IRX", "IOP/LIBNETB.IRX", "IOP/LIBSD.IRX", "IOP/MCMAN.IRX", "IOP/MCSERV.IRX", "IOP/MSIFRPC.IRX",
         "IOP/NETCNF.IRX", "IOP/NTPWROFF.IRX", "IOP/PADMAN.IRX", "IOP/PFILE_R.IRX", "IOP/PINPUT_R.IRX", "IOP/POWEROFF.IRX",
@@ -198,5 +212,5 @@ std::filesystem::path kzPrepareDiscFiles(const std::filesystem::path &isoPath, c
             return {};
         }
     }
-    return dir / "SCUS_974.02";
+    return dir / kBootElf;
 }
