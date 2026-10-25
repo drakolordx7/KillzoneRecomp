@@ -17,6 +17,42 @@ alignas(16) u8 iopHw[0x10000];
 
 const Kzspu2Console kzspu2_Console;
 
+// ---- CPU features for MULTI_ISA_SELECT (KZ_ISA=MULTI) ----------------------------------------------------------------------
+// The same choice as kzgs (shim/KzMultiISA.cpp): AVX2 when the CPU and the OS support it, else AVX, else SSE4;
+// OVERRIDE_VECTOR_ISA=sse4|avx|avx2 forces one.
+#ifdef MULTI_ISA_SHARED_COMPILATION
+#include <intrin.h>
+static ProcessorFeatures DetectProcessorFeatures()
+{
+	ProcessorFeatures f = {};
+	int r[4];
+	__cpuid(r, 0);
+	const int max_leaf = r[0];
+	__cpuid(r, 1);
+	const bool avx = ((r[2] >> 28) & 1) && ((r[2] >> 27) & 1) && (_xgetbv(0) & 6) == 6; // AVX + OSXSAVE + YMM state
+	f.hasFMA = avx && ((r[2] >> 12) & 1);
+	bool avx2 = false;
+	if (max_leaf >= 7)
+	{
+		__cpuidex(r, 7, 0);
+		avx2 = avx && ((r[1] >> 5) & 1);
+		f.hasBMI2 = ((r[1] >> 3) & 1) && ((r[1] >> 8) & 1);
+	}
+	f.vectorISA = avx2 ? ProcessorFeatures::VectorISA::AVX2 : avx ? ProcessorFeatures::VectorISA::AVX : ProcessorFeatures::VectorISA::SSE4;
+	if (const char* over = std::getenv("OVERRIDE_VECTOR_ISA"))
+	{
+		if (_stricmp(over, "avx2") == 0 || _stricmp(over, "avx512f") == 0)
+			f.vectorISA = ProcessorFeatures::VectorISA::AVX2;
+		else if (_stricmp(over, "avx") == 0)
+			f.vectorISA = ProcessorFeatures::VectorISA::AVX;
+		else if (_stricmp(over, "sse4") == 0)
+			f.vectorISA = ProcessorFeatures::VectorISA::SSE4;
+	}
+	return f;
+}
+const ProcessorFeatures g_cpu = DetectProcessorFeatures();
+#endif
+
 namespace kzspu2
 {
 	HostHooks g_host;

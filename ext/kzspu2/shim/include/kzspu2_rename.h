@@ -52,6 +52,10 @@
 #define DCFilterIn kzspu2_DCFilterIn
 #define DCFilterOut kzspu2_DCFilterOut
 #define isa_native kzspu2_isa
+#define isa_sse4 kzspu2_isa_sse4 // KZ_ISA=MULTI namespaces
+#define isa_avx kzspu2_isa_avx
+#define isa_avx2 kzspu2_isa_avx2
+#define g_cpu kzspu2_g_cpu
 #define SPU2 kzspu2_SPU2
 #define SPU2Savestate kzspu2_SPU2Savestate
 #define WaveDump kzspu2_WaveDump

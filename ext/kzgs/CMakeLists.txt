@@ -15,8 +15,12 @@ endif()
 set(KZGS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 set(KZGS_PCSX2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../pcsx2" CACHE PATH "PCSX2 source tree")
 set(KZGS_DEPS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/deps/deps" CACHE PATH "Extracted pcsx2-windows-dependencies bundle")
-set(KZGS_ISA "AVX2" CACHE STRING "Vector ISA the GS is compiled for (SSE4, AVX, AVX2)")
-set_property(CACHE KZGS_ISA PROPERTY STRINGS SSE4 AVX AVX2)
+# KZGS_ISA: the vector ISA the GS is compiled for (SSE4, AVX, AVX2), or MULTI: PCSX2's multi-ISA build. Everything is
+# compiled for the baseline (no /arch: SSE2 code generation, SSE4.1 intrinsics) and only the "unshared" per-ISA files
+# are compiled three times (SSE4.1 / AVX / AVX2, namespaces isa_sse4 / isa_avx / isa_avx2), picked at run time by
+# MULTI_ISA_SELECT from g_cpu (shim/KzMultiISA.cpp).
+set(KZGS_ISA "AVX2" CACHE STRING "Vector ISA the GS is compiled for (SSE4, AVX, AVX2, MULTI)")
+set_property(CACHE KZGS_ISA PROPERTY STRINGS MULTI SSE4 AVX AVX2)
 option(KZGS_BUILD_TEST "Build the kzgs_test executable" ${PROJECT_IS_TOP_LEVEL})
 option(KZGS_BUILD_TOOLS "Build kzgs debug tools (kzgs_replay)" ${PROJECT_IS_TOP_LEVEL})
 
@@ -68,6 +72,11 @@ elseif(KZGS_ISA STREQUAL "AVX")
 	target_compile_options(kzgs_flags INTERFACE $<$<COMPILE_LANGUAGE:C,CXX>:/arch:AVX>)
 elseif(KZGS_ISA STREQUAL "SSE4")
 	target_compile_options(kzgs_flags INTERFACE $<$<COMPILE_LANGUAGE:C,CXX>:/arch:SSE4.2>)
+elseif(KZGS_ISA STREQUAL "MULTI")
+	# No /arch (baseline). __SSE4_1__ above gives _M_SSE 0x401 (common/VectorIntrin.h). Every target that links
+	# kzgs_flags is shared code, except the per-ISA libraries below, which set the KZGS_UNSHARED target property.
+	target_compile_definitions(kzgs_flags INTERFACE
+		"$<$<NOT:$<BOOL:$<TARGET_PROPERTY:KZGS_UNSHARED>>>:MULTI_ISA_SHARED_COMPILATION>")
 endif()
 target_include_directories(kzgs_flags INTERFACE
 	"${KZGS_ROOT}/shim/include"
@@ -238,7 +247,6 @@ set(KZGS_GS_SRCS
 	GS/GSTables.cpp
 	GS/GSUtil.cpp
 	GS/GSVector.cpp
-	GS/MultiISA.cpp
 	GS/Renderers/Common/GSDevice.cpp
 	GS/Renderers/Common/GSDirtyRect.cpp
 	GS/Renderers/Common/GSFunctionMap.cpp
@@ -252,17 +260,7 @@ set(KZGS_GS_SRCS
 	GS/Renderers/HW/GSTextureReplacementLoaders.cpp
 	GS/Renderers/HW/GSTextureReplacements.cpp
 	GS/Renderers/SW/GSTextureCacheSW.cpp
-	# "unshared" (per-ISA) sources, compiled once for KZGS_ISA
-	GS/GSBlock.cpp
-	GS/GSLocalMemoryMultiISA.cpp
-	GS/GSXXH.cpp
-	GS/Renderers/Common/GSVertexTraceFMM.cpp
-	GS/Renderers/HW/GSRendererHWMultiISA.cpp
-	GS/Renderers/SW/GSDrawScanline.cpp
-	GS/Renderers/SW/GSRasterizer.cpp
-	GS/Renderers/SW/GSRendererSW.cpp
-	GS/Renderers/SW/GSDrawScanlineCodeGenerator.all.cpp
-	GS/Renderers/SW/GSSetupPrimCodeGenerator.all.cpp
+	# GS/MultiISA.cpp is replaced by shim/KzMultiISA.cpp; the per-ISA sources are KZGS_GS_UNSHARED_SRCS below
 	# D3D11
 	GS/Renderers/DX11/D3D.cpp
 	GS/Renderers/DX11/D3D11ShaderCache.cpp
@@ -288,7 +286,25 @@ set(KZGS_GS_SRCS
 	Pcsx2Config.cpp
 	SourceLog.cpp
 )
+# "Unshared" (per-ISA) sources: pcsx2GSSourcesUnshared in pcsx2/CMakeLists.txt. Compiled once for KZGS_ISA, or three
+# times in MULTI mode (below).
+set(KZGS_GS_UNSHARED_SRCS
+	GS/GSBlock.cpp
+	GS/GSLocalMemoryMultiISA.cpp
+	GS/GSXXH.cpp
+	GS/Renderers/Common/GSVertexTraceFMM.cpp
+	GS/Renderers/HW/GSRendererHWMultiISA.cpp
+	GS/Renderers/SW/GSDrawScanline.cpp
+	GS/Renderers/SW/GSRasterizer.cpp
+	GS/Renderers/SW/GSRendererSW.cpp
+	GS/Renderers/SW/GSDrawScanlineCodeGenerator.all.cpp
+	GS/Renderers/SW/GSSetupPrimCodeGenerator.all.cpp
+)
 list(TRANSFORM KZGS_GS_SRCS PREPEND "${P2SRC}/")
+list(TRANSFORM KZGS_GS_UNSHARED_SRCS PREPEND "${P2SRC}/")
+if(NOT KZGS_ISA STREQUAL "MULTI")
+	list(APPEND KZGS_GS_SRCS ${KZGS_GS_UNSHARED_SRCS})
+endif()
 
 file(GLOB KZGS_SHIM_SRCS CONFIGURE_DEPENDS "${KZGS_ROOT}/shim/*.cpp")
 add_library(kzgs_gs OBJECT ${KZGS_GS_SRCS} ${KZGS_SHIM_SRCS})
@@ -313,6 +329,38 @@ target_link_libraries(kzgs PRIVATE kzgs_flags)
 target_precompile_headers(kzgs PRIVATE "${P2SRC}/PrecompiledHeader.h")
 target_include_directories(kzgs PUBLIC "${KZGS_ROOT}/include")
 target_include_directories(kzgs PRIVATE "${KZGS_ROOT}/third_party/smaa")
+
+# ---------------------------------------------------------------------------------------------------------------------
+# MULTI: the unshared sources as three static libraries, as in PCSX2 (GS-sse4 / GS-avx / GS-avx2). Code in them is only
+# reached through MULTI_ISA_SELECT, so the AVX/AVX2 copies never run on a CPU without those instructions. Inline
+# functions from shared headers (STL, GSVector, ...) are emitted in every copy under the same name, and the linker keeps
+# the first copy it loads, so the shared libraries and then the per-ISA ones are linked whole-archive, oldest ISA first.
+# Each library is appended to the global property KZ_MULTI_ISA_LIBS_<isa>; inside the game build the top-level
+# CMakeLists.txt (kz_pcsx2_libs) links kzgs, kzipu, kzspu2, then all sse4 libraries, then all avx, then all avx2.
+# A standalone kzgs build links its own three here.
+# ---------------------------------------------------------------------------------------------------------------------
+if(KZGS_ISA STREQUAL "MULTI")
+	set(KZGS_ARCH_sse4 "")
+	set(KZGS_ARCH_avx "/arch:AVX")
+	set(KZGS_ARCH_avx2 "/arch:AVX2")
+	set(_kzgs_first 1)
+	set(_kzgs_isa_libs "")
+	foreach(_isa sse4 avx avx2)
+		add_library(kzgs_${_isa} STATIC ${KZGS_GS_UNSHARED_SRCS})
+		set_target_properties(kzgs_${_isa} PROPERTIES KZGS_UNSHARED ON)
+		target_link_libraries(kzgs_${_isa} PRIVATE kzgs_flags)
+		target_compile_definitions(kzgs_${_isa} PRIVATE MULTI_ISA_UNSHARED_COMPILATION=isa_${_isa} MULTI_ISA_IS_FIRST=${_kzgs_first})
+		target_compile_options(kzgs_${_isa} PRIVATE ${KZGS_ARCH_${_isa}})
+		target_precompile_headers(kzgs_${_isa} PRIVATE "${P2SRC}/PrecompiledHeader.h")
+		set_property(GLOBAL APPEND PROPERTY KZ_MULTI_ISA_LIBS_${_isa} kzgs_${_isa})
+		list(APPEND _kzgs_isa_libs kzgs_${_isa})
+		set(_kzgs_first 0)
+	endforeach()
+	if(PROJECT_IS_TOP_LEVEL)
+		list(JOIN _kzgs_isa_libs "," _kzgs_isa_libs)
+		target_link_libraries(kzgs INTERFACE "$<LINK_LIBRARY:WHOLE_ARCHIVE,${_kzgs_isa_libs}>")
+	endif()
+endif()
 
 # Import libraries for the bundle DLLs + system libs. The bundle DLLs are delay-loaded so a D3D11-only run does not
 # need dxcompiler.dll, and PNG/WebP/zstd are only touched by screenshots, dumps and texture replacement.

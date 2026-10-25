@@ -32,26 +32,37 @@ endif()
 # Wavedump_wav.cpp (PCSX2_DEVBUILD only). Every translation unit gets the forced include kzspu2_prefix.h, which renames
 # every symbol kzspu2 defines (kzspu2_rename.h). shim/include comes first on the include path and shadows the IOP,
 # config, savestate and audio-stream headers with minimal versions, so no other PCSX2 code is compiled.
-# The per-ISA code (Mixer.cpp, ReverbResample.cpp) is compiled once, for AVX2 like kzgs/kzvu/kzipu.
+# The per-ISA code (Mixer.cpp, ReverbResample.cpp; pcsx2SPU2SourcesUnshared) is compiled once with KZ_ARCH_FLAG, or
+# with KZ_ISA=MULTI three times (SSE4.1 / AVX / AVX2), as in ext/kzgs.
 # ---------------------------------------------------------------------------------------------------------------------
 set(KZSPU2_PCSX2_SRCS
 	${P2SRC}/SPU2/spu2sys.cpp
-	${P2SRC}/SPU2/Mixer.cpp
 	${P2SRC}/SPU2/ReadInput.cpp
 	${P2SRC}/SPU2/Reverb.cpp
-	${P2SRC}/SPU2/ReverbResample.cpp
 	${P2SRC}/SPU2/ADSR.cpp
 	${P2SRC}/SPU2/RegTable.cpp
 	${P2SRC}/SPU2/Dma.cpp
 )
+set(KZSPU2_UNSHARED_SRCS
+	${P2SRC}/SPU2/Mixer.cpp
+	${P2SRC}/SPU2/ReverbResample.cpp
+)
+if(KZ_ISA STREQUAL "MULTI")
+	set(KZSPU2_MULTI_ISA ON)
+else()
+	set(KZSPU2_MULTI_ISA OFF)
+	list(APPEND KZSPU2_PCSX2_SRCS ${KZSPU2_UNSHARED_SRCS})
+endif()
 add_library(kzspu2 STATIC
 	${KZSPU2_PCSX2_SRCS}
 	"${KZSPU2_ROOT}/shim/Kzspu2Shims.cpp"
 	"${KZSPU2_ROOT}/src/kzspu2.cpp"
 	"${KZSPU2_ROOT}/include/kzspu2.h"
 )
-target_compile_features(kzspu2 PRIVATE cxx_std_20)
-target_compile_definitions(kzspu2 PRIVATE
+add_library(kzspu2_flags INTERFACE)
+target_link_libraries(kzspu2 PRIVATE kzspu2_flags)
+target_compile_features(kzspu2_flags INTERFACE cxx_std_20)
+target_compile_definitions(kzspu2_flags INTERFACE
 	_M_X86=1
 	__SSE4_1__=1
 	WINVER=0x0A00
@@ -64,12 +75,12 @@ target_compile_definitions(kzspu2 PRIVATE
 	_UNICODE
 	UNICODE
 )
-target_compile_options(kzspu2 PRIVATE
+target_compile_options(kzspu2_flags INTERFACE
 	/Zc:externConstexpr /Zc:__cplusplus /permissive- /Zc:preprocessor
 	/utf-8 /Zo /GS- /fp:contract /W1 /wd4005 /wd4996 ${KZ_ARCH_FLAG}
 	"/FI${KZSPU2_ROOT}/shim/include/kzspu2_prefix.h"
 )
-target_include_directories(kzspu2 PRIVATE
+target_include_directories(kzspu2_flags INTERFACE
 	"${KZSPU2_ROOT}/shim/include"
 	"${KZSPU2_ROOT}/include"
 	"${P2}"
@@ -79,6 +90,30 @@ target_include_directories(kzspu2 PRIVATE
 	"${P3}/fast_float/include"
 )
 target_include_directories(kzspu2 PUBLIC "${KZSPU2_ROOT}/include")
+
+# MULTI: baseline everywhere (KZ_ARCH_FLAG is empty), the unshared files as kzspu2_sse4 / kzspu2_avx / kzspu2_avx2 (see
+# the MULTI section of ext/kzgs/CMakeLists.txt for the link order). g_cpu is kzspu2's own (shim/Kzspu2Shims.cpp).
+if(KZSPU2_MULTI_ISA)
+	target_compile_definitions(kzspu2 PRIVATE MULTI_ISA_SHARED_COMPILATION)
+	set(KZSPU2_ARCH_sse4 "")
+	set(KZSPU2_ARCH_avx "/arch:AVX")
+	set(KZSPU2_ARCH_avx2 "/arch:AVX2")
+	set(_kzspu2_first 1)
+	set(_kzspu2_isa_libs "")
+	foreach(_isa sse4 avx avx2)
+		add_library(kzspu2_${_isa} STATIC ${KZSPU2_UNSHARED_SRCS})
+		target_link_libraries(kzspu2_${_isa} PRIVATE kzspu2_flags)
+		target_compile_definitions(kzspu2_${_isa} PRIVATE MULTI_ISA_UNSHARED_COMPILATION=isa_${_isa} MULTI_ISA_IS_FIRST=${_kzspu2_first})
+		target_compile_options(kzspu2_${_isa} PRIVATE ${KZSPU2_ARCH_${_isa}})
+		set_property(GLOBAL APPEND PROPERTY KZ_MULTI_ISA_LIBS_${_isa} kzspu2_${_isa})
+		list(APPEND _kzspu2_isa_libs kzspu2_${_isa})
+		set(_kzspu2_first 0)
+	endforeach()
+	if(PROJECT_IS_TOP_LEVEL)
+		list(JOIN _kzspu2_isa_libs "," _kzspu2_isa_libs)
+		target_link_libraries(kzspu2 INTERFACE "$<LINK_LIBRARY:WHOLE_ARCHIVE,${_kzspu2_isa_libs}>")
+	endif()
+endif()
 
 if(KZSPU2_BUILD_TEST)
 	add_executable(kzspu2_test "${KZSPU2_ROOT}/test/kzspu2_test.cpp")
