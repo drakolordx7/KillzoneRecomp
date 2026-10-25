@@ -22,3 +22,10 @@ void kzWideConfigure(KzAspect aspect, int windowWidth, int windowHeight);
 
 // Called on the guest vblank: true when the frame being presented has a widened 3D view.
 bool kzWideTakeFrameFlag();
+
+// Field of view of the player's 3D view and of the first-person weapon, as horizontal degrees measured at 16:9 (the
+// vertical field of view follows; ultrawide widens the horizontal one further). 0 = the game's own. Thread-safe.
+// The same hooks as ultrawide are used, so kzWideInstall must run when either is not the game's own.
+void kzWideSetFov(float worldDegrees, float weaponDegrees);
+float kzFovNativeWorld();  // 87.1: 56.25 degrees vertical at 16:9
+float kzFovNativeWeapon(); // 72.7: 45 degrees vertical at 16:9
