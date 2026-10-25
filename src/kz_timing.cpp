@@ -1,6 +1,7 @@
 #include "kz_timing.h"
 
 #include "kz_parity.h"
+#include "kz_addrs.h"
 
 #include "runtime/ps2_host_gs.h"
 
@@ -15,10 +16,10 @@
 namespace
 {
     constexpr uint32_t kRamMask = 0x01FFFFFFu;
-    constexpr uint32_t kSecondsPerVsync = 0x0055A6E4u; // float
-    constexpr uint32_t kGameObjectPtr = 0x00559178u;   // DAT_00559178; frame timer at +0x50..+0x70
+    // Guest addresses: kzAddrs() secondsPerVsync (float), gameObjectPtr (frame timer at +0x50..+0x70), fadeLevel (int,
+    // stepped -8/+4 per vblank by FUN_0018f0d0). The timer offsets +0x50/+0x70 are used by the same instructions in the
+    // PAL frame-timer functions (0x1C01F0, 0x1C0278).
     constexpr uint32_t kTimerClampOffset = 0x70u;      // max vsyncs per simulated frame
-    constexpr uint32_t kFadeLevel = 0x0055A7C8u;       // int, stepped -8/+4 per vblank by FUN_0018f0d0
     constexpr int kNativeHz = 60;
 
     int g_rate = kNativeHz;
@@ -90,11 +91,12 @@ void kzTimingOnVsync(uint8_t *rdram)
     const float period = 1.0f / static_cast<float>(g_rate);
     uint32_t periodBits;
     std::memcpy(&periodBits, &period, 4);
-    if (rd32(rdram, kSecondsPerVsync) != 0)
-        wr32(rdram, kSecondsPerVsync, periodBits);
+    const KzAddrs &a = kzAddrs();
+    if (rd32(rdram, a.secondsPerVsync) != 0)
+        wr32(rdram, a.secondsPerVsync, periodBits);
 
     // Frame-time clamp: originally in 30 Hz ticks; now ticks are 1/R s.
-    const uint32_t obj = rd32(rdram, kGameObjectPtr);
+    const uint32_t obj = rd32(rdram, a.gameObjectPtr);
     if (obj >= 0x00100000u && obj < 0x02000000u)
     {
         const uint32_t cur = rd32(rdram, obj + kTimerClampOffset);
@@ -119,7 +121,7 @@ void kzTimingOnVsync(uint8_t *rdram)
                 std::fprintf(stderr, "[kz] timing: game %.3f s per wall s, %u frames, clamp %u, tick %.6f s, elapsed %u, scale %.3f, spv %.6f\n",
                              g_gameSeconds / wall, g_gameFrames, rd32(rdram, obj + kTimerClampOffset),
                              rdf(rdram, obj + 0x50), rd32(rdram, obj + 0x64), rdf(rdram, obj + 0x54),
-                             rdf(rdram, kSecondsPerVsync));
+                             rdf(rdram, a.secondsPerVsync));
                 g_gameSeconds = 0.0;
                 g_gameFrames = 0;
                 g_logStart = std::chrono::steady_clock::now();
@@ -130,7 +132,7 @@ void kzTimingOnVsync(uint8_t *rdram)
     // Fade: the vblank handler moved the level by its fixed step since our last write; keep only 60/R of it.
     if (g_rate != kNativeHz)
     {
-        const int32_t observed = static_cast<int32_t>(rd32(rdram, kFadeLevel));
+        const int32_t observed = static_cast<int32_t>(rd32(rdram, a.fadeLevel));
         if (!g_fadeInit)
         {
             g_fadeInit = true;
@@ -145,7 +147,7 @@ void kzTimingOnVsync(uint8_t *rdram)
             else
                 g_fadeShadow = observed; // set directly by the game
             g_fadeWritten = static_cast<int32_t>(std::lround(g_fadeShadow));
-            wr32(rdram, kFadeLevel, static_cast<uint32_t>(g_fadeWritten));
+            wr32(rdram, a.fadeLevel, static_cast<uint32_t>(g_fadeWritten));
         }
     }
 }

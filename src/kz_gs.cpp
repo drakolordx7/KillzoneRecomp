@@ -1,4 +1,5 @@
 #include "kz_gs.h"
+#include "kz_addrs.h"
 #include "kz_timing.h"
 #include "kz_patches.h"
 #include "kz_gpu.h"
@@ -445,10 +446,11 @@ namespace
         const GSRegisters &r = s.runtime->memory().gs();
         const uint8_t *ram = s.runtime->memory().getRDRAM();
         uint32_t fade = 0, vs = 0, countAcc = 0, countLast = 0;
-        std::memcpy(&fade, ram + 0x0055A7C8u, 4);
-        std::memcpy(&vs, ram + 0x0055A6E0u, 4);
-        std::memcpy(&countAcc, ram + 0x0055F0E8u, 4);
-        std::memcpy(&countLast, ram + 0x0055F0F0u, 4);
+        const KzAddrs &a = kzAddrs();
+        std::memcpy(&fade, ram + a.fadeLevel, 4);
+        std::memcpy(&vs, ram + a.vsyncCounter, 4);
+        std::memcpy(&countAcc, ram + a.vsyncCountAcc, 4);
+        std::memcpy(&countLast, ram + a.vsyncCountLast, 4);
         std::fprintf(stderr, "[gsdbg] smode1=%llx synch1=%llx synch2=%llx syncv=%llx srfsh=%llx\n",
                      static_cast<unsigned long long>(r.smode1), static_cast<unsigned long long>(r.synch1),
                      static_cast<unsigned long long>(r.synch2), static_cast<unsigned long long>(r.syncv),

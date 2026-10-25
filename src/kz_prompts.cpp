@@ -1,5 +1,6 @@
 #include "kz_prompts.h"
 
+#include "kz_addrs.h"
 #include "kz_config.h"
 #include "kz_input.h"
 
@@ -38,8 +39,10 @@
 namespace
 {
     constexpr uint32_t kRamMask = 0x01FFFFFFu;
-    constexpr uint32_t kText = 0x00167718u;
-    constexpr uint32_t kAtlasCrc = 0xD22EB2FDu;    // the stock button atlas (256x64 PSMT8, pre-swizzled)
+    // The text routine is kzAddrs().text (US 0x167718, PAL 0x1676F0).
+    // The stock button atlas (256x64 PSMT8, pre-swizzled) of the US disc. A texture with the atlas's shape whose data does not
+    // match (e.g. a different atlas on the PAL disc) is left alone, so the game's own pictures are drawn rather than wrong ones.
+    constexpr uint32_t kAtlasCrc = 0xD22EB2FDu;
     constexpr uint32_t kPaletteCrc = 0x062BBA16u;  // and its palette
     constexpr uint32_t kAtlasBytes = 16384, kPaletteBytes = 1024;
     constexpr int kAtlasW = 256, kAtlasH = 64;
@@ -47,6 +50,8 @@ namespace
 
     PS2Runtime::RecompiledFunction g_origText = nullptr;
     bool g_log = false;
+    bool g_atlasSeen = false; // the stock button atlas was found at least once
+    int g_mismatchLines = 0;
     bool g_enabled = true;
     int g_forceMode = -1; // KZ_PROMPT_MODE=kbm|pad forces the device (automation)
 
@@ -718,6 +723,11 @@ namespace
         if (dcrc == kAtlasCrc && pcrc == kPaletteCrc)
         {
             s.button = true;
+            if (!g_atlasSeen)
+            {
+                g_atlasSeen = true;
+                std::printf("[kz] button prompts: the game's button atlas matches (texture %08x)\n", T);
+            }
             s.applied = 0;
             if (g_origStream.empty())
             {
@@ -730,6 +740,14 @@ namespace
             for (size_t i = 0; i < g_atlases.size(); ++i)
                 if (g_atlases[i].streamCrc == dcrc && g_atlases[i].paletteCrc == pcrc)
                     s.button = true, s.applied = 1, s.atlas = static_cast<int>(i); // shared buffers already switched by another font
+        }
+        // A font texture with the atlas's format but other data (another font's 256x64 8-bit page, or a button atlas that
+        // differs from the US one): reported until the stock atlas has been seen once, at most 4 lines.
+        if (!s.button && !g_atlasSeen && g_mismatchLines < 4)
+        {
+            ++g_mismatchLines;
+            std::printf("[kz] button prompts: texture %08x has the button atlas's format but not its data (crc %08x/%08x); "
+                        "it is left as the game draws it\n", T, dcrc, pcrc);
         }
         if (g_log)
             std::printf("[kz-prompt] texture %08x list %08x data %08x res %08x crc %08x/%08x -> %s\n", T, list, data, res, dcrc, pcrc, s.button ? "button atlas" : "not the button atlas");
@@ -916,7 +934,7 @@ namespace
 
     void text(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
-        if (ctx->pc == kText)
+        if (ctx->pc == kzAddrs().text)
         {
             const uint32_t font = getRegU32(ctx, 6);
             if (g_enabled && ramPtr(font))
@@ -979,6 +997,6 @@ void kzPromptsInstall(PS2Runtime &runtime)
                 g_schedule.emplace_back(std::atof(item.c_str()), _stricmp(item.c_str() + c + 1, "kbm") == 0 ? 1 : 0);
         }
     }
-    const bool ok = hook(runtime, kText, &text, g_origText);
+    const bool ok = hook(runtime, kzAddrs().text, &text, g_origText);
     std::printf("[kz] prompt hooks: %s\n", ok ? "installed" : "FAILED");
 }
