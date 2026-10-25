@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 
 namespace
 {
@@ -28,6 +29,34 @@ namespace
         f.seekg(static_cast<std::streamoff>(offset));
         f.read(static_cast<char *>(dst), static_cast<std::streamsize>(size));
         return static_cast<size_t>(f.gcount()) == size;
+    }
+
+    // PCSX2-style CRC of a boot ELF: XOR of its little-endian words (zero-padded to a multiple of 4).
+    uint32_t xorCrc(std::vector<uint8_t> elf)
+    {
+        elf.resize((elf.size() + 3) & ~size_t(3), 0);
+        uint32_t crc = 0;
+        for (size_t i = 0; i < elf.size(); i += 4)
+            crc ^= le32(&elf[i]);
+        return crc;
+    }
+
+    // The region whose boot ELF SYSTEM.CNF names: the BOOT2 line, or anywhere in the file if there is no such line.
+    bool regionFromSystemCnf(const std::string &text, KzRegion &region)
+    {
+        std::string boot = upper(text);
+        if (const size_t at = boot.find("BOOT2"); at != std::string::npos)
+        {
+            const size_t end = boot.find_first_of("\r\n", at);
+            boot = boot.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        }
+        for (KzRegion r : {KzRegion::Us, KzRegion::Pal})
+            if (boot.find(kzRegionBootElf(r)) != std::string::npos)
+            {
+                region = r;
+                return true;
+            }
+        return false;
     }
 }
 
@@ -129,30 +158,62 @@ KzDiscCheck kzCheckDisc(const std::filesystem::path &isoPath)
         return r;
     }
     const std::string text(cnf.begin(), cnf.end());
-    if (text.find("SCUS_974.02") == std::string::npos)
+    KzRegion region = KzRegion::Us;
+    if (!regionFromSystemCnf(text, region))
     {
-        r.message = "This is a different game or region. Killzone NTSC-U (SCUS-97402) is required.";
+        r.message = "This is a different game or release. Killzone USA (SCUS-97402) or Europe (SCES-52893) is required.";
         return r;
     }
     std::vector<uint8_t> elf;
-    const auto elfFile = iso.find("SCUS_974.02");
+    const auto elfFile = iso.find(kzRegionBootElf(region));
     if (!elfFile || !iso.read(*elfFile, elf))
     {
         r.message = "The game executable could not be read from the disc image.";
         return r;
     }
-    elf.resize((elf.size() + 3) & ~size_t(3), 0);
-    uint32_t crc = 0;
-    for (size_t i = 0; i < elf.size(); i += 4)
-        crc ^= le32(&elf[i]);
-    if (crc != 0xCAAEC49Cu)
+    if (xorCrc(elf) != kzRegionBootElfXorCrc(region))
     {
-        r.message = "Killzone NTSC-U found, but a different revision than v1.00; it is not supported.";
+        r.message = region == KzRegion::Pal ? "Killzone (Europe) found, but a different revision of SCES-52893; it is not supported."
+                                            : "Killzone (USA) found, but a different revision than v1.00; it is not supported.";
+        return r;
+    }
+    if (!kzRegionSupported(region))
+    {
+        r.message = std::string("Disc: ") + kzRegionTitle(region) + " - " + kzRegionSerial(region) + ": this build does not include support for it.";
         return r;
     }
     r.ok = true;
-    r.message = "Killzone (USA) v1.00 - SCUS-97402 - OK";
+    r.region = region;
+    r.message = region == KzRegion::Pal ? "Disc: Killzone (Europe) - SCES-52893 - OK" : "Disc: Killzone (USA) v1.00 - SCUS-97402 - OK";
     return r;
+}
+
+bool kzDetectElfRegion(const std::filesystem::path &elfPath, KzRegion &region, std::string *note)
+{
+    region = KzRegion::Us;
+    std::ifstream f(elfPath, std::ios::binary);
+    std::vector<uint8_t> elf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const uint32_t crc = xorCrc(elf);
+    const std::string name = upper(elfPath.filename().string());
+    for (KzRegion r : {KzRegion::Us, KzRegion::Pal})
+        if (name == kzRegionBootElf(r))
+        {
+            region = r;
+            if (crc == kzRegionBootElfXorCrc(r))
+                return true;
+            if (note)
+                *note = std::string(kzRegionBootElf(r)) + " has an unexpected CRC (a different revision?)";
+            return false;
+        }
+    for (KzRegion r : {KzRegion::Us, KzRegion::Pal})
+        if (crc == kzRegionBootElfXorCrc(r))
+        {
+            region = r;
+            return true;
+        }
+    if (note)
+        *note = elfPath.filename().string() + " is neither boot ELF (SCUS_974.02, SCES_528.93); treated as US";
+    return false;
 }
 
 std::filesystem::path kzPrepareDiscFiles(const std::filesystem::path &isoPath, const std::filesystem::path &dir, std::string *error)
@@ -166,8 +227,9 @@ std::filesystem::path kzPrepareDiscFiles(const std::filesystem::path &isoPath, c
     KzIso iso;
     if (!iso.open(isoPath, error))
         return {};
-    static const char *kFiles[] = {
-        "SYSTEM.CNF", "SCUS_974.02",
+    const char *const kFiles[] = {
+        "SYSTEM.CNF", kzRegionBootElf(check.region),
+        "IOP/IOPRP300.IMG", // the PAL disc's IOP reboot image (the US disc has DNAS300.IMG instead, not extracted)
         "IOP/DEV9.IRX", "IOP/EZNETCNF.IRX", "IOP/EZNETCTL.IRX", "IOP/INET.IRX", "IOP/INETCTL.IRX", "IOP/LGAUD.IRX",
         "IOP/LGKBM.IRX", "IOP/LIBNETB.IRX", "IOP/LIBSD.IRX", "IOP/MCMAN.IRX", "IOP/MCSERV.IRX", "IOP/MSIFRPC.IRX",
         "IOP/NETCNF.IRX", "IOP/NTPWROFF.IRX", "IOP/PADMAN.IRX", "IOP/PFILE_R.IRX", "IOP/PINPUT_R.IRX", "IOP/POWEROFF.IRX",
@@ -198,5 +260,5 @@ std::filesystem::path kzPrepareDiscFiles(const std::filesystem::path &isoPath, c
             return {};
         }
     }
-    return dir / "SCUS_974.02";
+    return dir / kzRegionBootElf(check.region);
 }

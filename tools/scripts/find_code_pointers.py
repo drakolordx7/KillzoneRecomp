@@ -10,16 +10,17 @@ Writes work/code_pointers.txt (one 0x... per line).
 
 Usage: python tools/scripts/find_code_pointers.py
 """
-import csv, struct
+import csv, os, struct
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-ELF = ROOT / "game" / "SCUS_974.02"
-CSV = ROOT / "work" / "functions.csv"
-OUT = ROOT / "work" / "code_pointers.txt"
+# KZ_ELF / KZ_FUNCS_CSV / KZ_CODE_POINTERS / KZ_CODE_POINTERS_REJECT select another ELF (PAL set, issue #15).
+ELF = Path(os.environ.get("KZ_ELF", ROOT / "game" / "SCUS_974.02"))
+CSV = Path(os.environ.get("KZ_FUNCS_CSV", ROOT / "work" / "functions.csv"))
+OUT = Path(os.environ.get("KZ_CODE_POINTERS", ROOT / "work" / "code_pointers.txt"))
 # Candidates whose recompiled body hit undecodable instructions (VU microcode / tables embedded in .text);
 # written by regen.py after each recompile and excluded here.
-REJECT = ROOT / "config" / "code_pointers_reject.txt"
+REJECT = Path(os.environ.get("KZ_CODE_POINTERS_REJECT", ROOT / "config" / "code_pointers_reject.txt"))
 
 
 def sections(d):

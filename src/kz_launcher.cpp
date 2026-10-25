@@ -222,7 +222,7 @@ namespace
         ImGui::Separator();
 
         // Disc
-        ImGui::TextUnformatted("Game disc (your Killzone NTSC-U image)");
+        ImGui::TextUnformatted("Game disc (your Killzone USA or Europe image)");
         char buf[1024];
         std::snprintf(buf, sizeof(buf), "%s", cfg.isoPath.c_str());
         ImGui::SetNextItemWidth(-110);
