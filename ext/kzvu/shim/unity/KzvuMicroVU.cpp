@@ -46,6 +46,19 @@ void kzvuVu1CodeCounters(uint64_t* codeBytes, uint32_t* programsCreated)
 	*programsCreated = static_cast<uint32_t>(microVU1.prog.total);
 }
 
+void kzvuVuCodeState(int vu, uint64_t* codeBytes, uint32_t* programs)
+{
+	const microVU& m = vu ? microVU1 : microVU0;
+	*codeBytes = static_cast<uint64_t>(m.prog.x86ptr - m.prog.x86start);
+	*programs = static_cast<uint32_t>(m.prog.total);
+}
+
+void kzvuVuSetCacheEnd(int vu, uint8_t* end)
+{
+	microVU& m = vu ? microVU1 : microVU0;
+	m.prog.x86end = end;
+}
+
 void kzvuVu1CodeStats(KzvuVu1CodeStats* out)
 {
 	const microVU& m = microVU1;
