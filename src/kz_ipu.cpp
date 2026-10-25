@@ -1,4 +1,5 @@
 #include "kz_ipu.h"
+#include "kz_region.h"
 
 #include "kzipu.h"
 
@@ -250,7 +251,7 @@ bool kzIpuInstall()
 //    data keeps the flag (the stream really is stuck).
 namespace
 {
-    constexpr uint32_t kCurrentPlayer = 0x0055B3D8u; // DAT_0055b3d8: the movie player being serviced
+    constexpr uint32_t kCurrentPlayer = KZ_GADDR(0x0055B3D8u, 0x0055C1D8u); // (PAL: kz_region.h) DAT_0055b3d8: the movie player being serviced
     PS2Runtime::RecompiledFunction g_movieReadOrig = nullptr;
     PS2Runtime::RecompiledFunction g_inputEndOrig = nullptr;
     uint32_t g_eofPlayer = 0u;
@@ -270,7 +271,7 @@ namespace
                 g_eofReads = 0;
             return;
         }
-        constexpr uint32_t kDiscStreamVtable = 0x0052EB28u;
+        constexpr uint32_t kDiscStreamVtable = KZ_GADDR(0x0052EB28u, 0x0052F7B8u);
         if (guest32(rdram, stream + 4) != kDiscStreamVtable || guest32(rdram, stream + 0x20) != 0u)
             return; // no data yet, not the end
         if (player != g_eofPlayer)
@@ -298,8 +299,8 @@ namespace
 void kzIpuBindRuntime(PS2Runtime &runtime)
 {
     g_runtime = &runtime;
-    constexpr uint32_t kMovieRead = 0x002DEB98u;
-    constexpr uint32_t kInputEnd = 0x002DF800u;
+    constexpr uint32_t kMovieRead = KZ_GADDR(0x002DEB98u, 0x002DF698u);
+    constexpr uint32_t kInputEnd = KZ_GADDR(0x002DF800u, 0x002E0300u);
     if (g_active && runtime.hasFunction(kMovieRead) && runtime.hasFunction(kInputEnd))
     {
         g_movieReadOrig = runtime.lookupFunction(kMovieRead);
@@ -307,7 +308,8 @@ void kzIpuBindRuntime(PS2Runtime &runtime)
         g_inputEndOrig = runtime.lookupFunction(kInputEnd);
         runtime.replaceFunction(kInputEnd, &movieInputEnd);
     }
-    installTrace(runtime); // last, so it wraps the shims above
+    if (!kKzPal) // KZ_IPU_TRACE lists US addresses
+        installTrace(runtime); // last, so it wraps the shims above
 }
 
 bool kzIpuActive()

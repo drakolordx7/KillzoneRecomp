@@ -13,6 +13,7 @@ extern "C" int __llvm_profile_write_file(void);
 #include "kz_config.h"
 #include "kz_input.h"
 #include "kz_iso.h"
+#include "kz_region.h"
 #include "kz_launcher.h"
 #include "kz_gs.h"
 #include "kz_timing.h"
@@ -56,7 +57,7 @@ namespace
 {
     struct Options
     {
-        std::filesystem::path elf = "game/SCUS_974.02";
+        std::filesystem::path elf = kKzPal ? "game_pal/SCES_528.93" : "game/SCUS_974.02";
         bool elfGiven = false;
         std::filesystem::path iso;
         int sampleSeconds = 0; // --sample N: dump all thread stacks to work/stacks.txt every N seconds
@@ -240,7 +241,8 @@ int main(int argc, char *argv[])
         else
         {
             std::string prepError;
-            elf = kzPrepareDiscFiles(cfg.isoPath, kzConfigPath().parent_path() / "disc", &prepError);
+            // PAL test build (kz_region.h): its own folder, so the US boot files and memory card stay untouched.
+            elf = kzPrepareDiscFiles(cfg.isoPath, kzConfigPath().parent_path() / (kKzPal ? "disc_pal" : "disc"), &prepError);
             if (elf.empty())
             {
                 const std::string msg = "Can't use the game disc image: " + prepError;
@@ -361,14 +363,20 @@ int main(int argc, char *argv[])
             std::cerr << "[kz] failed to load ELF: " << elf.string() << std::endl;
             return 1;
         }
-        kzAimInstall(runtime);
-        kzTimeFixInstall(runtime);
-        kzPostInstall(runtime);
-        // Ultrawide hooks only when an ultrawide aspect is chosen (or forced for tests): other aspects keep the game's own path.
-        if (cfg.aspect == KzAspect::UltrawideAuto || cfg.aspect == KzAspect::Ultrawide21x9 || cfg.aspect == KzAspect::Ultrawide32x9 ||
-            std::getenv("KZ_WIDE_ASPECT"))
-            kzWideInstall(runtime);
-        kzPromptsInstall(runtime); // after kzWideInstall: wraps the same text function
+        // PAL test build (kz_region.h): these hooks use US addresses that are not mapped yet, so they stay off.
+        if (!kKzPal)
+        {
+            kzAimInstall(runtime);
+            kzTimeFixInstall(runtime);
+            kzPostInstall(runtime);
+            // Ultrawide hooks only when an ultrawide aspect is chosen (or forced for tests): other aspects keep the game's own path.
+            if (cfg.aspect == KzAspect::UltrawideAuto || cfg.aspect == KzAspect::Ultrawide21x9 || cfg.aspect == KzAspect::Ultrawide32x9 ||
+                std::getenv("KZ_WIDE_ASPECT"))
+                kzWideInstall(runtime);
+            kzPromptsInstall(runtime); // after kzWideInstall: wraps the same text function
+        }
+        else
+            std::cout << "[kz] PAL test build (SCES-52893): mouse aim, ultrawide, prompts, post-process and look-acceleration hooks are off" << std::endl;
         kzMoviesInstall(runtime);
         // Tests: a separate (e.g. empty) memory card folder. After loadELF, which resets the roots to the ELF folder.
         if (const char *mc = std::getenv("KZ_MC_ROOT"); mc && *mc)

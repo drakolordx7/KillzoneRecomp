@@ -103,6 +103,17 @@ add_library(kz_port STATIC
 target_include_directories(kz_port PRIVATE "${CMAKE_SOURCE_DIR}/src" "${KZ_IMGUI_DIR}" "${KZ_IMGUI_DIR}/backends")
 target_link_libraries(kz_port PRIVATE ps2_runtime SDL3::SDL3 imgui kz_pcsx2_libs) # kzgs kzvu kzipu kzspu2, see below
 target_compile_definitions(kz_port PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+# Issue #15 spike: a PAL-only test build (generated code from SCES_528.93, src/kz_region.h). Not shipped.
+if(KZ_GENERATED_DIR MATCHES "generated_pal")
+    set(_kz_pal_default ON)
+else()
+    set(_kz_pal_default OFF)
+endif()
+option(KZ_PAL_SPIKE "PAL (SCES-52893) test build; needs KZ_GENERATED_DIR = the PAL generated code" ${_kz_pal_default})
+if(KZ_PAL_SPIKE)
+    message(STATUS "Killzone: PAL spike build (SCES-52893)")
+    target_compile_definitions(kz_port PRIVATE KZ_PAL_SPIKE=1)
+endif()
 # The CPU check runs before the C runtime on any x64 CPU, so it is built without AVX2 (src/kz_cpucheck.cpp, issue #14).
 # KZ_CPUCHECK_ISA tells it which instructions this build needs: 0 = MULTI, 1 = SSE4, 2 = AVX2.
 if(KZ_ISA STREQUAL "MULTI")
