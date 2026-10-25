@@ -53,6 +53,16 @@ static ProcessorFeatures DetectProcessorFeatures()
 		f.vectorISA = avx2 ? ProcessorFeatures::VectorISA::AVX2 : ProcessorFeatures::VectorISA::AVX;
 	else
 		f.vectorISA = ProcessorFeatures::VectorISA::SSE4;
+	// Same override as kzgs (shim/KzMultiISA.cpp); it also decides whether microVU emits AVX (kzvuInit).
+	if (const char* over = std::getenv("OVERRIDE_VECTOR_ISA"))
+	{
+		if (_stricmp(over, "avx2") == 0 || _stricmp(over, "avx512f") == 0)
+			f.vectorISA = ProcessorFeatures::VectorISA::AVX2;
+		else if (_stricmp(over, "avx") == 0)
+			f.vectorISA = ProcessorFeatures::VectorISA::AVX;
+		else if (_stricmp(over, "sse4") == 0)
+			f.vectorISA = ProcessorFeatures::VectorISA::SSE4;
+	}
 	f.hasSlowGather = false;
 	return f;
 }

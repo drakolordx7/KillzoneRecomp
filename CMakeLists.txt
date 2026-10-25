@@ -6,16 +6,26 @@ project(KillzoneRecomp CXX C)
 # memory helpers, __security_check_cookie in profiles). Keep strict float semantics (no /fp:fast: PS2 float
 # emulation depends on it). KZ_FAST_FLAGS=OFF restores CMake's defaults.
 option(KZ_FAST_FLAGS "Release-grade optimisation flags for RelWithDebInfo" ON)
-# CPU baseline of the whole build (issue #8): AVX2 (Haswell / Ryzen and newer) or SSE4 (SSE4.2 + POPCNT: Intel Nehalem /
-# AMD Bulldozer and newer). Every library below takes its /arch flag from KZ_ARCH_FLAG.
-set(KZ_ISA "AVX2" CACHE STRING "CPU baseline: AVX2 or SSE4")
-set_property(CACHE KZ_ISA PROPERTY STRINGS SSE4 AVX2)
+# CPU baseline of the whole build (issue #8). Every library below takes its /arch flag from KZ_ARCH_FLAG.
+#   MULTI (default): one exe for any x64 CPU with SSE4.1 (Intel Core 2 Penryn / AMD Bulldozer and newer), as PCSX2's
+#         multi-ISA build: everything is compiled for the baseline (MSVC: no /arch, so SSE2 code generation with SSE4.1
+#         intrinsics; clang-cl: x86-64 + SSE4.1), and PCSX2's per-ISA GS / IPU / SPU2 files are compiled three times
+#         (SSE4.1, AVX, AVX2) and picked at run time from CPUID (ext/kzgs/CMakeLists.txt, "MULTI").
+#   AVX2: everything for AVX2 (x86-64-v3: Haswell / Ryzen and newer).
+#   SSE4: everything for SSE4.2 + POPCNT (x86-64-v2: Intel Nehalem / AMD Bulldozer and newer).
+set(KZ_ISA "MULTI" CACHE STRING "CPU baseline: MULTI, AVX2 or SSE4")
+set_property(CACHE KZ_ISA PROPERTY STRINGS MULTI SSE4 AVX2)
 if(KZ_ISA STREQUAL "SSE4")
     set(KZ_ARCH_FLAG "/arch:SSE4.2")
-    set(KZ_CLANG_MARCH "x86-64-v2")
-else()
+    set(KZ_CLANG_ARCH "/clang:-march=x86-64-v2")
+elseif(KZ_ISA STREQUAL "AVX2")
     set(KZ_ARCH_FLAG "/arch:AVX2")
-    set(KZ_CLANG_MARCH "x86-64-v3")
+    set(KZ_CLANG_ARCH "/clang:-march=x86-64-v3")
+elseif(KZ_ISA STREQUAL "MULTI")
+    set(KZ_ARCH_FLAG "")
+    set(KZ_CLANG_ARCH "/clang:-march=x86-64 /clang:-msse4.1")
+else()
+    message(FATAL_ERROR "KZ_ISA must be MULTI, AVX2 or SSE4 (got '${KZ_ISA}')")
 endif()
 set(KZGS_ISA "${KZ_ISA}" CACHE STRING "" FORCE)
 # clang-cl (opt-in: configure with -DCMAKE_C_COMPILER=<llvm>/clang-cl.exe -DCMAKE_CXX_COMPILER=<llvm>/clang-cl.exe, see
@@ -37,7 +47,7 @@ set(KZ_CLANG_LTO "" CACHE STRING "clang-cl LTO mode: empty, thin or full")
 option(KZ_CLANG_PGO_GEN "clang-cl: build an instrumented (profile-generating) binary" OFF)
 set(KZ_CLANG_PGO_USE "" CACHE FILEPATH "clang-cl: .profdata to optimise with")
 if(KZ_CLANG_CL AND KZ_FAST_FLAGS)
-    set(_kz_clang_opt "/Zi /O2 /Oi /Gy /Gw /GS- /clang:-march=${KZ_CLANG_MARCH} /clang:-ffp-contract=off /DNDEBUG")
+    set(_kz_clang_opt "/Zi /O2 /Oi /Gy /Gw /GS- ${KZ_CLANG_ARCH} /clang:-ffp-contract=off /DNDEBUG")
     set(_kz_clang_link "/DEBUG /INCREMENTAL:NO /OPT:REF /OPT:ICF")
     if(KZ_CLANG_LTO)
         string(APPEND _kz_clang_opt " /clang:-flto=${KZ_CLANG_LTO}")
@@ -94,6 +104,15 @@ target_include_directories(kz_port PRIVATE "${CMAKE_SOURCE_DIR}/src" "${KZ_IMGUI
 target_link_libraries(kz_port PRIVATE ps2_runtime SDL3::SDL3 imgui kzgs kzvu kzipu kzspu2)
 target_compile_definitions(kz_port PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 # The CPU check runs before the C runtime on any x64 CPU, so it is built without AVX2 (src/kz_cpucheck.cpp, issue #14).
+# KZ_CPUCHECK_ISA tells it which instructions this build needs: 0 = MULTI, 1 = SSE4, 2 = AVX2.
+if(KZ_ISA STREQUAL "MULTI")
+    set(_kz_cpucheck_isa 0)
+elseif(KZ_ISA STREQUAL "SSE4")
+    set(_kz_cpucheck_isa 1)
+else()
+    set(_kz_cpucheck_isa 2)
+endif()
+set_source_files_properties("${CMAKE_SOURCE_DIR}/src/kz_cpucheck.cpp" PROPERTIES COMPILE_DEFINITIONS "KZ_CPUCHECK_ISA=${_kz_cpucheck_isa}")
 if(KZ_CLANG_CL)
     set_source_files_properties("${CMAKE_SOURCE_DIR}/src/kz_cpucheck.cpp" PROPERTIES COMPILE_OPTIONS "/arch:SSE2;/clang:-march=x86-64")
 elseif(MSVC)
@@ -102,6 +121,21 @@ endif()
 if(KZ_CLANG_CL AND KZ_CLANG_PGO_GEN)
     target_compile_definitions(kz_port PRIVATE KZ_PGO_GEN=1)
 endif()
+
+# KZ_ISA=MULTI: the per-ISA libraries of kzgs, kzipu and kzspu2, linked whole-archive with every SSE4.1 copy first, then
+# every AVX copy, then every AVX2 copy. The linker keeps the first copy of an inline function it loads, so a function the
+# baseline code calls never resolves to an AVX/AVX2 build of it (see the MULTI section of ext/kzgs/CMakeLists.txt).
+add_library(kz_multi_isa INTERFACE)
+if(KZ_ISA STREQUAL "MULTI")
+    set(_kz_isa_libs "")
+    foreach(_isa sse4 avx avx2)
+        get_property(_libs GLOBAL PROPERTY KZ_MULTI_ISA_LIBS_${_isa})
+        list(APPEND _kz_isa_libs ${_libs})
+    endforeach()
+    list(JOIN _kz_isa_libs "," _kz_isa_libs)
+    target_link_libraries(kz_multi_isa INTERFACE "$<LINK_LIBRARY:WHOLE_ARCHIVE,${_kz_isa_libs}>")
+endif()
+target_link_libraries(kz_port PRIVATE kz_multi_isa)
 
 add_executable(killzone
     ${KZ_GENERATED_SRC}
@@ -140,7 +174,7 @@ add_custom_command(TARGET killzone POST_BUILD
 
 # Offline GS trace replay (tools/gs_replay): renders a KZ_GS_TRACE recording through kzgs.
 add_executable(kz_gs_replay tools/gs_replay/gs_replay.cpp)
-target_link_libraries(kz_gs_replay PRIVATE kzgs SDL3::SDL3)
+target_link_libraries(kz_gs_replay PRIVATE kzgs SDL3::SDL3 kz_multi_isa)
 target_compile_features(kz_gs_replay PRIVATE cxx_std_20)
 add_executable(kz_gs_replay_cpu tools/gs_replay/gs_replay_cpu.cpp)
 target_link_libraries(kz_gs_replay_cpu PRIVATE ps2_runtime)

@@ -31,6 +31,10 @@
 
 // ---- PCSX2 IPU globals, types and functions ----------------------------------------------------------------------------
 #define isa_native kzipu_isa
+#define isa_sse4 kzipu_isa_sse4 // KZ_ISA=MULTI namespaces
+#define isa_avx kzipu_isa_avx
+#define isa_avx2 kzipu_isa_avx2
+#define g_cpu kzipu_g_cpu
 #define ipu_fifo kzipu_ipu_fifo
 #define IPU_Fifo KzipuIPU_Fifo
 #define IPU_Fifo_Input KzipuIPU_Fifo_Input

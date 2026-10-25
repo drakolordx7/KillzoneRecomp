@@ -36,24 +36,35 @@ endif()
 # renames every symbol kzipu defines (kzipu_rename.h), pre-includes the PCSX2 headers and redirects logging.
 # No pcsx2/common source is compiled: the handful of common functions the IPU references are implemented, under
 # kzipu-private names, in shim/KzipuShims.cpp. kzipu therefore shares no symbol with kzgs or kzvu.
-# The per-ISA IPU code (IPU_MultiISA.cpp, IPUdither.cpp, yuv2rgb.cpp) is compiled once, for AVX2 like kzgs/kzvu.
+# The per-ISA IPU code (IPU_MultiISA.cpp, IPUdither.cpp, yuv2rgb.cpp; pcsx2IPUSourcesUnshared) is compiled once with
+# KZ_ARCH_FLAG, or with KZ_ISA=MULTI three times (SSE4.1 / AVX / AVX2), as in ext/kzgs.
 # ---------------------------------------------------------------------------------------------------------------------
 set(KZIPU_PCSX2_SRCS
 	${P2SRC}/IPU/IPU.cpp
 	${P2SRC}/IPU/IPU_Fifo.cpp
 	${P2SRC}/IPU/IPUdma.cpp
+)
+set(KZIPU_UNSHARED_SRCS
 	${P2SRC}/IPU/IPU_MultiISA.cpp
 	${P2SRC}/IPU/IPUdither.cpp
 	${P2SRC}/IPU/yuv2rgb.cpp
 )
+if(KZ_ISA STREQUAL "MULTI")
+	set(KZIPU_MULTI_ISA ON)
+else()
+	set(KZIPU_MULTI_ISA OFF)
+	list(APPEND KZIPU_PCSX2_SRCS ${KZIPU_UNSHARED_SRCS})
+endif()
 add_library(kzipu STATIC
 	${KZIPU_PCSX2_SRCS}
 	"${KZIPU_ROOT}/shim/KzipuShims.cpp"
 	"${KZIPU_ROOT}/src/kzipu.cpp"
 	"${KZIPU_ROOT}/include/kzipu.h"
 )
-target_compile_features(kzipu PRIVATE cxx_std_20)
-target_compile_definitions(kzipu PRIVATE
+add_library(kzipu_flags INTERFACE)
+target_link_libraries(kzipu PRIVATE kzipu_flags)
+target_compile_features(kzipu_flags INTERFACE cxx_std_20)
+target_compile_definitions(kzipu_flags INTERFACE
 	_M_X86=1
 	__SSE4_1__=1
 	WINVER=0x0A00
@@ -66,12 +77,12 @@ target_compile_definitions(kzipu PRIVATE
 	_UNICODE
 	UNICODE
 )
-target_compile_options(kzipu PRIVATE
+target_compile_options(kzipu_flags INTERFACE
 	/Zc:externConstexpr /Zc:__cplusplus /permissive- /Zc:preprocessor
 	/utf-8 /Zo /GS- /fp:contract /W1 /wd4005 /wd4996 ${KZ_ARCH_FLAG}
 	"/FI${KZIPU_ROOT}/shim/include/kzipu_prefix.h"
 )
-target_include_directories(kzipu PRIVATE
+target_include_directories(kzipu_flags INTERFACE
 	"${KZIPU_ROOT}/shim/include"
 	"${P2}"
 	"${P2SRC}"
@@ -80,6 +91,30 @@ target_include_directories(kzipu PRIVATE
 	"${P3}/fast_float/include"
 )
 target_include_directories(kzipu PUBLIC "${KZIPU_ROOT}/include")
+
+# MULTI: baseline everywhere (KZ_ARCH_FLAG is empty), the unshared files as kzipu_sse4 / kzipu_avx / kzipu_avx2 (see the
+# MULTI section of ext/kzgs/CMakeLists.txt for the link order). g_cpu is kzipu's own (shim/KzipuShims.cpp).
+if(KZIPU_MULTI_ISA)
+	target_compile_definitions(kzipu PRIVATE MULTI_ISA_SHARED_COMPILATION)
+	set(KZIPU_ARCH_sse4 "")
+	set(KZIPU_ARCH_avx "/arch:AVX")
+	set(KZIPU_ARCH_avx2 "/arch:AVX2")
+	set(_kzipu_first 1)
+	set(_kzipu_isa_libs "")
+	foreach(_isa sse4 avx avx2)
+		add_library(kzipu_${_isa} STATIC ${KZIPU_UNSHARED_SRCS})
+		target_link_libraries(kzipu_${_isa} PRIVATE kzipu_flags)
+		target_compile_definitions(kzipu_${_isa} PRIVATE MULTI_ISA_UNSHARED_COMPILATION=isa_${_isa} MULTI_ISA_IS_FIRST=${_kzipu_first})
+		target_compile_options(kzipu_${_isa} PRIVATE ${KZIPU_ARCH_${_isa}})
+		set_property(GLOBAL APPEND PROPERTY KZ_MULTI_ISA_LIBS_${_isa} kzipu_${_isa})
+		list(APPEND _kzipu_isa_libs kzipu_${_isa})
+		set(_kzipu_first 0)
+	endforeach()
+	if(PROJECT_IS_TOP_LEVEL)
+		list(JOIN _kzipu_isa_libs "," _kzipu_isa_libs)
+		target_link_libraries(kzipu INTERFACE "$<LINK_LIBRARY:WHOLE_ARCHIVE,${_kzipu_isa_libs}>")
+	endif()
+endif()
 
 if(KZIPU_BUILD_TEST)
 	set(FF "${KZIPU_FFMPEG_DIR}")
