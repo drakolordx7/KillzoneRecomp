@@ -89,6 +89,31 @@ file(GLOB KZ_GENERATED_SRC CONFIGURE_DEPENDS "${KZ_GENERATED_DIR}/*.cpp")
 list(LENGTH KZ_GENERATED_SRC KZ_GENERATED_COUNT)
 message(STATUS "Killzone: ${KZ_GENERATED_COUNT} generated sources")
 
+# Issue #15: one exe for the US disc (SCUS-97402, the set above) and the PAL disc (SCES-52893, En/Ru/El). The PAL code
+# (from SCES_528.93) is generated with symbol_prefix = "kzpal_" and table_register_function = "kzPalRegisterFunctionTable"
+# (src/kz_pal_table.h), so it links next to the US code; it is its own object library below (own include directory and
+# PCH, so its ps2_recompiled_functions.h is the PAL one). The game picks the version from the disc at run time
+# (src/kz_region.h). Empty or missing directory: a US-only build (the PAL disc is then reported as unsupported).
+set(KZ_GENERATED_PAL_DIR "${CMAKE_SOURCE_DIR}/generated_pal" CACHE PATH "PS2Recomp output for SCES_528.93 (PAL); empty = US only")
+set(KZ_HAVE_PAL OFF)
+if(KZ_GENERATED_PAL_DIR AND EXISTS "${KZ_GENERATED_PAL_DIR}/register_functions.cpp")
+    # A PAL set generated without the table function (e.g. the old PAL-only test build) defines the US table symbols
+    # and would not link: it is left out.
+    file(STRINGS "${KZ_GENERATED_PAL_DIR}/register_functions.cpp" _kz_pal_register REGEX "kzPalRegisterFunctionTable" LIMIT_COUNT 1)
+    if(_kz_pal_register)
+        file(GLOB KZ_GENERATED_PAL_SRC CONFIGURE_DEPENDS "${KZ_GENERATED_PAL_DIR}/*.cpp")
+        list(LENGTH KZ_GENERATED_PAL_SRC KZ_GENERATED_PAL_COUNT)
+        set(KZ_HAVE_PAL ON)
+        message(STATUS "Killzone: ${KZ_GENERATED_PAL_COUNT} PAL generated sources (SCES-52893 supported)")
+    else()
+        message(WARNING "Killzone: ${KZ_GENERATED_PAL_DIR} was not generated with table_register_function = "
+                        "kzPalRegisterFunctionTable (and symbol_prefix = kzpal_); building US only, the PAL disc is not supported")
+    endif()
+else()
+    message(STATUS "Killzone: no PAL generated code (KZ_GENERATED_PAL_DIR = '${KZ_GENERATED_PAL_DIR}'); building US only, "
+                   "the PAL disc (SCES-52893) is not supported")
+endif()
+
 file(GLOB KZ_SRC CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.cpp")
 
 # Our code lives in its own library so its dependencies (SDL3, ImGui, ...) never change the compile flags of the
@@ -103,16 +128,8 @@ add_library(kz_port STATIC
 target_include_directories(kz_port PRIVATE "${CMAKE_SOURCE_DIR}/src" "${KZ_IMGUI_DIR}" "${KZ_IMGUI_DIR}/backends")
 target_link_libraries(kz_port PRIVATE ps2_runtime SDL3::SDL3 imgui kz_pcsx2_libs) # kzgs kzvu kzipu kzspu2, see below
 target_compile_definitions(kz_port PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-# Issue #15 spike: a PAL-only test build (generated code from SCES_528.93, src/kz_region.h). Not shipped.
-if(KZ_GENERATED_DIR MATCHES "generated_pal")
-    set(_kz_pal_default ON)
-else()
-    set(_kz_pal_default OFF)
-endif()
-option(KZ_PAL_SPIKE "PAL (SCES-52893) test build; needs KZ_GENERATED_DIR = the PAL generated code" ${_kz_pal_default})
-if(KZ_PAL_SPIKE)
-    message(STATUS "Killzone: PAL spike build (SCES-52893)")
-    target_compile_definitions(kz_port PRIVATE KZ_PAL_SPIKE=1)
+if(KZ_HAVE_PAL)
+    target_compile_definitions(kz_port PRIVATE KZ_HAVE_PAL=1) # src/kz_region.cpp fills the function table from the PAL set
 endif()
 # The CPU check runs before the C runtime on any x64 CPU, so it is built without AVX2 (src/kz_cpucheck.cpp, issue #14).
 # KZ_CPUCHECK_ISA tells it which instructions this build needs: 0 = MULTI, 1 = SSE4, 2 = AVX2.
@@ -186,6 +203,32 @@ if(MSVC)
     target_compile_options(killzone PRIVATE /bigobj /FS)
     # Start in the CPU check (src/kz_cpucheck.cpp), which then calls the normal C runtime start-up.
     target_link_options(killzone PRIVATE /ENTRY:kzCpuCheckEntry)
+endif()
+
+# The PAL generated code (see KZ_GENERATED_PAL_DIR above): same flags, unity batches and PCH layout as the US code, but its
+# own include directory, so `#include <ps2_recompiled_functions.h>` in its sources and its PCH is generated_pal's header.
+if(KZ_HAVE_PAL)
+    add_library(kz_generated_pal OBJECT ${KZ_GENERATED_PAL_SRC})
+    target_include_directories(kz_generated_pal PRIVATE "${KZ_GENERATED_PAL_DIR}")
+    target_link_libraries(kz_generated_pal PRIVATE ps2_runtime)
+    set_target_properties(kz_generated_pal PROPERTIES
+        UNITY_BUILD ON
+        UNITY_BUILD_BATCH_SIZE 128
+    )
+    target_precompile_headers(kz_generated_pal PRIVATE
+        ext/PS2Recomp/ps2xRuntime/include/ps2_runtime_macros.h
+        ext/PS2Recomp/ps2xRuntime/include/ps2_runtime.h
+        "${KZ_GENERATED_PAL_DIR}/ps2_recompiled_functions.h"
+        "${KZ_GENERATED_PAL_DIR}/ps2_recompiled_stubs.h"
+        ext/PS2Recomp/ps2xRuntime/include/ps2_syscalls.h
+        ext/PS2Recomp/ps2xRuntime/include/ps2_stubs.h
+    )
+    if(MSVC)
+        target_compile_options(kz_generated_pal PRIVATE /bigobj /FS)
+    endif()
+    # Only its objects: linking the object library would add its ps2_runtime dependency again at the end of the link line,
+    # which moves raylib behind OneCore.lib/winmm.lib (LNK2005 CloseWindow / PlaySound).
+    target_sources(killzone PRIVATE $<TARGET_OBJECTS:kz_generated_pal>)
 endif()
 
 # Copy FFmpeg runtime DLLs next to killzone.exe (helper from ps2xRuntime).

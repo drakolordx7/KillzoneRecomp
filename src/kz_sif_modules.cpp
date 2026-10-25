@@ -5,7 +5,7 @@
 // tracker (g_sif_modules_by_id / g_sif_module_id_by_path, filled by sceSifLoadModule).
 
 #include "kz_sif_modules.h"
-#include "kz_region.h"
+#include "kz_addrs.h"
 
 #include "Syscalls/Common.h"
 #include "ps2_syscalls.h"
@@ -103,7 +103,7 @@ void kzSceSifUnloadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime
     setReturnS32(ctx, 0);
 }
 
-// Logitech lgkbm USB keyboard library init (FUN_003d7490(maxKbd, maxMouse, threadPrio, callback)).
+// Logitech lgkbm USB keyboard library init (FUN_003d7490(maxKbd, maxMouse, threadPrio, callback); PAL 0x3D80E0).
 // The real init binds the LGKBM.IRX RPC server and starts a polling thread that blocks on the IOP; the port feeds
 // keyboard/mouse through its own input layer, so the library is brought up as "initialized, nothing plugged in":
 // device counts set, every keyboard/mouse slot id = 0xFFFF (free), init flag set. The public API
@@ -116,18 +116,18 @@ void kzLgkbmInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     const int32_t maxMouse = std::min<int32_t>(static_cast<int32_t>(getRegU32(ctx, 5)), 4);
     auto w32 = [rdram](uint32_t addr, uint32_t v) { std::memcpy(rdram + (addr & PS2_RAM_MASK), &v, 4); };
     auto w16 = [rdram](uint32_t addr, uint16_t v) { std::memcpy(rdram + (addr & PS2_RAM_MASK), &v, 2); };
-    // PAL test build (kz_region.h): the library state block moved from 0x590D90 to 0x591B90 (the PAL init at 0x3D80E0
-    // addresses it as 0x1B90(s4) where the US one uses 0x0D90(s4)); the layout inside it is the same.
-    constexpr uint32_t d = KZ_GADDR(0u, 0xE00u);
-    w32(d + 0x00590DD0u, static_cast<uint32_t>(maxKbd));
-    w32(d + 0x00590DD4u, static_cast<uint32_t>(maxMouse));
+    // The library state block (US 0x590D90, PAL 0x591B90: the PAL init addresses it as 0x1B90(s4) where the US one uses
+    // 0x0D90(s4)); the layout inside it is the same.
+    const uint32_t b = kzAddrs().lgkbmState;
+    w32(b + 0x40u, static_cast<uint32_t>(maxKbd));   // US 0x590DD0
+    w32(b + 0x44u, static_cast<uint32_t>(maxMouse)); // US 0x590DD4
     for (int i = 0; i < 4; ++i)
     {
-        w16(d + 0x00590E1Cu + i * 0x110u, 0xFFFFu); // keyboard slot device id
-        w32(d + 0x00590E34u + i * 0x110u, 0u);      // keyboard slot state: not connected
-        w16(d + 0x0059125Cu + i * 0x68u, 0xFFFFu);  // mouse slot device id
+        w16(b + 0x8Cu + i * 0x110u, 0xFFFFu); // keyboard slot device id (US 0x590E1C)
+        w32(b + 0xA4u + i * 0x110u, 0u);      // keyboard slot state: not connected (US 0x590E34)
+        w16(b + 0x4CCu + i * 0x68u, 0xFFFFu); // mouse slot device id (US 0x59125C)
     }
-    w32(d + 0x00590DC4u, 1u); // library initialized
+    w32(b + 0x34u, 1u); // library initialized (US 0x590DC4)
     RUNTIME_LOG("[kz] lgkbm init HLE: maxKbd=" << maxKbd << " maxMouse=" << maxMouse << " (no USB devices)");
     setReturnS32(ctx, 0);
 }

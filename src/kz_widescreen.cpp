@@ -1,5 +1,5 @@
 #include "kz_widescreen.h"
-#include "kz_region.h"
+#include "kz_addrs.h"
 
 #include "kzgs.h"
 #include "ps2_runtime.h"
@@ -10,7 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 
-// Game functions (SCUS-97402), found with Ghidra (docs/findings.md "Ultrawide"):
+// Game functions (SCUS-97402; PAL addresses in kz_addrs.cpp), found with Ghidra (docs/findings.md "Ultrawide"):
 //   0x1C1960 renders the 3D world for one view slot (a0 game, a1 render slot, a2 camera object, a3 render camera). The camera
 //            (class at 0x3C8B78 ...) has near +0x68, far +0x6C, vertical field of view in degrees +0x70, aspect +0x74. The
 //            player update 0x21E0A0 sets aspect = 4/3 * (16:9 flag ? 4/3 : 1) = 16/9 and fov = 75 * wide / aspect = 56.25.
@@ -27,16 +27,8 @@
 namespace
 {
     constexpr uint32_t kRamMask = 0x01FFFFFFu;
-    constexpr uint32_t kWorld = 0x001C1960u;
-    constexpr uint32_t kViewmodel = 0x00220018u;
-    constexpr uint32_t kFrustum = 0x0016E2D8u;
-    constexpr uint32_t kOrtho = 0x0016E420u;
-    constexpr uint32_t kKick = 0x00150090u;
-    constexpr uint32_t kLimiter = 0x001BFF10u;
-    constexpr uint32_t kBufferIndex = 0x0055A6B4u;
-    constexpr uint32_t kText = 0x00167718u;
-    constexpr uint32_t kRect = 0x0015CF60u;
-    constexpr uint32_t kViewBuild = 0x003C8E70u; // builds the render camera's planes/matrices from the view struct that 0x1C1960 filled (trace only)
+    // Guest addresses: kzAddrs() world, viewmodel, frustum, ortho, kick, frameLimiter, bufferIndex, text, rect, viewBuild (builds the
+    // render camera's planes/matrices from the view struct that the world render filled; trace only).
     constexpr float kFrameWidth = 512.0f; // viewport of the render context (0x559118 -> scratchpad 0x70003A00, +0x10..+0x1C)
     constexpr float kNativeAspect = 16.0f / 9.0f;
 
@@ -117,14 +109,14 @@ namespace
 
     void world(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
-        const bool entry = ctx->pc == kWorld;
+        const bool entry = ctx->pc == kzAddrs().world;
         const uint32_t cam = getRegU32(ctx, 6);
         float saved = 0.0f;
         bool widened = false;
         if (entry)
         {
             flushPending(rdram);
-            logEv("world", rd32(rdram, 0x0055A6B4u), 0.0f);
+            logEv("world", rd32(rdram, kzAddrs().bufferIndex), 0.0f);
             if (g_log && ramPtr(cam))
                 std::printf("[kz-wide] worldcall cam=%08x aspect=%.4f fov=%.2f ra=%08x a3=%08x\n", cam, rdF(rdram, cam + 0x74), rdF(rdram, cam + 0x70), getRegU32(ctx, 31), getRegU32(ctx, 7));
             const float k = factor();
@@ -159,7 +151,7 @@ namespace
     void viewBuild(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
         const uint32_t s = getRegU32(ctx, 5);
-        if (g_log && ctx->pc == kViewBuild && getRegU32(ctx, 31) == 0x001C1A64u && ramPtr(s))
+        if (g_log && ctx->pc == kzAddrs().viewBuild && getRegU32(ctx, 31) == kzAddrs().viewBuildFromWorld && ramPtr(s))
         {
             // struct +0x30..0x3C = left, right, top, bottom of the view window at the near plane: (right - left) / (top - bottom) is the aspect
             const float w = rdF(rdram, s + 0x34) - rdF(rdram, s + 0x30), h = rdF(rdram, s + 0x38) - rdF(rdram, s + 0x3C);
@@ -170,7 +162,7 @@ namespace
 
     void viewmodel(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
-        const bool entry = ctx->pc == kViewmodel;
+        const bool entry = ctx->pc == kzAddrs().viewmodel;
         if (entry)
         {
             flushPending(rdram);
@@ -185,7 +177,7 @@ namespace
 
     void frustum(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
-        if (ctx->pc == kFrustum)
+        if (ctx->pc == kzAddrs().frustum)
         {
             logEv("frustum", 0, ctx->f[13]);
             if (g_inViewmodel)
@@ -196,7 +188,7 @@ namespace
 
     void ortho(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
-        if (ctx->pc == kOrtho)
+        if (ctx->pc == kzAddrs().ortho)
         {
             flushPending(rdram);
             g_built = true;
@@ -219,9 +211,10 @@ namespace
     {
         const uint32_t scalePtr = getRegU32(ctx, 4);
         const uint32_t ra = getRegU32(ctx, 31);
-        if (ctx->pc == kText && g_pendScale)
+        const bool entry = ctx->pc == kzAddrs().text;
+        if (entry && g_pendScale)
             flushPending(rdram); // a previous string yielded in the middle: its scale is put back first
-        const bool apply = ctx->pc == kText && g_worldWide && ramPtr(scalePtr);
+        const bool apply = entry && g_worldWide && ramPtr(scalePtr);
         float savedScale = 0.0f;
         if (apply)
         {
@@ -245,14 +238,15 @@ namespace
 
     void limiter(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
-        if (ctx->pc == kLimiter)
+        const KzAddrs &a = kzAddrs();
+        if (ctx->pc == a.frameLimiter)
             flushPending(rdram);
-        if (ctx->pc == kLimiter)
-            logEv("limiter", (rd32(rdram, kBufferIndex) & 1u) | (g_built ? 0x10u : 0u) | (g_worldWide ? 0x100u : 0u));
-        if (ctx->pc == kLimiter && g_built)
+        if (ctx->pc == a.frameLimiter)
+            logEv("limiter", (rd32(rdram, a.bufferIndex) & 1u) | (g_built ? 0x10u : 0u) | (g_worldWide ? 0x100u : 0u));
+        if (ctx->pc == a.frameLimiter && g_built)
         {
             g_built = false;
-            const uint32_t idx = rd32(rdram, kBufferIndex) & 1u;
+            const uint32_t idx = rd32(rdram, a.bufferIndex) & 1u;
             g_bufWide[idx] = g_worldWide;
             g_bufValid[idx] = true;
             g_worldWide = false;
@@ -264,7 +258,7 @@ namespace
     // (fades, dimming, letterbox bars) is extended over the widened 2D area so it still covers the whole screen.
     void rect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
-        if (ctx->pc == kRect && g_worldWide && std::fabs(ctx->f[12]) < 0.5f && std::fabs(ctx->f[14] - kFrameWidth) < 0.5f)
+        if (ctx->pc == kzAddrs().rect && g_worldWide && std::fabs(ctx->f[12]) < 0.5f && std::fabs(ctx->f[14] - kFrameWidth) < 0.5f)
         {
             logEv("fullrect", getRegU32(ctx, 4), ctx->f[15]);
             const float pad = kFrameWidth * (g_k - 1.0f) * 0.5f;
@@ -276,9 +270,9 @@ namespace
 
     void kick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
-        if (ctx->pc == kKick)
+        if (ctx->pc == kzAddrs().kick)
         {
-            const uint32_t idx = rd32(rdram, kBufferIndex) & 1u;
+            const uint32_t idx = rd32(rdram, kzAddrs().bufferIndex) & 1u;
             if (g_bufValid[idx])
             {
                 g_latched.store(g_bufWide[idx], std::memory_order_relaxed);
@@ -303,7 +297,7 @@ namespace
         static void fn(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
         {
             if (ctx->pc == t.addr)
-                logEv(t.name, rd32(rdram, 0x0055A6B4u), 0.0f);
+                logEv(t.name, rd32(rdram, kzAddrs().bufferIndex), 0.0f);
             t.orig(rdram, ctx, rt);
         }
     };
@@ -341,8 +335,6 @@ void kzWideConfigure(KzAspect aspect, int windowWidth, int windowHeight)
     }
     if (const char *v = std::getenv("KZ_WIDE_ASPECT")) // automation override
         target = static_cast<float>(std::atof(v));
-    if (kKzPal)
-        target = 0.0f; // PAL test build: the ultrawide hooks are not installed (kz_region.h)
     const float before = kzWideTargetAspect();
     kzWideSetTargetAspect(target);
     if (kzWideTargetAspect() != before)
@@ -365,16 +357,18 @@ void kzWideInstall(PS2Runtime &runtime)
     g_hold = !(std::getenv("KZ_WIDE_HOLD") && std::getenv("KZ_WIDE_HOLD")[0] == '0');
     if (const char *v = std::getenv("KZ_WIDE_ASPECT")) // automation: view aspect ratio of the widened frames
         kzWideSetTargetAspect(static_cast<float>(std::atof(v)));
-    const bool ok = hook(runtime, kWorld, &world, g_origWorld) && hook(runtime, kViewmodel, &viewmodel, g_origViewmodel) &&
-                    hook(runtime, kFrustum, &frustum, g_origFrustum) && hook(runtime, kOrtho, &ortho, g_origOrtho) &&
-                    hook(runtime, kKick, &kick, g_origKick) && hook(runtime, kLimiter, &limiter, g_origLimiter) && hook(runtime, kText, &text, g_origText) && hook(runtime, kRect, &rect, g_origRect);
+    const KzAddrs &a = kzAddrs();
+    const bool ok = hook(runtime, a.world, &world, g_origWorld) && hook(runtime, a.viewmodel, &viewmodel, g_origViewmodel) &&
+                    hook(runtime, a.frustum, &frustum, g_origFrustum) && hook(runtime, a.ortho, &ortho, g_origOrtho) &&
+                    hook(runtime, a.kick, &kick, g_origKick) && hook(runtime, a.frameLimiter, &limiter, g_origLimiter) &&
+                    hook(runtime, a.text, &text, g_origText) && hook(runtime, a.rect, &rect, g_origRect);
     if (g_log)
     {
-        hook(runtime, kViewBuild, &viewBuild, g_origViewBuild);
-        traceInstall<0>(runtime, 0x001C0148u, "renderframe");
-        traceInstall<1>(runtime, 0x0026B340u, "hud");
-        traceInstall<2>(runtime, 0x001EF640u, "postfx");
-        traceInstall<3>(runtime, 0x001C3040u, "c3040");
+        hook(runtime, a.viewBuild, &viewBuild, g_origViewBuild);
+        traceInstall<0>(runtime, a.renderFrameTrace, "renderframe");
+        traceInstall<1>(runtime, a.hudTrace, "hud");
+        traceInstall<2>(runtime, a.postRender, "postfx");
+        traceInstall<3>(runtime, a.c3040Trace, "c3040");
     }
     std::printf("[kz] ultrawide hooks: %s\n", ok ? "installed" : "FAILED");
 }

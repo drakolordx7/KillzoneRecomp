@@ -1,7 +1,8 @@
 // Killzone runner entry point. Replaces ps2xRuntime/src/main.cpp so we control boot paths.
 //
-// Usage: killzone.exe [--elf <path to SCUS_974.02>] [--iso <path to Killzone ISO>] [--sample <seconds>]
+// Usage: killzone.exe [--elf <path to SCUS_974.02 or SCES_528.93>] [--iso <path to Killzone ISO>] [--sample <seconds>]
 // Defaults: --elf game/SCUS_974.02 (relative to the working directory); --iso unset.
+// The game version (US SCUS-97402 or PAL SCES-52893, kz_region.h) comes from the disc image, or from the --elf file.
 // The ELF's directory is mounted as cdrom0:. The ISO, when given, backs raw sceCdRead sector reads.
 
 #include "ps2_runtime.h"
@@ -57,7 +58,7 @@ namespace
 {
     struct Options
     {
-        std::filesystem::path elf = kKzPal ? "game_pal/SCES_528.93" : "game/SCUS_974.02";
+        std::filesystem::path elf = "game/SCUS_974.02";
         bool elfGiven = false;
         std::filesystem::path iso;
         int sampleSeconds = 0; // --sample N: dump all thread stacks to work/stacks.txt every N seconds
@@ -234,15 +235,26 @@ int main(int argc, char *argv[])
                 return 0;
         }
         // Boot files: an explicit --elf (development), otherwise the small files extracted from the user's disc image
-        // into <exe dir>/disc. Game data is read from the image itself.
+        // into <exe dir>/disc (US) or <exe dir>/disc_pal (PAL, so each version keeps its own boot files and memory card).
+        // Game data is read from the image itself. The disc (or the --elf file) also chooses the game version.
         std::filesystem::path elf;
+        KzRegion region = KzRegion::Us;
         if (opts.elfGiven)
+        {
             elf = std::filesystem::absolute(opts.elf).lexically_normal();
+            std::string note;
+            if (std::filesystem::exists(elf) && !kzDetectElfRegion(elf, region, &note))
+                std::cerr << "[kz] --elf: " << note << std::endl;
+        }
         else
         {
-            std::string prepError;
-            // PAL test build (kz_region.h): its own folder, so the US boot files and memory card stay untouched.
-            elf = kzPrepareDiscFiles(cfg.isoPath, kzConfigPath().parent_path() / (kKzPal ? "disc_pal" : "disc"), &prepError);
+            const KzDiscCheck check = kzCheckDisc(cfg.isoPath);
+            std::string prepError = check.message;
+            if (check.ok)
+            {
+                region = check.region;
+                elf = kzPrepareDiscFiles(cfg.isoPath, kzConfigPath().parent_path() / kzRegionBootFolder(region), &prepError);
+            }
             if (elf.empty())
             {
                 const std::string msg = "Can't use the game disc image: " + prepError;
@@ -255,6 +267,17 @@ int main(int argc, char *argv[])
         {
             std::cerr << "[kz] ELF not found: " << elf.string() << std::endl;
             return 1;
+        }
+        // Before anything writes the function table (kzIpuBindRuntime, loadELF's overrides, the hooks): for PAL this puts
+        // the PAL code into the table, and every hook below reads its guest addresses from kzAddrs().
+        {
+            std::string regionError;
+            if (!kzSelectRegion(region, &regionError))
+            {
+                if (!headless)
+                    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Killzone", regionError.c_str(), nullptr);
+                return 1;
+            }
         }
 
         if (opts.sampleSeconds > 0)
@@ -363,21 +386,22 @@ int main(int argc, char *argv[])
             std::cerr << "[kz] failed to load ELF: " << elf.string() << std::endl;
             return 1;
         }
-        // PAL test build (kz_region.h): these hooks use US addresses that are not mapped yet, so they stay off.
-        if (!kKzPal)
-        {
-            kzAimInstall(runtime);
-            kzTimeFixInstall(runtime);
-            kzPostInstall(runtime);
-            // Ultrawide hooks only when an ultrawide aspect is chosen (or forced for tests): other aspects keep the game's own path.
-            if (cfg.aspect == KzAspect::UltrawideAuto || cfg.aspect == KzAspect::Ultrawide21x9 || cfg.aspect == KzAspect::Ultrawide32x9 ||
-                std::getenv("KZ_WIDE_ASPECT"))
-                kzWideInstall(runtime);
-            kzPromptsInstall(runtime); // after kzWideInstall: wraps the same text function
-        }
-        else
-            std::cout << "[kz] PAL test build (SCES-52893): mouse aim, ultrawide, prompts, post-process and look-acceleration hooks are off" << std::endl;
+        kzAimInstall(runtime);
+        kzTimeFixInstall(runtime);
+        kzPostInstall(runtime);
+        // Ultrawide hooks only when an ultrawide aspect is chosen (or forced for tests): other aspects keep the game's own path.
+        const bool wide = cfg.aspect == KzAspect::UltrawideAuto || cfg.aspect == KzAspect::Ultrawide21x9 ||
+                          cfg.aspect == KzAspect::Ultrawide32x9 || std::getenv("KZ_WIDE_ASPECT");
+        if (wide)
+            kzWideInstall(runtime);
+        kzPromptsInstall(runtime); // after kzWideInstall: wraps the same text function
         kzMoviesInstall(runtime);
+        if (kzIsPal())
+            std::cout << "[kz] PAL disc (SCES-52893, En/Ru/El): every hook uses its SCES_528.93 address (src/kz_addrs.cpp). "
+                      << "On: mouse aim, keyboard text entry, frame-rate fixes, post-process switches, movie fixes, native 16:9; "
+                      << "ultrawide " << (wide ? "on" : "off (aspect setting)") << "; button prompts "
+                      << (cfg.buttonPrompts ? "on while the game's button atlas matches the known one" : "off (setting)")
+                      << "; game video forced to NTSC 60 Hz (config/killzone_pal.toml). Boot files and memory card: disc_pal" << std::endl;
         // Tests: a separate (e.g. empty) memory card folder. After loadELF, which resets the roots to the ELF folder.
         if (const char *mc = std::getenv("KZ_MC_ROOT"); mc && *mc)
         {

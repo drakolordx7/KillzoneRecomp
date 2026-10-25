@@ -1,5 +1,7 @@
 #include "kz_devtools.h"
 
+#include "kz_addrs.h"
+
 #include "ps2_runtime.h"
 
 #include <atomic>
@@ -140,6 +142,7 @@ namespace
 
 namespace
 {
+    // Guest addresses here are the US ones (SCUS-97402); the code reads both versions' from kzAddrs() (kz_addrs.h).
     // KZ_CPDEBUG=1: wraps FUN_0017d318(world, nameObj, outVec) (object-list query used by the checkpoint scan, FUN_001c5330)
     // and logs the name object's words and the resulting list (count, first objects with their +0xB0 byte), at most 40 lines.
     uint32_t rdw(const uint8_t *ram, uint32_t a);
@@ -150,9 +153,9 @@ namespace
     void listWatch(uint8_t *ram);
     void syncKillWrap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
-        if (ctx->pc == 0x001BFF10u)
+        if (ctx->pc == kzAddrs().frameLimiter)
             listWatch(rdram);
-        if (ctx->pc == 0x001BFF10u && std::getenv("KZ_KILLALL_SYNC"))
+        if (ctx->pc == kzAddrs().frameLimiter && std::getenv("KZ_KILLALL_SYNC"))
         {
             static const char *k = std::getenv("KZ_KILLALL");
             static const double start = k ? std::atof(k) : 1e9;
@@ -186,7 +189,7 @@ namespace
             for (uint32_t o = 0; o < 0x200 && n < 8; o += 4)
             {
                 const uint32_t w = rdw(rdram, sp + o);
-                if (w >= 0x140000u && w < 0x55a674u && (w & 3u) == 0u)
+                if (w >= 0x140000u && w < kzAddrs().imageEnd && (w & 3u) == 0u)
                 {
                     std::fprintf(stderr, " +%x=%x", o, w);
                     ++n;
@@ -219,7 +222,7 @@ namespace
     {
         const uint32_t nameObj = getRegU32(ctx, 5), out = getRegU32(ctx, 6), ra = getRegU32(ctx, 31);
         g_origGetList(rdram, ctx, rt);
-        if (ctx->pc == ra && nameObj == 0x564b48u && out)
+        if (ctx->pc == ra && nameObj == kzAddrs().cpNameObj && out)
         {
             static const double force = std::getenv("KZ_CPFORCE") ? std::atof(std::getenv("KZ_CPFORCE")) : -1.0;
             static int forced = 0;
@@ -232,7 +235,7 @@ namespace
                 std::fprintf(stderr, "[cpforce] t=%.2f object %x flag set\n", nowSec(), o);
             }
         }
-        if (ctx->pc == ra && nameObj == 0x564b48u && g_cpLines < 40 && out)
+        if (ctx->pc == ra && nameObj == kzAddrs().cpNameObj && g_cpLines < 40 && out)
         {
             ++g_cpLines;
             uint32_t cnt = rdw(rdram, out), arr = rdw(rdram, out + 8);
@@ -273,14 +276,14 @@ void kzDevHooksInstall(PS2Runtime &runtime)
     }
     if ((std::getenv("KZ_KILLALL_SYNC") && std::getenv("KZ_KILLALL")) || std::getenv("KZ_LISTWATCH"))
     {
-        g_origSyncKill = runtime.lookupFunction(0x001BFF10u);
-        if (!g_origSyncKill || !runtime.replaceFunction(0x001BFF10u, &syncKillWrap))
+        g_origSyncKill = runtime.lookupFunction(kzAddrs().frameLimiter);
+        if (!g_origSyncKill || !runtime.replaceFunction(kzAddrs().frameLimiter, &syncKillWrap))
             std::cerr << "[kz] killall-sync hook failed" << std::endl;
     }
     if (const char *c = std::getenv("KZ_CPDEBUG"); c && *c == '1')
     {
-        g_origGetList = runtime.lookupFunction(0x0017D318u);
-        if (!g_origGetList || !runtime.replaceFunction(0x0017D318u, &getListWrap))
+        g_origGetList = runtime.lookupFunction(kzAddrs().objListQuery);
+        if (!g_origGetList || !runtime.replaceFunction(kzAddrs().objListQuery, &getListWrap))
             std::cerr << "[kz] cpdebug hook failed" << std::endl;
     }
     const char *e = std::getenv("KZ_HOOKLOG");
@@ -355,10 +358,10 @@ namespace
     uint32_t findCtl(const uint8_t *ram)
     {
         for (uint32_t a = 0x100000; a + 0x320 < 0x02000000u; a += 4)
-            if (rdw(ram, a) == 0x525710u)
+            if (rdw(ram, a) == kzAddrs().playerVtable)
             {
                 const uint32_t c = rdw(ram, a + 0x31C);
-                if (c >= 0x100000u && c < 0x01FFF000u && rdw(ram, c) == 0x524B50u)
+                if (c >= 0x100000u && c < 0x01FFF000u && rdw(ram, c) == kzAddrs().ctlVtable)
                     return c;
             }
         return 0;
@@ -374,7 +377,7 @@ namespace
         if (vt < 0x500000u || vt >= 0x580000u)
             return false;
         const uint32_t c = rdw(ram, a + 0x31C);
-        return c >= 0x100000u && c < 0x01FFF000u && rdw(ram, c) == 0x524B50u;
+        return c >= 0x100000u && c < 0x01FFF000u && rdw(ram, c) == kzAddrs().ctlVtable;
     }
 }
 
@@ -386,7 +389,7 @@ namespace
         std::fprintf(stderr, "[actors] t=%.1f", t);
         int n = 0;
         for (uint32_t a = 0x100000; a + 0x80 < 0x02000000u && n < 64; a += 4)
-            if (rdw(ram, a) == 0x524B50u)
+            if (rdw(ram, a) == kzAddrs().ctlVtable)
             {
                 float f[4];
                 const uint32_t offs[4] = {0x50, 0x54, 0x58, 0x78};
@@ -470,7 +473,7 @@ namespace
     uint32_t g_player = 0;
     uint32_t findPlayer(const uint8_t *ram)
     {
-        if (g_player && rdw(ram, g_player) == 0x525710u)
+        if (g_player && rdw(ram, g_player) == kzAddrs().playerVtable)
             return g_player;
         g_player = 0;
         static double nextScan = 0.0;
@@ -479,10 +482,10 @@ namespace
             return 0;
         nextScan = t + 1.0;
         for (uint32_t a = 0x100000; a + 0x320 < 0x02000000u; a += 4)
-            if (rdw(ram, a) == 0x525710u)
+            if (rdw(ram, a) == kzAddrs().playerVtable)
             {
                 const uint32_t c = rdw(ram, a + 0x31C);
-                if (c >= 0x100000u && c < 0x01FFF000u && rdw(ram, c) == 0x524B50u)
+                if (c >= 0x100000u && c < 0x01FFF000u && rdw(ram, c) == kzAddrs().ctlVtable)
                     return g_player = a;
             }
         return 0;
