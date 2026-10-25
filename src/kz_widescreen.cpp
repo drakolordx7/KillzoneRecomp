@@ -64,6 +64,11 @@ namespace
     uint32_t g_yields = 0;
     bool g_defer = true; // KZ_WIDE_DEFER=0: undo at once even after a yield (the behaviour before the issue #10 fix, for A/B runs)
     float g_k = 1.0f; // aspect factor of the widened view, valid while g_worldWide
+    // Issue #13: the sky dome and the distant skyline cards are drawn after 0x1C1960 returned (0x1C1B48 and others read the camera's aspect
+    // themselves), so with the camera put back at once they were built from the 16:9 aspect and shown stretched; only in frames where the guest
+    // had yielded inside 0x1C1960 (camera still widened, see above) were they right: that was the flicker. The camera therefore stays widened until the
+    // first hook after the world pass (first-person weapon, 2D setup, frame limiter, next view setup). KZ_WIDE_HOLD=0: undo at once (old behaviour, A/B).
+    bool g_hold = true;
 
     PS2Runtime::RecompiledFunction g_origViewBuild = nullptr, g_origWorld = nullptr, g_origViewmodel = nullptr, g_origFrustum = nullptr, g_origOrtho = nullptr, g_origKick = nullptr, g_origText = nullptr, g_origLimiter = nullptr, g_origRect = nullptr;
 
@@ -119,6 +124,8 @@ namespace
         {
             flushPending(rdram);
             logEv("world", rd32(rdram, 0x0055A6B4u), 0.0f);
+            if (g_log && ramPtr(cam))
+                std::printf("[kz-wide] worldcall cam=%08x aspect=%.4f fov=%.2f ra=%08x a3=%08x\n", cam, rdF(rdram, cam + 0x74), rdF(rdram, cam + 0x70), getRegU32(ctx, 31), getRegU32(ctx, 7));
             const float k = factor();
             if (k > 1.0f && ramPtr(cam))
             {
@@ -136,7 +143,7 @@ namespace
         g_origWorld(rdram, ctx, rt);
         if (widened)
         {
-            if (ctx->pc == ra || !g_defer)
+            if ((ctx->pc == ra && !g_hold) || !g_defer)
                 wrF(rdram, cam + 0x74, saved);
             else // the guest yielded inside: the camera stays widened until the call has really finished
             {
@@ -352,6 +359,7 @@ void kzWideInstall(PS2Runtime &runtime)
 {
     g_log = std::getenv("KZ_WIDE_LOG") != nullptr;
     g_defer = !(std::getenv("KZ_WIDE_DEFER") && std::getenv("KZ_WIDE_DEFER")[0] == '0');
+    g_hold = !(std::getenv("KZ_WIDE_HOLD") && std::getenv("KZ_WIDE_HOLD")[0] == '0');
     if (const char *v = std::getenv("KZ_WIDE_ASPECT")) // automation: view aspect ratio of the widened frames
         kzWideSetTargetAspect(static_cast<float>(std::atof(v)));
     const bool ok = hook(runtime, kWorld, &world, g_origWorld) && hook(runtime, kViewmodel, &viewmodel, g_origViewmodel) &&

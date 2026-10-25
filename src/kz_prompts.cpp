@@ -579,6 +579,7 @@ namespace
         at.valid = valid;
         Image img = decodeOriginal();
         std::map<std::string, Image> keyCache;
+        bool changed = false;
         for (int i = 0; i < kButtons; ++i)
         {
             const char *target = targetOfButton(i);
@@ -603,8 +604,15 @@ namespace
             for (int y = 0; y < n; ++y)
                 for (int x = 0; x < n; ++x)
                     img.at(ox + x, oy + y) = key.at(x, y);
+            changed = true;
             if (g_log)
                 std::printf("[kz-prompt] button %d (%s) -> %s (%s), %dx%d in cell %d,%d %dx%d\n", i, target, sourceFor(target).c_str(), icon.c_str(), n, n, c.u, c.v, c.w, c.h);
+        }
+        if (!changed) // nothing to draw: the stock data stands in, no re-quantising (CRCs stay 0, so it never matches a texture)
+        {
+            at.stream = g_origStream;
+            at.palette = g_origPalette;
+            return at;
         }
         std::vector<uint8_t> idx(kAtlasW * kAtlasH);
         Px palette[256];
@@ -882,14 +890,19 @@ namespace
             const char *words;
             std::string repl;
         };
-        const Rule rules[2] = {{"Right Analog Stick", "mouse"}, {"Left Analog Stick", movementKeys()}};
+        const Rule rules[2] = {{"Right Analog Stick", "mouse"}, {"Left Analog Stick", ""}};
         for (const Rule &r : rules)
         {
             const size_t at = line.find(r.words);
-            if (at == std::string::npos || r.repl.empty())
+            if (at == std::string::npos)
+                continue;
+            const std::string repl = r.repl.empty() ? movementKeys() : r.repl; // built only for a matched line
+            if (repl.empty())
                 continue;
             std::string out = line;
-            out.replace(at, std::strlen(r.words), r.repl);
+            out.replace(at, std::strlen(r.words), repl);
+            if (out.size() > len) // never write past the original string in guest memory
+                continue;
             WordSwap w{line, out, textWidth(rdram, font, line) - textWidth(rdram, font, out)};
             std::memcpy(p, out.c_str(), out.size() + 1);
             if (g_log)

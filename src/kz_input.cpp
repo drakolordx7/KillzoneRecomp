@@ -101,6 +101,7 @@ namespace
         float mouseDx = 0.0f; // raw counts since last take
         float mouseDy = 0.0f;
         bool usingKbm = true; // last device with activity was keyboard/mouse (vs gamepad)
+        bool kbmSeen = false; // any keyboard/mouse input has happened yet
         float stickMouseDx = 0.0f; // counts since last pad read (right-stick fallback)
         float stickMouseDy = 0.0f;
         bool captured = false;
@@ -630,12 +631,14 @@ void kzInputOnEvent(const SDL_Event &e)
             }
         }
         s.usingKbm = true;
+        s.kbmSeen = true;
         break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
     case SDL_EVENT_MOUSE_BUTTON_UP:
         if (e.button.button < s.mouseButtons.size())
             s.mouseButtons[e.button.button] = e.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
         s.usingKbm = true;
+        s.kbmSeen = true;
         break;
     case SDL_EVENT_MOUSE_WHEEL:
         if (e.wheel.y > 0)
@@ -654,11 +657,16 @@ void kzInputOnEvent(const SDL_Event &e)
             s.stickMouseDx += dx;
             s.stickMouseDy += dy;
             s.usingKbm = true;
+            s.kbmSeen = true;
         }
         break;
     case SDL_EVENT_GAMEPAD_ADDED:
         if (!s.gamepad)
+        {
             s.gamepad = SDL_OpenGamepad(e.gdevice.which);
+            if (s.gamepad && !s.kbmSeen)
+                s.usingKbm = false; // controller-only player: start with controller prompts
+        }
         break;
     case SDL_EVENT_GAMEPAD_REMOVED:
         if (s.gamepad && SDL_GetGamepadID(s.gamepad) == e.gdevice.which)

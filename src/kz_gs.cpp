@@ -544,8 +544,8 @@ namespace
         // is a barrier), so it must never wait for the GS thread: when Present is slow (an external frame limiter such as
         // RTSS sleeps inside it, or a display slower than the guest vblank rate) a blocking kzgsVsync stalled the whole EE and
         // the loading screen crawled or hung (issue #9). A busy GS drops this vblank's presentation; the next one shows the
-        // newest frame (the packets and register changes stay pending). Not verified enough yet: the blocking throttle stays the default; KZ_GS_NONBLOCK=1 turns the new path on for testing.
-        static const bool blockingThrottle = !(std::getenv("KZ_GS_NONBLOCK") && std::getenv("KZ_GS_NONBLOCK")[0] == '1');
+        // newest frame (the packets and register changes stay pending). This is the default; KZ_GS_BLOCK=1 brings back the old blocking throttle (A/B tests).
+        static const bool blockingThrottle = std::getenv("KZ_GS_BLOCK") && std::getenv("KZ_GS_BLOCK")[0] == '1';
         const bool newPackets = g_packetsSinceVsync.load(std::memory_order_relaxed) != 0;
         const bool regsChanged = std::memcmp(lastDisplayRegs, s.privRegs, sizeof(lastDisplayRegs)) != 0;
         bool didPresent = false;
