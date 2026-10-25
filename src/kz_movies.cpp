@@ -1,6 +1,6 @@
 // Optional skip of the boot intro movie (GitHub issue #5).
 //
-// FUN_0026ECC8 is the game's blocking movie player (a0 = movie name string object, *a0 + 0x10 = the characters).
+// FUN_0026ECC8 (PAL 0x26F338, kzAddrs().playMovie) is the game's blocking movie player (a0 = movie name string object, *a0 + 0x10 = the characters).
 // It first checks that the file exists and returns 0 without playing when it does not; callers then carry on as
 // after the movie. With the option on, the hook takes that path for the intro movie only ("Movies/Intro/Intro").
 // Story cutscenes, the attract loop and the menu background movies are untouched.
@@ -9,7 +9,7 @@
 #include "kz_movies.h"
 
 #include "kz_config.h"
-#include "kz_region.h"
+#include "kz_addrs.h"
 #include "ps2_runtime.h"
 
 #include <cstdio>
@@ -19,7 +19,6 @@
 
 namespace
 {
-    constexpr uint32_t kPlayMovie = KZ_GADDR(0x0026ECC8u, 0x0026F338u); // PAL: kz_region.h, matches apart from relocations
     constexpr uint32_t kRamMask = 0x01FFFFFFu;
     constexpr const char *kIntroMovie = "Movies/Intro/Intro";
 
@@ -47,7 +46,7 @@ namespace
 
     void playMovie(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
-        if (ctx->pc == kPlayMovie)
+        if (ctx->pc == kzAddrs().playMovie)
         {
             const std::string name = movieName(rdram, getRegU32(ctx, 4));
             const bool skip = g_skipIntro && name == kIntroMovie;
@@ -72,6 +71,7 @@ void kzMoviesInstall(PS2Runtime &runtime)
     g_log = std::getenv("KZ_MOVIE_LOG") != nullptr;
     if (!g_skipIntro && !g_log)
         return;
+    const uint32_t kPlayMovie = kzAddrs().playMovie;
     g_origPlayMovie = runtime.hasFunction(kPlayMovie) ? runtime.lookupFunction(kPlayMovie) : nullptr;
     if (!g_origPlayMovie || !runtime.replaceFunction(kPlayMovie, &playMovie))
         std::printf("[kz] movie hook FAILED\n");

@@ -1,5 +1,5 @@
 #include "kz_ipu.h"
-#include "kz_region.h"
+#include "kz_addrs.h"
 
 #include "kzipu.h"
 
@@ -125,14 +125,14 @@ namespace
         const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), a2 = getRegU32(ctx, 6), a3 = getRegU32(ctx, 7);
         const uint32_t ra = getRegU32(ctx, 31);
         char extra[160] = "";
-        if (t.addr == 0x0014D790u || t.addr == 0x0014DAD0u)
+        if (t.addr == kzAddrs().fileReadAsync || t.addr == kzAddrs().filePoll)
         {
             const uint32_t dev = guest32(rdram, a0 + 8), vt = guest32(rdram, dev + 4);
             std::snprintf(extra, sizeof(extra), " dev=0x%x vt=0x%x +28=0x%x +38=0x%x h=0x%x", dev, vt,
                           guest32(rdram, vt + 0x28), guest32(rdram, vt + 0x38), guest32(rdram, a0 + 0xC));
         }
         t.orig(rdram, ctx, rt);
-        if (t.addr == 0x004963B8u) // stream read: log the total delivered when it first returns 0 (EOF or stall)
+        if (t.addr == kzAddrs().stRead) // stream read: log the total delivered when it first returns 0 (EOF or stall)
         {
             static uint32_t s_stream = 0, s_total = 0, s_lastLogged = ~0u;
             if (a0 != s_stream) { s_stream = a0; s_total = 0; s_lastLogged = ~0u; }
@@ -164,10 +164,11 @@ namespace
         const char *spec = std::getenv("KZ_IPU_TRACE");
         if (!spec || !*spec)
             return;
-        static const std::pair<uint32_t, const char *> kDefault[] = {
-            {0x002DED00u, "movieOpen"}, {0x00496168u, "stOpen"}, {0x004963B8u, "stRead"},
-            {0x0014D790u, "fileReadAsync"}, {0x0014DAD0u, "filePoll"}, {0x002E0AC0u, "feed"},
-            {0x002DF800u, "inputEnd"}, {0x002E1A40u, "audioFull"}, {0x002E19C0u, "audioFeed"},
+        const KzAddrs &k = kzAddrs();
+        const std::pair<uint32_t, const char *> kDefault[] = {
+            {k.movieOpen, "movieOpen"}, {k.stOpen, "stOpen"}, {k.stRead, "stRead"},
+            {k.fileReadAsync, "fileReadAsync"}, {k.filePoll, "filePoll"}, {k.movieFeed, "feed"},
+            {k.movieInputEnd, "inputEnd"}, {k.audioFull, "audioFull"}, {k.audioFeed, "audioFeed"},
         };
         std::vector<std::pair<uint32_t, const char *>> fns(std::begin(kDefault), std::end(kDefault));
         // extra addresses: KZ_IPU_TRACE=0x1234,0x5678
@@ -251,7 +252,7 @@ bool kzIpuInstall()
 //    data keeps the flag (the stream really is stuck).
 namespace
 {
-    constexpr uint32_t kCurrentPlayer = KZ_GADDR(0x0055B3D8u, 0x0055C1D8u); // (PAL: kz_region.h) DAT_0055b3d8: the movie player being serviced
+    // kzAddrs().movieCurrentPlayer (DAT_0055b3d8): the movie player being serviced
     PS2Runtime::RecompiledFunction g_movieReadOrig = nullptr;
     PS2Runtime::RecompiledFunction g_inputEndOrig = nullptr;
     uint32_t g_eofPlayer = 0u;
@@ -264,15 +265,14 @@ namespace
         g_movieReadOrig(rdram, ctx, rt);
         if (ctx->pc != ra)
             return; // yielded mid-read (the result is produced later)
-        const uint32_t player = guest32(rdram, kCurrentPlayer);
+        const uint32_t player = guest32(rdram, kzAddrs().movieCurrentPlayer);
         if (getRegU32(ctx, 2) != 0u)
         {
             if (player == g_eofPlayer)
                 g_eofReads = 0;
             return;
         }
-        constexpr uint32_t kDiscStreamVtable = KZ_GADDR(0x0052EB28u, 0x0052F7B8u);
-        if (guest32(rdram, stream + 4) != kDiscStreamVtable || guest32(rdram, stream + 0x20) != 0u)
+        if (guest32(rdram, stream + 4) != kzAddrs().discStreamVtable || guest32(rdram, stream + 0x20) != 0u)
             return; // no data yet, not the end
         if (player != g_eofPlayer)
         {
@@ -285,7 +285,7 @@ namespace
 
     void movieInputEnd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
-        const uint32_t player = guest32(rdram, kCurrentPlayer);
+        const uint32_t player = guest32(rdram, kzAddrs().movieCurrentPlayer);
         if (player != 0u && player == g_eofPlayer && g_eofReads == 1)
         {
             const uint32_t flag = (player + 0x160u) & 0x01FFFFFFu;
@@ -299,8 +299,8 @@ namespace
 void kzIpuBindRuntime(PS2Runtime &runtime)
 {
     g_runtime = &runtime;
-    constexpr uint32_t kMovieRead = KZ_GADDR(0x002DEB98u, 0x002DF698u);
-    constexpr uint32_t kInputEnd = KZ_GADDR(0x002DF800u, 0x002E0300u);
+    const uint32_t kMovieRead = kzAddrs().movieRead;
+    const uint32_t kInputEnd = kzAddrs().movieInputEnd;
     if (g_active && runtime.hasFunction(kMovieRead) && runtime.hasFunction(kInputEnd))
     {
         g_movieReadOrig = runtime.lookupFunction(kMovieRead);
@@ -308,8 +308,7 @@ void kzIpuBindRuntime(PS2Runtime &runtime)
         g_inputEndOrig = runtime.lookupFunction(kInputEnd);
         runtime.replaceFunction(kInputEnd, &movieInputEnd);
     }
-    if (!kKzPal) // KZ_IPU_TRACE lists US addresses
-        installTrace(runtime); // last, so it wraps the shims above
+    installTrace(runtime); // last, so it wraps the shims above
 }
 
 bool kzIpuActive()

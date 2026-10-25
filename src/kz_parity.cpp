@@ -1,5 +1,7 @@
 #include "kz_parity.h"
 
+#include "kz_addrs.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -11,13 +13,12 @@
 namespace
 {
     constexpr uint32_t kRamSize = 0x02000000u;
-    constexpr uint32_t kPlayerVtable = 0x525710u; // player entity
-    constexpr uint32_t kCtlVtable = 0x524B50u;    // character controller (player+0x31C)
-    constexpr uint32_t kWeaponVtable = 0x52BD20u; // weapon (+0xC owner ctl, +0x180 magazine, +0x184 reserve, +0xE0 state)
+    // kzAddrs() vtables: playerVtable (player entity), ctlVtable (character controller, player+0x31C), weaponVtable (weapon:
+    // +0xC owner ctl, +0x180 magazine, +0x184 reserve, +0xE0 state).
 
     struct Word
     {
-        char base;                   // p player, c ctl, g game object (*0x559178), w rifle weapon, a absolute
+        char base;                   // p player, c ctl, g game object (*kzAddrs().gameObjectPtr), w rifle weapon, a absolute
         std::vector<uint32_t> chain; // first = offset from base, the rest = offsets after dereferencing
         std::string text;
     };
@@ -120,6 +121,7 @@ namespace
     void sweep(const uint8_t *ram, uint32_t ctl)
     {
         const uint32_t *w = reinterpret_cast<const uint32_t *>(ram);
+        const uint32_t kPlayerVtable = kzAddrs().playerVtable, kCtlVtable = kzAddrs().ctlVtable, kWeaponVtable = kzAddrs().weaponVtable;
         const uint32_t end = std::min<uint32_t>(g_sweepPos + kChunkWords, kRamSize / 4 - 0x300);
         for (uint32_t i = g_sweepPos; i < end; ++i)
         {
@@ -172,11 +174,12 @@ void kzParityOnVsync(uint8_t *ram)
     }
     if (wall < g_start)
         return;
-    if (g_player && rd32(ram, g_player) != kPlayerVtable)
+    const KzAddrs &k = kzAddrs();
+    if (g_player && rd32(ram, g_player) != k.playerVtable)
         g_player = 0;
-    if (g_weapon && rd32(ram, g_weapon) != kWeaponVtable)
+    if (g_weapon && rd32(ram, g_weapon) != k.weaponVtable)
         g_weapon = 0;
-    const uint32_t obj = rd32(ram, 0x00559178u);
+    const uint32_t obj = rd32(ram, k.gameObjectPtr);
     uint32_t ctl = 0;
     if (g_player)
         ctl = rd32(ram, g_player + 0x31C);
@@ -200,7 +203,7 @@ void kzParityOnVsync(uint8_t *ram)
         std::memcpy(&z, &v[2], 4);
         std::memcpy(&h, &v[3], 4);
     }
-    std::fprintf(g_file, "%.5f,%u,%u,%u,%.7f,%x,%x,%.4f,%.4f,%.4f,%.5f", wall, rd32(ram, 0x0055A6E0u), nowTick, el, spt, g_player,
+    std::fprintf(g_file, "%.5f,%u,%u,%u,%.7f,%x,%x,%.4f,%.4f,%.4f,%.5f", wall, rd32(ram, k.vsyncCounter), nowTick, el, spt, g_player,
                  ctl, x, y, z, h);
     for (const Word &w : g_words)
     {

@@ -1,5 +1,6 @@
 #include "kz_aim.h"
 
+#include "kz_addrs.h"
 #include "kz_config.h"
 #include "kz_input.h"
 
@@ -12,7 +13,8 @@
 #include <cstdlib>
 #include <cstring>
 
-// Game functions (SCUS-97402):
+// Game functions (SCUS-97402; the PAL addresses are in kz_addrs.cpp. The PAL player update matches the US one apart from
+// relocations from its start through the ApplyLook call, the scope block and the call of the after-look probe):
 //   0x23EE08 JoystickControllerPlayerImp update(ctrl, ...). ctrl+0x18 = player entity, ctrl+0x1C = local player index
 //            (-1 = unused). Writes the stick look rates: ctrl+0xA8 yaw (copy at ctrl+0x3C), ctrl+0xAC pitch. The player
 //            update reads them as its control state (ctrl+0x24, rates at +0x84/+0x88).
@@ -35,13 +37,8 @@
 //            FUN_001b17a0(obj, ch)), but no USB keyboard is emulated. obj+0x21C == 1 while the keyboard is open.
 namespace
 {
-    constexpr uint32_t kCtrlUpdate = 0x0023EE08u;
-    constexpr uint32_t kApplyLook = 0x0021C550u;
-    constexpr uint32_t kPitchAutoCentre = 0x0023E9C8u;
-    constexpr uint32_t kAfterLookProbe = 0x00218710u; // first call the player update makes after the scope block
-    constexpr uint32_t kVkKeyboard = 0x001B0DF0u;
-    constexpr uint32_t kVkAddChar = 0x001B17A0u;
-    constexpr uint32_t kVkBackspace = 0x001B18D8u;
+    // Guest functions: kzAddrs() ctrlUpdate, applyLook, pitchAutoCentre, afterLookProbe (the first call the player update
+    // makes after the scope block), vkKeyboard, vkAddChar, vkBackspace.
 
     constexpr float kRadPerCount = 0.05f * 3.14159265f / 180.0f; // at sensitivity 1.0: 0.05 degrees per count
     constexpr double kStaleSeconds = 0.25; // mouse motion older than this (menus, loading, pause) is dropped
@@ -107,7 +104,7 @@ namespace
     // times seconds per tick (+0x50) in the game object *(0x559178). 0 if unavailable.
     float frameDt(const uint8_t *rdram)
     {
-        const uint32_t obj = rd32(rdram, 0x00559178u);
+        const uint32_t obj = rd32(rdram, kzAddrs().gameObjectPtr);
         if (obj < 0x00100000u || obj >= 0x02000000u)
             return 0.0f;
         return static_cast<float>(rd32(rdram, obj + 0x64)) * rdf(rdram, obj + 0x50);
@@ -244,7 +241,7 @@ namespace
         }
         const uint32_t ra = getRegU32(ctx, 31);
         const uint32_t ctrl = getRegU32(ctx, 4);
-        const bool local = ctx->pc == kCtrlUpdate && rd32(rdram, ctrl + 0x1C) == 0u;
+        const bool local = ctx->pc == kzAddrs().ctrlUpdate && rd32(rdram, ctrl + 0x1C) == 0u;
         g_origCtrlUpdate(rdram, ctx, rt);
         if (!local || ctx->pc != ra)
             return; // not player 0, or the update yielded (it finishes later in guest code)
@@ -305,7 +302,7 @@ namespace
 
     void applyLook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
-        const bool mine = ctx->pc == kApplyLook && g_player != 0u && getRegU32(ctx, 4) == g_player;
+        const bool mine = ctx->pc == kzAddrs().applyLook && g_player != 0u && getRegU32(ctx, 4) == g_player;
         if (!mine)
         {
             g_origApplyLook(rdram, ctx, rt);
@@ -380,7 +377,7 @@ namespace
     void pitchAutoCentre(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
         // With keyboard/mouse the player holds pitch with the mouse; the pad assist would drag the view to the horizon.
-        if (ctx->pc == kPitchAutoCentre && kzInputUsingKeyboardMouse())
+        if (ctx->pc == kzAddrs().pitchAutoCentre && kzInputUsingKeyboardMouse())
         {
             ctx->pc = getRegU32(ctx, 31);
             return;
@@ -394,7 +391,7 @@ namespace
     void vkKeyboard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
         const uint32_t obj = getRegU32(ctx, 4);
-        if (ctx->pc == kVkKeyboard && rd32(rdram, obj + 0x21C) == 1u)
+        if (ctx->pc == kzAddrs().vkKeyboard && rd32(rdram, obj + 0x21C) == 1u)
         {
             kzInputSetTextEntryActive();
             uint16_t key = 0;
@@ -406,14 +403,14 @@ namespace
                     wr32(rdram, obj + 0x21C, 4u);
                 else if (key == KZ_TEXT_BACKSPACE)
                 {
-                    ctx->pc = kVkBackspace;
+                    ctx->pc = kzAddrs().vkBackspace;
                     g_vkBackspace(rdram, ctx, rt);
                     return;
                 }
                 else
                 {
                     setReg(ctx, 5, key);
-                    ctx->pc = kVkAddChar;
+                    ctx->pc = kzAddrs().vkAddChar;
                     g_vkAddChar(rdram, ctx, rt);
                     return;
                 }
@@ -461,13 +458,15 @@ namespace
 
 void kzAimInstall(PS2Runtime &runtime)
 {
+    const KzAddrs &a = kzAddrs();
+    const uint32_t kVkAddChar = a.vkAddChar, kVkBackspace = a.vkBackspace;
     // Text entry does not depend on the aim patch.
     g_vkAddChar = runtime.hasFunction(kVkAddChar) ? runtime.lookupFunction(kVkAddChar) : nullptr;
     g_vkBackspace = runtime.hasFunction(kVkBackspace) ? runtime.lookupFunction(kVkBackspace) : nullptr;
-    const bool vk = g_vkAddChar && g_vkBackspace && hook(runtime, kVkKeyboard, &vkKeyboard, g_origVkKeyboard);
+    const bool vk = g_vkAddChar && g_vkBackspace && hook(runtime, a.vkKeyboard, &vkKeyboard, g_origVkKeyboard);
     std::printf("[kz] keyboard text entry: %s\n", vk ? "installed" : "FAILED");
     if (std::getenv("KZ_PAD_LOG"))
-        hook(runtime, 0x001B33B8u, &buttonValue, g_origButtonValue);
+        hook(runtime, a.buttonValue, &buttonValue, g_origButtonValue);
 
     if (const char *v = std::getenv("KZ_AIM"); v && std::strcmp(v, "off") == 0)
     {
@@ -475,9 +474,9 @@ void kzAimInstall(PS2Runtime &runtime)
         return;
     }
     g_log = std::getenv("KZ_AIM_LOG") != nullptr;
-    const bool ok = hook(runtime, kCtrlUpdate, &ctrlUpdate, g_origCtrlUpdate) &&
-                    hook(runtime, kApplyLook, &applyLook, g_origApplyLook) &&
-                    hook(runtime, kPitchAutoCentre, &pitchAutoCentre, g_origPitchAutoCentre) &&
-                    hook(runtime, kAfterLookProbe, &afterLook, g_origAfterLook);
+    const bool ok = hook(runtime, a.ctrlUpdate, &ctrlUpdate, g_origCtrlUpdate) &&
+                    hook(runtime, a.applyLook, &applyLook, g_origApplyLook) &&
+                    hook(runtime, a.pitchAutoCentre, &pitchAutoCentre, g_origPitchAutoCentre) &&
+                    hook(runtime, a.afterLookProbe, &afterLook, g_origAfterLook);
     std::printf("[kz] mouse aim patch: %s\n", ok ? "installed" : "FAILED (mouse drives the right stick)");
 }

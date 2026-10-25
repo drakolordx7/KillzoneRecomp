@@ -14,6 +14,9 @@ single_file_output = false
 patch_syscalls = false
 patch_cop0 = true
 patch_cache = true
+# The function table reaches past the PAL code (generated_pal, kzPalRegisterFunctionTableEnd 0x513FD4), which fills this
+# same table when the PAL disc is chosen (src/kz_region.cpp).
+table_end_min = 0x514000
 stubs = [
   # --- manual bindings (docs/findings.md#library-bindings). New ones go in src/kz_overrides.cpp (no regen needed). ---
   "sceSifLoadModule@0x002B6060",

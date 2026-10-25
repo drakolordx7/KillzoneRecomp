@@ -1,5 +1,7 @@
 #include "kz_timefix.h"
 
+#include "kz_addrs.h"
+
 #include "ps2_runtime.h"
 
 #include <algorithm>
@@ -8,7 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 
-// Game functions (SCUS-97402):
+// Game functions (SCUS-97402; the PAL addresses are in kz_addrs.cpp):
 //   0x23E8C8 FUN_0023e8c8(pad, state, float *turnSpeed, flag, float *accum, float *start): the stick look acceleration of
 //            the JoystickControllerPlayerImp update (0x23EE08). state+0x18 is the turn value (stick^3 * sensitivity).
 //            Every frame it adds |turn| * turnSpeed * (pi/180) to *accum, a count of "degrees turned" that is only reset
@@ -28,11 +30,7 @@
 //            original at 30..inf fps (+6 % at 120 fps), settle time 0.075 s (-9 %).
 namespace
 {
-    constexpr uint32_t kLookAccel = 0x0023E8C8u;
-    constexpr uint32_t kApplyLook = 0x0021C550u;
     constexpr float kLagTau = 0.075f;
-    constexpr uint32_t kGameObjectPtr = 0x00559178u;
-    constexpr uint32_t kNowSeconds = 0x0055F0FCu; // DAT_0055f0fc: the engine clock in seconds (float)
     constexpr uint32_t kRamMask = 0x01FFFFFFu;
 
     PS2Runtime::RecompiledFunction g_origLookAccel = nullptr;
@@ -55,7 +53,7 @@ namespace
 
     float frameDt(const uint8_t *ram)
     {
-        const uint32_t obj = rd32(ram, kGameObjectPtr);
+        const uint32_t obj = rd32(ram, kzAddrs().gameObjectPtr);
         if (obj < 0x00100000u || obj >= 0x02000000u)
             return 0.0f;
         return static_cast<float>(rd32(ram, obj + 0x64)) * rdf(ram, obj + 0x50);
@@ -63,7 +61,7 @@ namespace
 
     void applyLook(uint8_t *ram, R5900Context *ctx, PS2Runtime *rt)
     {
-        if (ctx->pc != kApplyLook)
+        if (ctx->pc != kzAddrs().applyLook)
         {
             g_origApplyLook(ram, ctx, rt);
             return;
@@ -84,7 +82,7 @@ namespace
 
     void lookAccel(uint8_t *ram, R5900Context *ctx, PS2Runtime *rt)
     {
-        if (ctx->pc != kLookAccel)
+        if (ctx->pc != kzAddrs().lookAccel)
         {
             g_origLookAccel(ram, ctx, rt); // resumed after a yield: not our entry
             return;
@@ -94,7 +92,7 @@ namespace
         const uint32_t flag = getRegU32(ctx, 7);
         const uint32_t accumPtr = getRegU32(ctx, 8);
         const uint32_t startPtr = getRegU32(ctx, 9);
-        const float now = rdf(ram, kNowSeconds);
+        const float now = rdf(ram, kzAddrs().nowSeconds); // the engine clock in seconds
         const float turn = rdf(ram, state + 0x18);
         uint32_t turnBits;
         std::memcpy(&turnBits, &turn, 4);
@@ -136,6 +134,7 @@ void kzTimeFixInstall(PS2Runtime &runtime)
         return;
     }
     g_log = std::getenv("KZ_TIMEFIX_LOG") != nullptr;
+    const uint32_t kLookAccel = kzAddrs().lookAccel, kApplyLook = kzAddrs().applyLook;
     g_origLookAccel = runtime.hasFunction(kLookAccel) ? runtime.lookupFunction(kLookAccel) : nullptr;
     const bool ok = g_origLookAccel && runtime.replaceFunction(kLookAccel, &lookAccel);
     // After kzAimInstall (which wraps ApplyLook too): this wrapper calls whatever is registered now.
