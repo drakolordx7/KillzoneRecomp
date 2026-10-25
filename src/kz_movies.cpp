@@ -9,6 +9,7 @@
 #include "kz_movies.h"
 
 #include "kz_config.h"
+#include "kz_region.h"
 #include "ps2_runtime.h"
 
 #include <cstdio>
@@ -18,7 +19,7 @@
 
 namespace
 {
-    constexpr uint32_t kPlayMovie = 0x0026ECC8u;
+    constexpr uint32_t kPlayMovie = KZ_GADDR(0x0026ECC8u, 0x0026F338u); // PAL: kz_region.h, matches apart from relocations
     constexpr uint32_t kRamMask = 0x01FFFFFFu;
     constexpr const char *kIntroMovie = "Movies/Intro/Intro";
 

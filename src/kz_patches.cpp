@@ -2,6 +2,7 @@
 
 #include "kz_config.h"
 #include "kz_devtools.h"
+#include "kz_region.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -28,7 +29,7 @@ void kzPatchesApply(uint8_t *rdram, const KzConfig &cfg)
 {
     kzDevOnVsync(rdram);
     static const bool disabled = std::getenv("KZ_NO_PATCHES") != nullptr; // debugging
-    if (!rdram || disabled)
+    if (!rdram || disabled || kKzPal) // PAL test build: the game object's +0x34 field is not checked on PAL
         return;
     // Writing the pnach's absolute heap address corrupted render state here (the runtime's heap layout differs from
     // the PS2's), so the flag is reached through the game object pointer instead.
