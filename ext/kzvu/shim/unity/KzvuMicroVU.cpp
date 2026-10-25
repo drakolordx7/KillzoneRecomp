@@ -203,7 +203,7 @@ namespace
 		return k;
 	}
 
-	// Same kind of key for CPUs without AES-NI (Core 2 / Penryn, Nehalem, Phenom: the SSE4.1 baseline, issue #8): two
+	// Same kind of key for CPUs without AES-NI (Core 2 Penryn, Nehalem, Clarkdale and older Pentium/Celeron: the SSE4.1 baseline, issue #8): two
 	// independent multiply-rotate lanes per 8-byte word, folded at the end. Slower than the AES path but only a few microseconds
 	// per VU1 code change.
 	MemoKey memoHashScalar(const u8* p)

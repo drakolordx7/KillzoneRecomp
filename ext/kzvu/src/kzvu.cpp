@@ -174,7 +174,7 @@ bool kzvuInit(const KzvuConfig& cfg, std::string* err)
 	// is PCSX2's 64 MB unless cfg.vu1CacheMB says otherwise; microVU1's limit is moved to match after Reserve().
 	s_vu1_cache_bytes = HostMemoryMap::mVU1recSize;
 	if (cfg.vu1CacheMB != 0)
-		s_vu1_cache_bytes = std::clamp<u32>(cfg.vu1CacheMB, 4, 1024) * _1mb;
+		s_vu1_cache_bytes = std::clamp<u32>(cfg.vu1CacheMB, 4, 256) * _1mb;
 	if (!kzvu::AllocCodeCache(HostMemoryMap::mVU0recSize + s_vu1_cache_bytes, err))
 		return false;
 

@@ -9,7 +9,7 @@ No game files are included; you need your own disc image of Killzone, US version
 ## Requirements
 
 - Windows 10 or 11, 64-bit
-- CPU with AVX2: Intel 4th gen (Haswell), AMD Ryzen or newer
+- CPU with SSE4.1: Intel Core 2 (45 nm, Penryn), AMD FX (Bulldozer) or newer. Newer CPUs get the faster AVX and AVX2 code automatically
 - GPU with Direct3D 11, Direct3D 12 or Vulkan
 
 ## Usage

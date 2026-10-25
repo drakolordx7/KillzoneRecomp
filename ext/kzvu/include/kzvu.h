@@ -49,7 +49,7 @@ struct KzvuConfig
 	// VU0 clamp mode (same meaning as clampMode); -1 = use clampMode.
 	int vu0ClampMode = -1;
 
-	// Size of microVU1's code cache in MB (0 = PCSX2's 64 MB; clamped to 4..1024). Only read by the first kzvuInit. When it
+	// Size of microVU1's code cache in MB (0 = PCSX2's 64 MB; clamped to 4..256: committed up front). Only read by the first kzvuInit. When it
 	// is full (3 MB short of the end, PCSX2's safe zone), microVU frees every compiled VU1 program and starts over
 	// ("Program cache limit reached"); a small value makes that happen often, for testing.
 	uint32_t vu1CacheMB = 0;

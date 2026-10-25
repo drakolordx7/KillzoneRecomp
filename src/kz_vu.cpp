@@ -560,7 +560,7 @@ bool kzVuInstall(std::string *error)
     // KZ_VU_IBITHACK=0: PCSX2's IbitHack off (the GameIndex has it on; off roughly doubles VU recompiles).
     if (const char *ib = std::getenv("KZ_VU_IBITHACK"); ib && *ib)
         vc.iBitHack = *ib != '0';
-    // KZ_VU_CACHE_MB=<4..1024>: microVU1 code cache size (default 64 MB, as PCSX2). A small value makes the
+    // KZ_VU_CACHE_MB=<4..256>: microVU1 code cache size (default 64 MB, as PCSX2). A small value makes the
     // "cache full -> free everything and recompile" path run within seconds, for testing; killzone.log gets a
     // "[kzvu] microVU1 program cache full" line each time.
     if (const char *cm = std::getenv("KZ_VU_CACHE_MB"); cm && *cm)
