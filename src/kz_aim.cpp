@@ -276,7 +276,11 @@ namespace
         const float turnSpeed = (zoom > 0.01f) ? rdf(rdram, ctl + 0x190) / zoom : 0.0f; // rad/s at turn value 1
         const float dt = g_ctrlDt;
         updateHoldAim(rdram, ctl);
-        if (since >= kStaleSeconds || !(turnSpeed > 0.01f) || !(dt > 0.0f))
+        const bool drop = since >= kStaleSeconds || !(turnSpeed > 0.01f) || !(dt > 0.0f);
+        if (g_log && (d.dx != 0.0f || d.dy != 0.0f)) // KZ_AIM_LOG: every mouse motion that reaches the patch, and why it is dropped
+            std::printf("[kz-aim] mouse dx=%.1f dy=%.1f %s since=%.3f turnSpeed=%.4f (ctl %08x +0x190=%.4f zoom=%.3f) dt=%.5f\n", d.dx, d.dy,
+                        drop ? "DROPPED" : "taken", since, turnSpeed, ctl, rdf(rdram, ctl + 0x190), zoom, dt);
+        if (drop)
         {
             g_yawDebt = 0.0f; // menus, loading, pause: drop stale motion and any pending correction
             g_prevTurn = 0.0f;
