@@ -6,6 +6,8 @@
 
 #include "common/FPControl.h"
 
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <immintrin.h>
 
@@ -22,6 +24,38 @@ static thread_local u32 s_fbrst = 0; // per thread: VU0 calls (EE thread) and VU
 static u64 s_total_cycles = 0;
 static u64 s_vu0_cycles = 0;
 static u64 s_vu0_calls = 0;
+static u64 s_cache_resets[2] = {};
+static u32 s_vu1_cache_bytes = HostMemoryMap::mVU1recSize;
+
+// microVU resets its code cache inside a run (mVUcleanUp, when the code pointer passed x86end): every compiled program of
+// that VU is freed. Seen from outside as the emitted-code size or the program count going down across the run. For VU1
+// the code-state memo's saved tables point at the freed programs, so they are dropped right here (kzvuVu1CodeChanged
+// also notices it on the next code change, but only from the same two counters).
+struct CacheWatch
+{
+	int vu;
+	u64 bytes;
+	u32 programs;
+	explicit CacheWatch(int v)
+		: vu(v)
+	{
+		kzvuVuCodeState(vu, &bytes, &programs);
+	}
+	~CacheWatch()
+	{
+		u64 b;
+		u32 p;
+		kzvuVuCodeState(vu, &b, &p);
+		if (b >= bytes && p >= programs)
+			return;
+		if (vu)
+			kzvuVu1MemoFlush();
+		const u64 n = ++s_cache_resets[vu];
+		const double mb = (vu ? s_vu1_cache_bytes : HostMemoryMap::mVU0recSize) / 1048576.0;
+		std::fprintf(stderr, "[kzvu] microVU%d program cache full (%.0f MB, %.1f MB used, %u programs): reset %llu, recompiling\n",
+			vu, mb, bytes / 1048576.0, programs, static_cast<unsigned long long>(n));
+	}
+};
 
 // Default VU FPCR, same as PCSX2 (Pcsx2Config.cpp): exceptions masked, DAZ + FTZ, round toward zero.
 static constexpr FPControlRegister KZVU_VU_FPCR = FPControlRegister::GetDefault()
@@ -111,7 +145,10 @@ static u32 RunCycles(u32 budget)
 	VU0.VI[REG_FBRST].UL = s_fbrst & kFbrstStopEnables;
 	cpuRegs.cycle = VU1.cycle;
 	const u64 start = VU1.cycle;
-	CpuVU1->Execute(budget);
+	{
+		const CacheWatch watch(1);
+		CpuVU1->Execute(budget);
+	}
 	const u64 used = VU1.cycle - start;
 	s_total_cycles += used;
 	return static_cast<u32>(used);
@@ -133,8 +170,12 @@ bool kzvuInit(const KzvuConfig& cfg, std::string* err)
 	}
 
 	x86Emitter::use_avx = g_cpu.vectorISA >= ProcessorFeatures::VectorISA::AVX;
-	// One region for both recompilers: [mVU0recOffset, mVU1recOffset + mVU1recSize) of PCSX2's code map.
-	if (!kzvu::AllocCodeCache(HostMemoryMap::mVU0recSize + HostMemoryMap::mVU1recSize, err))
+	// One region for both recompilers: [mVU0recOffset, mVU1recOffset + VU1 cache size) of PCSX2's code map. The VU1 part
+	// is PCSX2's 64 MB unless cfg.vu1CacheMB says otherwise; microVU1's limit is moved to match after Reserve().
+	s_vu1_cache_bytes = HostMemoryMap::mVU1recSize;
+	if (cfg.vu1CacheMB != 0)
+		s_vu1_cache_bytes = std::clamp<u32>(cfg.vu1CacheMB, 4, 1024) * _1mb;
+	if (!kzvu::AllocCodeCache(HostMemoryMap::mVU0recSize + s_vu1_cache_bytes, err))
 		return false;
 
 	ResetRegs();
@@ -143,11 +184,14 @@ bool kzvuInit(const KzvuConfig& cfg, std::string* err)
 	CpuMicroVU0.Reset();
 	CpuIntVU0.Reset();
 	CpuMicroVU1.Reserve();
+	// Same rule as mVUinit (x86end = end of the region - mVUcacheSafeZone, 3 MB); Reset() below keeps it.
+	kzvuVuSetCacheEnd(1, kzvu::CodeCacheBase() + HostMemoryMap::mVU0recSize + s_vu1_cache_bytes - 3 * _1mb);
 	CpuMicroVU1.Reset();
 	CpuIntVU1.Reset();
 	s_total_cycles = 0;
 	s_vu0_cycles = 0;
 	s_vu0_calls = 0;
+	s_cache_resets[0] = s_cache_resets[1] = 0;
 	s_init = true;
 	return true;
 }
@@ -161,6 +205,11 @@ void kzvuShutdown()
 	CpuMicroVU1.Shutdown();
 	kzvu::FreeCodeCache();
 	s_init = false;
+}
+
+uint64_t kzvuCacheResets(int vu)
+{
+	return s_cache_resets[vu ? 1 : 0];
 }
 
 bool kzvuIsInit()
@@ -439,7 +488,10 @@ static u32 RunCycles0(VURegs& v0, u32 budget)
 	v0.VI[REG_FBRST].UL = s_fbrst & kFbrstStopEnables;
 	cpuRegs.cycle = v0.cycle;
 	const u64 start = v0.cycle;
-	CpuVU0->Execute(budget);
+	{
+		const CacheWatch watch(0);
+		CpuVU0->Execute(budget);
+	}
 	const u64 used = v0.cycle - start;
 	s_vu0_cycles += used;
 	return static_cast<u32>(used);

@@ -48,14 +48,23 @@ struct KzvuConfig
 	bool vu0UseJit = true;
 	// VU0 clamp mode (same meaning as clampMode); -1 = use clampMode.
 	int vu0ClampMode = -1;
+
+	// Size of microVU1's code cache in MB (0 = PCSX2's 64 MB; clamped to 4..1024). Only read by the first kzvuInit. When it
+	// is full (3 MB short of the end, PCSX2's safe zone), microVU frees every compiled VU1 program and starts over
+	// ("Program cache limit reached"); a small value makes that happen often, for testing.
+	uint32_t vu1CacheMB = 0;
 };
+
+// microVU cache resets seen since kzvuInit (vu 0 or 1). Each one is also reported on stderr ("[kzvu] microVU1 program cache
+// full ...").
+uint64_t kzvuCacheResets(int vu);
 
 // Makes the calling thread the VU1 thread (see the top of this file). Call it on that thread before its first VU1 call,
 // and before any VU1 program has run anywhere. VU0/VU1 then use separate VPU_STAT / FBRST words and separate
 // pending-interrupt and FBRST state, so a VU0 call on the EE thread can overlap a VU1 program on this one.
 void kzvuBindVu1Thread();
 
-// Allocates the 64 MB code cache, resets all VU1 state and applies `cfg`. Calling it again re-applies the config.
+// Allocates the code caches (64 MB for VU0, cfg.vu1CacheMB for VU1), resets all VU1 state and applies `cfg`. Calling it again re-applies the config.
 bool kzvuInit(const KzvuConfig& cfg, std::string* err = nullptr);
 void kzvuShutdown();
 bool kzvuIsInit();
@@ -142,6 +151,10 @@ struct KzvuVu1ProgDiff
 // programs were freed: reset, config change, shutdown).
 void kzvuVu1CodeChanged(uint32_t offset, uint32_t size);
 void kzvuVu1MemoFlush();
+// Code cache state of microVU0/1 (vu 0 or 1): bytes emitted since the last reset and programs created since then. Both
+// drop when the cache is reset. kzvuVuSetCacheEnd moves microVU's "cache full" limit (call right after Reserve).
+void kzvuVuCodeState(int vu, uint64_t* codeBytes, uint32_t* programs);
+void kzvuVuSetCacheEnd(int vu, uint8_t* end);
 bool kzvuVu1DiffCachedProgram(uint32_t startPcBytes, uint32_t which, KzvuVu1ProgDiff* out);
 // Number of GIF packets delivered to the XGKICK callback since kzvuInit.
 uint64_t kzvuXgkickCount();
