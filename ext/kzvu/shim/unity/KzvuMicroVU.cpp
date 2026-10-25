@@ -237,10 +237,8 @@ void kzvuVu1CodeChanged(uint32_t offset, uint32_t size)
 	u32 nnow = 0;
 	for (u32 i = 0; i < slots; i += 2)
 	{
-		// two 16-byte slots at once; the program pointer is the second qword of each
-		const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&mVU.prog.quick[i]));
-		const __m256i m = _mm256_set_epi64x(-1, 0, -1, 0);
-		if (_mm256_testz_si256(v, m))
+		// two 16-byte slots; the program pointer is the second qword of each (SSE: the build may target CPUs without AVX)
+		if (!mVU.prog.quick[i].prog && !mVU.prog.quick[i + 1].prog)
 			continue;
 		for (u32 j = i; j < i + 2; j++)
 			if (microProgram* p = mVU.prog.quick[j].prog)

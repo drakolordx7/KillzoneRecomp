@@ -66,6 +66,8 @@ if(KZGS_ISA STREQUAL "AVX2")
 	target_compile_options(kzgs_flags INTERFACE $<$<COMPILE_LANGUAGE:C,CXX>:/arch:AVX2>)
 elseif(KZGS_ISA STREQUAL "AVX")
 	target_compile_options(kzgs_flags INTERFACE $<$<COMPILE_LANGUAGE:C,CXX>:/arch:AVX>)
+elseif(KZGS_ISA STREQUAL "SSE4")
+	target_compile_options(kzgs_flags INTERFACE $<$<COMPILE_LANGUAGE:C,CXX>:/arch:SSE4.2>)
 endif()
 target_include_directories(kzgs_flags INTERFACE
 	"${KZGS_ROOT}/shim/include"

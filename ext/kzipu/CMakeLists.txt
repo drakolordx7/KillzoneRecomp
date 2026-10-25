@@ -68,7 +68,7 @@ target_compile_definitions(kzipu PRIVATE
 )
 target_compile_options(kzipu PRIVATE
 	/Zc:externConstexpr /Zc:__cplusplus /permissive- /Zc:preprocessor
-	/utf-8 /Zo /GS- /fp:contract /W1 /wd4005 /wd4996 /arch:AVX2
+	/utf-8 /Zo /GS- /fp:contract /W1 /wd4005 /wd4996 ${KZ_ARCH_FLAG}
 	"/FI${KZIPU_ROOT}/shim/include/kzipu_prefix.h"
 )
 target_include_directories(kzipu PRIVATE

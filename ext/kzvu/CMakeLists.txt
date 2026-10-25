@@ -50,7 +50,7 @@ target_compile_definitions(kzvu_flags INTERFACE
 )
 target_compile_options(kzvu_flags INTERFACE
 	"$<$<COMPILE_LANGUAGE:CXX>:/Zc:externConstexpr;/Zc:__cplusplus;/permissive-;/Zc:preprocessor>"
-	"$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8;/Zo;/GS-;/fp:contract;/W1;/wd4005;/wd4996;/arch:AVX2>"
+	"$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8;/Zo;/GS-;/fp:contract;/W1;/wd4005;/wd4996;${KZ_ARCH_FLAG}>"
 )
 target_include_directories(kzvu_flags INTERFACE
 	"${KZVU_ROOT}/shim/include"

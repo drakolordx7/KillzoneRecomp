@@ -376,12 +376,11 @@ void kzvu0MicroWritten(uint32_t offset, uint32_t size)
 // 31 registers (VF1..VF31): 496 bytes.
 static inline void CopyVf31(void* dst, const void* src)
 {
-	const __m256i* s = static_cast<const __m256i*>(src);
-	__m256i* d = static_cast<__m256i*>(dst);
-	for (int i = 0; i < 15; i++)
-		_mm256_storeu_si256(d + i, _mm256_loadu_si256(s + i));
-	_mm_storeu_si128(reinterpret_cast<__m128i*>(static_cast<char*>(dst) + 480),
-		_mm_loadu_si128(reinterpret_cast<const __m128i*>(static_cast<const char*>(src) + 480)));
+	// 128-bit copies: the build may target CPUs without AVX (KZ_ISA=SSE4)
+	const __m128i* s = static_cast<const __m128i*>(src);
+	__m128i* d = static_cast<__m128i*>(dst);
+	for (int i = 0; i < 31; i++)
+		_mm_storeu_si128(d + i, _mm_loadu_si128(s + i));
 }
 
 // Seeds the VU0 flag state the way PCSX2's vu0ExecMicro() does: the interpreter's flag copies, and microVU's four

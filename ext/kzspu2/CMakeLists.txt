@@ -66,7 +66,7 @@ target_compile_definitions(kzspu2 PRIVATE
 )
 target_compile_options(kzspu2 PRIVATE
 	/Zc:externConstexpr /Zc:__cplusplus /permissive- /Zc:preprocessor
-	/utf-8 /Zo /GS- /fp:contract /W1 /wd4005 /wd4996 /arch:AVX2
+	/utf-8 /Zo /GS- /fp:contract /W1 /wd4005 /wd4996 ${KZ_ARCH_FLAG}
 	"/FI${KZSPU2_ROOT}/shim/include/kzspu2_prefix.h"
 )
 target_include_directories(kzspu2 PRIVATE

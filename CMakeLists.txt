@@ -6,10 +6,22 @@ project(KillzoneRecomp CXX C)
 # memory helpers, __security_check_cookie in profiles). Keep strict float semantics (no /fp:fast: PS2 float
 # emulation depends on it). KZ_FAST_FLAGS=OFF restores CMake's defaults.
 option(KZ_FAST_FLAGS "Release-grade optimisation flags for RelWithDebInfo" ON)
+# CPU baseline of the whole build (issue #8): AVX2 (Haswell / Ryzen and newer) or SSE4 (SSE4.2 + POPCNT: Intel Nehalem /
+# AMD Bulldozer and newer). Every library below takes its /arch flag from KZ_ARCH_FLAG.
+set(KZ_ISA "AVX2" CACHE STRING "CPU baseline: AVX2 or SSE4")
+set_property(CACHE KZ_ISA PROPERTY STRINGS SSE4 AVX2)
+if(KZ_ISA STREQUAL "SSE4")
+    set(KZ_ARCH_FLAG "/arch:SSE4.2")
+    set(KZ_CLANG_MARCH "x86-64-v2")
+else()
+    set(KZ_ARCH_FLAG "/arch:AVX2")
+    set(KZ_CLANG_MARCH "x86-64-v3")
+endif()
+set(KZGS_ISA "${KZ_ISA}" CACHE STRING "" FORCE)
 # clang-cl (opt-in: configure with -DCMAKE_C_COMPILER=<llvm>/clang-cl.exe -DCMAKE_CXX_COMPILER=<llvm>/clang-cl.exe, see
 # docs/perf_research.md "clang-cl build"): same option set, spelled for clang. Float semantics stay strict:
 # -ffp-contract=off (no FMA fusing of a*b+c: PS2 float emulation is bit-exact), never /fp:fast. The kz* libraries
-# (PCSX2 code) add their own /fp:contract /arch:AVX2 after these, as they do with MSVC.
+# (PCSX2 code) add their own /fp:contract ${KZ_ARCH_FLAG} after these, as they do with MSVC.
 if(MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     set(KZ_CLANG_CL ON)
 else()
@@ -25,7 +37,7 @@ set(KZ_CLANG_LTO "" CACHE STRING "clang-cl LTO mode: empty, thin or full")
 option(KZ_CLANG_PGO_GEN "clang-cl: build an instrumented (profile-generating) binary" OFF)
 set(KZ_CLANG_PGO_USE "" CACHE FILEPATH "clang-cl: .profdata to optimise with")
 if(KZ_CLANG_CL AND KZ_FAST_FLAGS)
-    set(_kz_clang_opt "/Zi /O2 /Oi /Gy /Gw /GS- /clang:-march=x86-64-v3 /clang:-ffp-contract=off /DNDEBUG")
+    set(_kz_clang_opt "/Zi /O2 /Oi /Gy /Gw /GS- /clang:-march=${KZ_CLANG_MARCH} /clang:-ffp-contract=off /DNDEBUG")
     set(_kz_clang_link "/DEBUG /INCREMENTAL:NO /OPT:REF /OPT:ICF")
     if(KZ_CLANG_LTO)
         string(APPEND _kz_clang_opt " /clang:-flto=${KZ_CLANG_LTO}")
@@ -44,8 +56,8 @@ if(KZ_CLANG_CL AND KZ_FAST_FLAGS)
     set(CMAKE_C_FLAGS_RELWITHDEBINFO "${_kz_clang_opt}")
     set(CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO "${_kz_clang_link}")
 elseif(MSVC AND KZ_FAST_FLAGS)
-    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "/Zi /O2 /Ob3 /Oi /Gy /Gw /GS- /Qspectre- /arch:AVX2 /DNDEBUG")
-    set(CMAKE_C_FLAGS_RELWITHDEBINFO "/Zi /O2 /Ob3 /Oi /Gy /Gw /GS- /Qspectre- /arch:AVX2 /DNDEBUG")
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "/Zi /O2 /Ob3 /Oi /Gy /Gw /GS- /Qspectre- ${KZ_ARCH_FLAG} /DNDEBUG")
+    set(CMAKE_C_FLAGS_RELWITHDEBINFO "/Zi /O2 /Ob3 /Oi /Gy /Gw /GS- /Qspectre- ${KZ_ARCH_FLAG} /DNDEBUG")
     set(CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO "/DEBUG /INCREMENTAL:NO /OPT:REF /OPT:ICF")
 endif()
 
