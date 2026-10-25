@@ -81,6 +81,12 @@ add_library(kz_port STATIC
 target_include_directories(kz_port PRIVATE "${CMAKE_SOURCE_DIR}/src" "${KZ_IMGUI_DIR}" "${KZ_IMGUI_DIR}/backends")
 target_link_libraries(kz_port PRIVATE ps2_runtime SDL3::SDL3 imgui kzgs kzvu kzipu kzspu2)
 target_compile_definitions(kz_port PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+# The CPU check runs before the C runtime on any x64 CPU, so it is built without AVX2 (src/kz_cpucheck.cpp, issue #14).
+if(KZ_CLANG_CL)
+    set_source_files_properties("${CMAKE_SOURCE_DIR}/src/kz_cpucheck.cpp" PROPERTIES COMPILE_OPTIONS "/arch:SSE2;/clang:-march=x86-64")
+elseif(MSVC)
+    set_source_files_properties("${CMAKE_SOURCE_DIR}/src/kz_cpucheck.cpp" PROPERTIES COMPILE_OPTIONS "/arch:SSE2")
+endif()
 if(KZ_CLANG_CL AND KZ_CLANG_PGO_GEN)
     target_compile_definitions(kz_port PRIVATE KZ_PGO_GEN=1)
 endif()
@@ -105,6 +111,8 @@ target_precompile_headers(killzone PRIVATE
 )
 if(MSVC)
     target_compile_options(killzone PRIVATE /bigobj /FS)
+    # Start in the CPU check (src/kz_cpucheck.cpp), which then calls the normal C runtime start-up.
+    target_link_options(killzone PRIVATE /ENTRY:kzCpuCheckEntry)
 endif()
 
 # Copy FFmpeg runtime DLLs next to killzone.exe (helper from ps2xRuntime).
