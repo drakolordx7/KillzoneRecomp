@@ -1,6 +1,7 @@
 #include "kz_timing.h"
 
 #include "kz_parity.h"
+#include "kz_region.h"
 
 #include "runtime/ps2_host_gs.h"
 
@@ -15,10 +16,12 @@
 namespace
 {
     constexpr uint32_t kRamMask = 0x01FFFFFFu;
-    constexpr uint32_t kSecondsPerVsync = 0x0055A6E4u; // float
-    constexpr uint32_t kGameObjectPtr = 0x00559178u;   // DAT_00559178; frame timer at +0x50..+0x70
+    // PAL addresses (kz_region.h): work/pal/hookmap.csv, exact matches; the timer offsets +0x50/+0x70 are used by the
+    // same instructions in the PAL frame-timer functions (0x1C01F0, 0x1C0278).
+    constexpr uint32_t kSecondsPerVsync = KZ_GADDR(0x0055A6E4u, 0x0055B4E4u); // float
+    constexpr uint32_t kGameObjectPtr = KZ_GADDR(0x00559178u, 0x00559F78u);   // DAT_00559178; frame timer at +0x50..+0x70
     constexpr uint32_t kTimerClampOffset = 0x70u;      // max vsyncs per simulated frame
-    constexpr uint32_t kFadeLevel = 0x0055A7C8u;       // int, stepped -8/+4 per vblank by FUN_0018f0d0
+    constexpr uint32_t kFadeLevel = KZ_GADDR(0x0055A7C8u, 0x0055B5C8u);       // int, stepped -8/+4 per vblank by FUN_0018f0d0
     constexpr int kNativeHz = 60;
 
     int g_rate = kNativeHz;

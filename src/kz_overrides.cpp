@@ -8,6 +8,7 @@
 #include "kz_sif_modules.h"
 #include "kz_ipu.h"
 #include "kz_devtools.h"
+#include "kz_region.h"
 #include "ps2_runtime.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_timeline.h"
@@ -46,13 +47,14 @@ namespace
         setReturnS32(ctx, 0);
     }
 
+    // PAL addresses (kz_region.h): work/pal/hookmap.csv; each PAL function matches the US one apart from relocations.
     const CustomBinding kCustom[] = {
 
-        {0x002B5D88u, &kzSceSifSearchModuleByName, "sceSifSearchModuleByName"},
-        {0x002B5CF8u, &kzSceSifUnloadModule, "sceSifUnloadModule"},
-        {0x003D7490u, &kzLgkbmInit, "lgkbm init"},
-        {0x002B6060u, &kzSifLoadModuleAt, "sceSifLoadModule"},
-        {0x002B5AF0u, &kzSifStopModuleAt, "sceSifStopModule"},
+        {KZ_GADDR(0x002B5D88u, 0x002B6888u), &kzSceSifSearchModuleByName, "sceSifSearchModuleByName"},
+        {KZ_GADDR(0x002B5CF8u, 0x002B67F8u), &kzSceSifUnloadModule, "sceSifUnloadModule"},
+        {KZ_GADDR(0x003D7490u, 0x003D80E0u), &kzLgkbmInit, "lgkbm init"},
+        {KZ_GADDR(0x002B6060u, 0x002B6B60u), &kzSifLoadModuleAt, "sceSifLoadModule"},
+        {KZ_GADDR(0x002B5AF0u, 0x002B65F0u), &kzSifStopModuleAt, "sceSifStopModule"},
     };
 
     // KZ_TIMELINE: wrappers that log entry/exit of the frame pipeline's guest functions (patch 0025). The wrapper takes the
@@ -105,7 +107,7 @@ namespace
     void applyKillzone(PS2Runtime &runtime)
     {
         kzDevHooksInstall(runtime);
-        if (const char *tl = std::getenv("KZ_TIMELINE"); tl && *tl)
+        if (const char *tl = std::getenv("KZ_TIMELINE"); tl && *tl && !kKzPal) // US addresses only
         {
             tlInstall<0>(runtime, 0x001BFF10u); // frame limiter / delta
             tlInstall<1>(runtime, 0x001759C0u); // wait for D1 idle, then set the kick flag
@@ -121,7 +123,7 @@ namespace
             if (!ps2_game_overrides::bindAddressHandler(runtime, b.address, b.handler))
                 std::cerr << "[kz] failed to bind " << b.handler << " @0x" << std::hex << b.address << std::dec << std::endl;
         }
-        if (!kzIpuActive() && !runtime.replaceFunction(0x002DED00u, &kzMovieOpenUnavailable))
+        if (!kzIpuActive() && !runtime.replaceFunction(KZ_GADDR(0x002DED00u, 0x002DF800u), &kzMovieOpenUnavailable))
             std::cerr << "[kz] failed to bind movie-open skip" << std::endl;
         for (const CustomBinding &c : kCustom)
         {
@@ -132,4 +134,9 @@ namespace
 }
 
 // ELF CRC32 (zlib) of SCUS_974.02 v1.00 = 0x114E85F8 (PCSX2-style XOR CRC is CAAEC49C).
+#if defined(KZ_PAL_SPIKE)
+// PAL test build (kz_region.h): SCES_528.93, entry 0x146F10, ELF CRC32 (zlib) 0x39B8D221 (XOR CRC 69FE9BB6).
+PS2_REGISTER_GAME_OVERRIDE("Killzone SCES-52893", "SCES_528.93", 0x00146F10u, 0x39B8D221u, applyKillzone)
+#else
 PS2_REGISTER_GAME_OVERRIDE("Killzone SCUS-97402", "SCUS_974.02", 0x00146F30u, 0x114E85F8u, applyKillzone)
+#endif
