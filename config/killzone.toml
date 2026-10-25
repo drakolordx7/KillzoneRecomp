@@ -7,9 +7,9 @@
 # - no SCE symbol database is used by this Ghidra script
 
 [general]
-input = "D:/KillzoneRecomp/game/SCUS_974.02"
-output = "D:/KillzoneRecomp/generated"
-ghidra_output = "D:/KillzoneRecomp/work/functions.csv"
+input = "game/SCUS_974.02"
+output = "generated"
+ghidra_output = "work/functions.csv"
 single_file_output = false
 patch_syscalls = false
 patch_cop0 = true

@@ -96,8 +96,9 @@ void kzTimingOnVsync(uint8_t *rdram)
         wr32(rdram, a.secondsPerVsync, periodBits);
 
     // Frame-time clamp: originally in 30 Hz ticks; now ticks are 1/R s.
-    const uint32_t obj = rd32(rdram, a.gameObjectPtr);
-    if (obj >= 0x00100000u && obj < 0x02000000u)
+    // Only through a live game object (kz_addrs.h).
+    const uint32_t obj = kzLiveGameObject(rdram);
+    if (obj)
     {
         const uint32_t cur = rd32(rdram, obj + kTimerClampOffset);
         if (cur != 0 && cur != g_clampWritten)

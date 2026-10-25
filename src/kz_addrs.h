@@ -13,6 +13,7 @@ struct KzAddrs
 {
     // ---- global data
     uint32_t gameObjectPtr;      // DAT_00559178: the game object (frame timer +0x50..+0x70, native 16:9 flag +0x34)
+    uint32_t gameObjectVtable;   // the game object's vtable (word 0 of the object): tells a live object from reused memory
     uint32_t bufferIndex;        // DAT_0055a6b4: index of the command buffer being built
     uint32_t vsyncCounter;       // DAT_0055a6e0: vblank counter
     uint32_t secondsPerVsync;    // DAT_0055a6e4: float
@@ -105,3 +106,7 @@ namespace kz_detail
     extern const KzAddrs *g_addrs;
 }
 inline const KzAddrs &kzAddrs() { return *kz_detail::g_addrs; }
+
+// The game object *gameObjectPtr if it is a live game object (word 0 = gameObjectVtable), else 0 (before it is built,
+// or if something has overwritten it). Per-vsync writes through the pointer check this first.
+uint32_t kzLiveGameObject(const uint8_t *rdram);

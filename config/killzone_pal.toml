@@ -9,9 +9,9 @@
 # - no SCE symbol database is used by this Ghidra script
 
 [general]
-input = "D:/KillzoneRecomp/work/pal/elf/SCES_528.93"
-output = "D:/KillzoneRecomp/generated_pal"
-ghidra_output = "D:/KillzoneRecomp/work/pal/functions_pal.csv"
+input = "work/pal/elf/SCES_528.93"
+output = "generated_pal"
+ghidra_output = "work/pal/functions_pal.csv"
 single_file_output = false
 patch_syscalls = false
 patch_cop0 = true
