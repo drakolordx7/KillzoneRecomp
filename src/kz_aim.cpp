@@ -460,6 +460,8 @@ namespace
     }
 }
 
+uint32_t kzAimPlayer() { return g_player; }
+
 void kzAimInstall(PS2Runtime &runtime)
 {
     const KzAddrs &a = kzAddrs();

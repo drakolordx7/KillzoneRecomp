@@ -77,6 +77,10 @@ KzConfig kzLoadConfig(const std::filesystem::path &path)
     const auto envOverrides = [&c]() {
         if (const char *e = std::getenv("KZ_ASPECT")) // automation: 16:9, 4:3, stretch, auto, 21:9, 32:9
             c.aspect = fromName(kAspects, e, c.aspect);
+        if (const char *e = std::getenv("KZ_FOV")) // automation: world field of view (horizontal degrees at 16:9, 0 = native)
+            c.fov = std::max(0.0f, static_cast<float>(std::atof(e)));
+        if (const char *e = std::getenv("KZ_WEAPON_FOV")) // automation: first-person weapon field of view
+            c.weaponFov = std::max(0.0f, static_cast<float>(std::atof(e)));
     };
     std::ifstream in(path);
     if (!in)
@@ -131,6 +135,13 @@ KzConfig kzLoadConfig(const std::filesystem::path &path)
     if (auto v = get("Graphics.LensBlur")) c.lensBlur = parseBool(*v, c.lensBlur);
     if (auto v = get("Graphics.RenderDistance")) c.renderDistance = std::clamp(static_cast<float>(std::atof(v->c_str())), 1.0f, 16.0f);
     if (auto v = get("Graphics.LodScale")) c.lodScale = std::clamp(static_cast<float>(std::atof(v->c_str())), 0.25f, 16.0f);
+    // Field of view: 0 = the game's own, otherwise horizontal degrees at 16:9.
+    const auto fovValue = [](const std::string &v, float lo, float hi) {
+        const float f = static_cast<float>(std::atof(v.c_str()));
+        return f <= 0.0f ? 0.0f : std::clamp(f, lo, hi);
+    };
+    if (auto v = get("Graphics.FieldOfView")) c.fov = fovValue(*v, 60.0f, 130.0f);
+    if (auto v = get("Graphics.WeaponFieldOfView")) c.weaponFov = fovValue(*v, 50.0f, 120.0f);
     if (auto v = get("Input.MouseSensitivity")) c.mouseSensitivity = std::clamp(static_cast<float>(std::atof(v->c_str())), 0.05f, 20.0f);
     if (auto v = get("Input.InvertY")) c.invertY = parseBool(*v, c.invertY);
     if (auto v = get("Input.RawMouse")) c.rawMouse = parseBool(*v, c.rawMouse);
@@ -158,7 +169,8 @@ bool kzSaveConfig(const std::filesystem::path &path, const KzConfig &c)
       << "\nBilinear=" << (c.bilinear ? 1 : 0) << "\nSharpScaling=" << (c.sharpScaling ? 1 : 0) << "\nSharpen=" << c.sharpen
       << "\nNoiseFilter=" << (c.noiseFilter ? 1 : 0) << "\nMotionBlur=" << (c.motionBlur ? 1 : 0)
       << "\nGlow=" << (c.glow ? 1 : 0) << "\nLensBlur=" << (c.lensBlur ? 1 : 0)
-      << "\nRenderDistance=" << c.renderDistance << "\nLodScale=" << c.lodScale << "\n\n"
+      << "\nRenderDistance=" << c.renderDistance << "\nLodScale=" << c.lodScale
+      << "\nFieldOfView=" << c.fov << "\nWeaponFieldOfView=" << c.weaponFov << "\n\n"
       << "[Input]\nMouseSensitivity=" << c.mouseSensitivity << "\nInvertY=" << (c.invertY ? 1 : 0)
       << "\nRawMouse=" << (c.rawMouse ? 1 : 0) << "\nAimMode=" << (c.holdAim ? "Hold" : "Toggle")
       << "\nSprintMode=" << (c.toggleSprint ? "Toggle" : "Hold")
