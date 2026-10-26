@@ -42,6 +42,8 @@ Mouse and keyboard work out of the box, and so do controllers with the original 
 
 Port by [drakolordx7](https://github.com/drakolordx7). Built on [PS2Recomp](https://github.com/ran-j/PS2Recomp) by ran-j and contributors, and on [PCSX2](https://github.com/PCSX2/pcsx2)'s GS renderer, microVU, IPU and SPU2, linked in as libraries.
 
+Code contributions: Ash01Live (field of view settings).
+
 Testing and reports: mcdermott87, Ash01Live, Lockefinder1, VGEsoterica, Mister-Mannered and everyone who sent logs.
 
 Third-party: PCSX2, SDL3, Dear ImGui, FFmpeg, PCSX2's Windows dependencies and Kenney Input Prompts (CC0) for the keyboard and mouse button pictures.
