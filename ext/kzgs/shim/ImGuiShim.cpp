@@ -13,6 +13,10 @@
 #include "imgui_freetype.h"
 #include "imgui_internal.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+
 // GImGui is renamed to KzGImGui by kzgs_imgui_rename.h, which makes imgui.cpp skip its own definition.
 ImGuiContext* GImGui = nullptr;
 
@@ -75,7 +79,35 @@ void ImGuiManager::SkipFrame()
 	NewFrame();
 }
 
-void ImGuiManager::RenderOSD() {}
+// kzgsSetShowFps: frame-rate counter. RenderOSD runs once per present (GSRenderer::PresentCurrentFrame), so counting its
+// calls gives the presented frame rate.
+std::atomic<bool> g_kzgs_show_fps{false};
+
+void ImGuiManager::RenderOSD()
+{
+	if (!g_kzgs_show_fps.load(std::memory_order_relaxed))
+		return;
+	static Common::Timer s_timer;
+	static int s_frames = 0;
+	static float s_fps = 0.0f;
+	++s_frames;
+	const double t = s_timer.GetTimeSeconds();
+	if (t >= 0.5)
+	{
+		s_fps = static_cast<float>(s_frames / t);
+		s_frames = 0;
+		s_timer.Reset();
+	}
+	const ImGuiIO& io = ImGui::GetIO();
+	const float size = std::max(16.0f, io.DisplaySize.y / 36.0f);
+	char text[32];
+	std::snprintf(text, sizeof(text), "%.0f FPS", s_fps);
+	ImDrawList* dl = ImGui::GetForegroundDrawList();
+	const ImVec2 pos(size * 0.5f, size * 0.4f);
+	const float shadow = std::max(1.0f, size / 16.0f);
+	dl->AddText(ImGui::GetFont(), size, ImVec2(pos.x + shadow, pos.y + shadow), IM_COL32(0, 0, 0, 200), text);
+	dl->AddText(ImGui::GetFont(), size, pos, IM_COL32(255, 230, 64, 255), text);
+}
 
 void FullscreenUI::Render() {}
 

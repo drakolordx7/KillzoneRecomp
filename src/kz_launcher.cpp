@@ -303,6 +303,7 @@ namespace
                             ImGui::EndCombo();
                         }
                         toggleRow("V-Sync", "Removes tearing; adds a little input delay.", cfg.vsync);
+                        toggleRow("Show FPS", "Frame-rate counter in the top-left corner while playing.", cfg.showFps);
                         toggleRow("Skip intro movies", "Skips the long intro movie after the logos. Story cutscenes still play.", cfg.skipIntro);
                         ImGui::EndTable();
                     }

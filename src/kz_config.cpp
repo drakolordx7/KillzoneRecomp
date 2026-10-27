@@ -113,6 +113,7 @@ KzConfig kzLoadConfig(const std::filesystem::path &path)
     if (auto v = get("Display.Width")) c.width = std::max(0, std::atoi(v->c_str()));
     if (auto v = get("Display.Height")) c.height = std::max(0, std::atoi(v->c_str()));
     if (auto v = get("Display.VSync")) c.vsync = parseBool(*v, c.vsync);
+    if (auto v = get("Display.ShowFps")) c.showFps = parseBool(*v, c.showFps);
     if (auto v = get("Display.FpsLimit")) c.fpsLimit = std::max(0, std::atoi(v->c_str()));
     if (auto v = get("Graphics.Renderer")) c.renderer = fromName(kRenderers, *v, c.renderer);
     if (auto v = get("Graphics.Upscale")) c.upscale = std::clamp(std::atoi(v->c_str()), 0, 8);
@@ -163,7 +164,7 @@ bool kzSaveConfig(const std::filesystem::path &path, const KzConfig &c)
     std::ostringstream o;
     o << "; Killzone PC settings. Edited by the launcher; safe to edit by hand.\n\n"
       << "[Display]\nWindowMode=" << toName(kWindowModes, c.windowMode) << "\nWidth=" << c.width << "\nHeight=" << c.height
-      << "\nVSync=" << (c.vsync ? 1 : 0) << "\nFpsLimit=" << c.fpsLimit << "\n\n"
+      << "\nVSync=" << (c.vsync ? 1 : 0) << "\nFpsLimit=" << c.fpsLimit << "\nShowFps=" << (c.showFps ? 1 : 0) << "\n\n"
       << "[Graphics]\nRenderer=" << toName(kRenderers, c.renderer) << "\nUpscale=" << c.upscale
       << "\nAspect=" << toName(kAspects, c.aspect) << "\nAnisotropy=" << c.anisotropy << "\nFXAA=" << (c.fxaa ? 1 : 0) << "\nSMAA=" << (c.smaa ? 1 : 0) << "\nSmaaThreshold=" << c.smaaThreshold << "\nTextureReplacement=" << (c.textureReplacement ? 1 : 0)
       << "\nBilinear=" << (c.bilinear ? 1 : 0) << "\nSharpScaling=" << (c.sharpScaling ? 1 : 0) << "\nSharpen=" << c.sharpen

@@ -898,6 +898,13 @@ void kzgsSetWideRatio(float ratio)
 	s_wide_ratio.store(ratio > 0.0f ? ratio : 0.0f, std::memory_order_relaxed);
 }
 
+extern std::atomic<bool> g_kzgs_show_fps; // shim/ImGuiShim.cpp
+
+void kzgsSetShowFps(bool show)
+{
+	g_kzgs_show_fps.store(show, std::memory_order_relaxed);
+}
+
 void kzgsVsync(int field, bool regsWritten, bool wide)
 {
 	if (!s_open.load(std::memory_order_relaxed))
