@@ -37,6 +37,7 @@ struct KzConfig
     int width = 0;  // 0 = desktop resolution
     int height = 0;
     bool vsync = false;
+    bool showFps = false; // frame-rate counter in the corner of the game window (issue #24)
     int fpsLimit = 0; // 0 = unlimited (display refresh with vsync); otherwise a cap, e.g. 120, 144, 240
 
     // Graphics

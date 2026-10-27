@@ -170,6 +170,9 @@ void kzgsSetTraceHook(KzgsTraceFn fn);
 // SMAA edge-detection luma threshold (0.02 .. 0.5, default 0.1 = the HIGH preset); applied the next time the SMAA shaders are built.
 void kzgsSetSmaaThreshold(float threshold);
 
+// Frame-rate counter in the top-left corner of the window: presented frames per second, updated twice a second. Off by default.
+void kzgsSetShowFps(bool show);
+
 // SMAA luma edge threshold (0.02..0.5, default 0.1 = SMAA's HIGH preset). Higher = only strong edges are smoothed and texture detail is kept;
 // the shaders are rebuilt on the next frame when it changes. Direct3D 11 only. See docs/findings.md ("Menu jitter and blur").
 

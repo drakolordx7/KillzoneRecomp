@@ -37,6 +37,8 @@ you use a controller. The launcher's Controls tab can turn this off. Pictures: K
 Ultrawide monitors (21:9, 32:9): pick "Ultrawide: match window" under Aspect ratio in the launcher's Graphics tab.
 You see more of the world at the sides; the HUD stays in the middle 16:9 part, menus and movies get side bars.
 
+Frame-rate counter: "Show FPS" on the launcher's Display tab shows it in the top-left corner while playing.
+
 Field of view: the launcher's Graphics tab has "Field of view" (the world; the original is 87 degrees across a 16:9 screen)
 and "Weapon field of view" (the gun and arms; the original is 73, higher shows more of the gun). Zooming keeps its magnification.
 

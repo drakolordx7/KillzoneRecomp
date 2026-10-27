@@ -117,6 +117,9 @@ namespace
         k.loadTextureReplacements = c.textureReplacement;
         k.sharpPresent = c.sharpScaling;
         k.casSharpness = c.sharpen;
+        kzgsSetShowFps(c.showFps);
+        if (const char *v = std::getenv("KZ_SHOW_FPS")) // automation override
+            kzgsSetShowFps(std::atoi(v) != 0);
         if (const char *v = std::getenv("KZ_FXAA")) // automation overrides
             k.fxaa = std::atoi(v) != 0;
         // Interlace handling off: the game outputs full 448-line frames (FFMD=0) and PCSX2 Automatic mode never deinterlaces them
