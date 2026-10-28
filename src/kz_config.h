@@ -81,6 +81,7 @@ struct KzConfig
 
     // Game
     bool skipIntro = false; // skip the boot intro movie (story cutscenes still play)
+    bool skipLogos = false; // run the boot logo screens through in a fraction of a second (issue #24)
 
     // Paths
     std::string isoPath; // user's Killzone (USA) disc image

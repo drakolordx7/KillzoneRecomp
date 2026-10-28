@@ -55,6 +55,7 @@ struct KzAddrs
 
     // ---- movies (kz_ipu.cpp, kz_movies.cpp, kz_overrides.cpp)
     uint32_t playMovie;     // blocking movie player
+    uint32_t menuPageUpdate; // front-end page update: script clock from menu+0x170 (ms), then <Page>Update (kz_movies.cpp)
     uint32_t movieOpen;     // movie object's open method
     uint32_t movieRead;     // player read callback
     uint32_t movieInputEnd; // end-of-input check

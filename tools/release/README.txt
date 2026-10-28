@@ -42,7 +42,7 @@ Frame-rate counter: "Show FPS" on the launcher's Display tab shows it in the top
 Field of view: the launcher's Graphics tab has "Field of view" (the world; the original is 87 degrees across a 16:9 screen)
 and "Weapon field of view" (the gun and arms; the original is 73, higher shows more of the gun). Zooming keeps its magnification.
 
-To skip the long intro movie at every start, switch on "Skip intro movies" in the launcher's Display tab.
+To skip the long intro movie at every start, switch on "Skip intro movies" in the launcher's Display tab. "Skip logos" next to it skips the Sony and Guerrilla logo screens.
 
 Settings are saved in killzone.ini next to killzone.exe. Delete it to reset everything.
 If you untick "Show this launcher at startup", the game boots straight in. To get the launcher back,
