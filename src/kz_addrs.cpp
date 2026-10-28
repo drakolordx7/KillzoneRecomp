@@ -57,6 +57,7 @@ const KzAddrs kKzAddrsUs = {
     .lookAccel = 0x0023E8C8u,
 
     .playMovie = 0x0026ECC8u,
+    .menuPageUpdate = 0x001A8958u,
     .movieOpen = 0x002DED00u,
     .movieRead = 0x002DEB98u,
     .movieInputEnd = 0x002DF800u,
@@ -136,6 +137,7 @@ const KzAddrs kKzAddrsPal = {
     .lookAccel = 0x0023EE60u,
 
     .playMovie = 0x0026F338u,
+    .menuPageUpdate = 0x001A8B30u, // 30 words, same as US apart from 5 relocations
     .movieOpen = 0x002DF800u,
     .movieRead = 0x002DF698u,
     .movieInputEnd = 0x002E0300u,

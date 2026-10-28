@@ -153,6 +153,7 @@ KzConfig kzLoadConfig(const std::filesystem::path &path)
     if (auto v = get("Input.StickRange")) c.stickRange = std::clamp(static_cast<float>(std::atof(v->c_str())), 1.0f, 1.5f);
     if (auto v = get("Audio.MasterVolume")) c.masterVolume = std::clamp(std::atoi(v->c_str()), 0, 100);
     if (auto v = get("Game.SkipIntro")) c.skipIntro = parseBool(*v, c.skipIntro);
+    if (auto v = get("Game.SkipLogos")) c.skipLogos = parseBool(*v, c.skipLogos);
     if (auto v = get("Paths.ISO")) c.isoPath = *v;
     if (auto v = get("Launcher.Show")) c.showLauncher = parseBool(*v, c.showLauncher);
     envOverrides();
@@ -178,7 +179,7 @@ bool kzSaveConfig(const std::filesystem::path &path, const KzConfig &c)
       << "\nButtonPrompts=" << (c.buttonPrompts ? "Auto" : "Controller")
       << "\nStickDeadzone=" << c.stickDeadzone << "\nStickRange=" << c.stickRange << "\n\n"
       << "[Audio]\nMasterVolume=" << c.masterVolume << "\n\n"
-      << "[Game]\nSkipIntro=" << (c.skipIntro ? 1 : 0) << "\n\n"
+      << "[Game]\nSkipIntro=" << (c.skipIntro ? 1 : 0) << "\nSkipLogos=" << (c.skipLogos ? 1 : 0) << "\n\n"
       << "[Paths]\nISO=" << c.isoPath << "\n\n"
       << "[Launcher]\nShow=" << (c.showLauncher ? 1 : 0) << "\n\n";
     // Key/mouse bindings: keep the user's section (read before the file is rewritten), or write the defaults.
