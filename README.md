@@ -4,7 +4,7 @@ A native Windows port of Killzone (PlayStation 2, 2004) by [drakolordx7](https:/
 
 [Download the latest build](https://github.com/drakolordx7/KillzoneRecomp/releases/latest)
 
-No game files are included; you need your own disc image of Killzone: the US version (SCUS-97402) or the European version (SCES-52893, English/Russian/Greek). The game detects which one you have. Not affiliated with Sony or Guerrilla Games.
+No game files are included; you need your own disc image of the US version of Killzone (SCUS-97402). Support for the European version (SCES-52893, English/Russian/Greek) is on master and comes with the next release; v0.1.5 and older only take the US disc. Not affiliated with Sony or Guerrilla Games.
 
 ## Requirements
 
@@ -18,7 +18,7 @@ No game files are included; you need your own disc image of Killzone: the US ver
 2. In the launcher, browse to your Killzone `.iso`.
 3. Pick your settings and press Play.
 
-Settings are in `killzone.ini` and saves in `disc\mc0` (US) or `disc_pal\mc0` (Europe), all next to `killzone.exe`. To update, unzip a new build over the old one; settings and saves stay.
+Settings are in `killzone.ini` and saves in `disc\mc0`, both next to `killzone.exe`. To update, unzip a new build over the old one; settings and saves stay.
 
 Mouse and keyboard work out of the box, and so do controllers with the original PS2 layout. The launcher's Controls tab lists the keys; change them in `killzone.ini` under `[Bindings]`. Ultrawide, intro skip, toggle sprint and the graphics options are in the launcher too; `README.txt` in the zip lists the controls.
 
