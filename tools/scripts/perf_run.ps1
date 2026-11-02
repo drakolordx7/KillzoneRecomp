@@ -3,7 +3,7 @@
 #   perf_run.ps1 -Name x [-Config RelWithDebInfo] [-EnvSet "A=1;B=2"] [-Profile]
 # Prints: <name> (<env>): fps=<vif counter delta t=150..200 / 50>. Output in work\<name>\ (stderr.log, gs_*.png).
 param([string]$Name, [string]$Config = 'RelWithDebInfo', [string]$EnvSet = '', [switch]$Profile)
-$wd = '<repo>'; $iso = $(if ($env:KZ_ISO) { $env:KZ_ISO } else { (Select-String '<repo>\dist\Killzone\killzone.ini' -Pattern '^ISO=(.*)').Matches[0].Groups[1].Value })
+$wd = (Resolve-Path "$PSScriptRoot\..\..").Path; $iso = $(if ($env:KZ_ISO) { $env:KZ_ISO } else { (Select-String "$wd\dist\Killzone\killzone.ini" -Pattern '^ISO=(.*)').Matches[0].Groups[1].Value })
 $out = "$wd\work\$Name"; Remove-Item -Recurse -Force $out -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force $out | Out-Null
 $env:KZ_FPS = '120'; $env:KZ_IPU = 'off'
 $env:KZ_INPUT_SCRIPT = '60:start:0.3;80:cross:0.3;90:cross:0.3;100:cross:0.3;110:cross:0.3;120:cross:0.3;130:cross:0.3;140:cross:0.3;150:cross:0.3;160:cross:0.3'

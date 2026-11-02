@@ -1,6 +1,8 @@
 """Print the state-change timeline of a parity log: python parity_events.py <csv> <rate> [word ...]"""
 import sys
-sys.path.insert(0, r'<repo>\tools\scripts')
+import os
+ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from parity_analyze import Run
 import numpy as np
 r = Run(sys.argv[1], float(sys.argv[2]))

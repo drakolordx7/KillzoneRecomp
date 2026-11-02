@@ -4,7 +4,7 @@
 # fps = (vif counter at t=200 - at t=150) / 50 from the [headless] lines; mean CPU load of the machine over the run is logged next to it.
 # Output: work\<Tag>_<variant>_<round>\ (stderr.log, gs_*.png), a summary line per run and the median per variant at the end.
 param([string]$Tag, [int]$Rounds = 3, [string]$VariantList, [string]$Config = 'tl', [int]$Seconds = 235, [switch]$Timeline, [switch]$Ipu)
-$wd = '<repo>'
+$wd = (Resolve-Path "$PSScriptRoot\..\..").Path
 $results = @{}
 $Variants = @($VariantList -split '\|')   # 'name=ENV=v;ENV2=v2|name2=' (a real array does not survive powershell -File)
 for ($r = 1; $r -le $Rounds; $r++) {

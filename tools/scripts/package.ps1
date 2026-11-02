@@ -4,7 +4,7 @@
 # Usage: package.ps1 [-Config RelWithDebInfo] [-WithPdb]
 param([string]$Config = "RelWithDebInfo", [switch]$WithPdb)
 $ErrorActionPreference = 'Stop'
-$root = '<repo>'
+$root = (Resolve-Path "$PSScriptRoot\..\..").Path
 $src = "$root\build\$Config"
 $dst = "$root\dist\Killzone"
 

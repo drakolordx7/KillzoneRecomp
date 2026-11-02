@@ -6,11 +6,12 @@ Port events come from the script times (the script clock is the vsync counter ov
 within a tick); PCSX2 events are the '#ev' lines parity_pcsx2.py writes (vsync of the pad write).
 """
 import sys, os
-sys.path.insert(0, r'<repo>\tools\scripts')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from parity_analyze import Run
 import numpy as np
 
-W = r'<repo>\work'
+ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+W = os.path.join(ROOT, 'work')
 MAG, WST, FL, CRA, CRB = 'w:0x180', 'w:0xE0', 'c:0xE0', 'c:0x374', 'c:0x370'
 
 
