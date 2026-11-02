@@ -5,7 +5,7 @@
 # (a separator other than ; because KZ_INPUT_SCRIPT values contain it). Example: -EnvSet "KZ_WINDOW_SIZE=2560x1440|KZ_SHOT_PRESENT=1"
 # also writes gp_*.png, the frame as presented in a window of that size, next to the gs_*.png internal-resolution frames.
 param([string]$Name = "h", [int]$Seconds = 90, [int]$Interval = 5, [string]$Config = "RelWithDebInfo", [string]$Extra = "", [switch]$NoIso, [string]$ExeDir = "", [string]$EnvSet = "")
-$wd = '<repo>'; $iso = $(if ($env:KZ_ISO) { $env:KZ_ISO } else { (Select-String '<repo>\dist\Killzone\killzone.ini' -Pattern '^ISO=(.*)').Matches[0].Groups[1].Value })
+$wd = (Resolve-Path "$PSScriptRoot\..\..").Path; $iso = $(if ($env:KZ_ISO) { $env:KZ_ISO } else { (Select-String "$wd\dist\Killzone\killzone.ini" -Pattern '^ISO=(.*)').Matches[0].Groups[1].Value })
 $out = "$wd\work\$Name"; Remove-Item -Recurse -Force $out -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force $out | Out-Null
 $env:PS2X_HEADLESS = '1'; $env:PS2X_HEADLESS_INTERVAL = "$Interval"; $env:PS2X_HEADLESS_SECONDS = "$Seconds"
 $env:KZ_SHOT_DIR = $out; $env:KZ_SHOT_INTERVAL = "$Interval"   # frames from the hardware GS (kzgs)
