@@ -53,8 +53,8 @@ KzMouseDelta kzInputTakeMouseDelta();
 // True when the most recent input came from keyboard/mouse rather than a gamepad (pad-only assists are then disabled).
 bool kzInputUsingKeyboardMouse();
 
-// Hold-to-aim support (kz_aim): true while a key/mouse binding to R3 (the game's zoom toggle) is held and
-// [Input] AimMode=Hold; such bindings then do not press R3 themselves. kzInputPulseButton presses pad buttons for a
+// Hold-to-aim support (kz_aim): true while a key/mouse binding to R3 (the game's zoom toggle) or the controller's R3
+// is held; with [Input] AimMode=Hold in gameplay they then do not press R3 themselves. kzInputPulseButton presses pad buttons for a
 // short time (the aim patch pulses R3 to bring the game's zoom state in line).
 bool kzInputZoomHeld();
 void kzInputPulseButton(uint16_t padMask, uint32_t milliseconds);

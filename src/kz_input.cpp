@@ -413,12 +413,17 @@ namespace
         uint16_t pressed = s.padButtons;
         float mx = 0, my = 0, lx = 0, ly = 0;
         uint16_t menuPad = 0;
+        // Hold to aim (gameplay only): kz_aim drives R3 from kzInputZoomHeld(), for a key/mouse binding and for the
+        // controller's own R3 alike, so neither presses R3 itself.
+        const bool holdAimNow = kzConfig().holdAim && s.aimPatchActive && now < s.gameplayUntil;
+        if (holdAimNow)
+            pressed &= static_cast<uint16_t>(~KZ_PAD_R3);
         for (const Binding &b : s.bindings)
         {
             if (!sourceActive(s, b, now))
                 continue;
-            if (b.padButton == KZ_PAD_R3 && kzConfig().holdAim && s.aimPatchActive && now < s.gameplayUntil)
-                continue; // hold to aim: kz_aim drives R3 from kzInputZoomHeld()
+            if (b.padButton == KZ_PAD_R3 && holdAimNow)
+                continue;
             pressed |= b.padButton;
             switch (b.axis)
             {
@@ -586,6 +591,8 @@ bool kzInputZoomHeld()
     State &s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
     const uint64_t now = SDL_GetTicks();
+    if (s.padButtons & KZ_PAD_R3)
+        return true; // the controller's zoom button (R3, the game's default)
     for (const Binding &b : s.bindings)
         if (b.padButton == KZ_PAD_R3 && sourceActive(s, b, now))
             return true;

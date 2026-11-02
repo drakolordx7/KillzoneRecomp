@@ -110,15 +110,16 @@ namespace
         return static_cast<float>(rd32(rdram, obj + 0x64)) * rdf(rdram, obj + 0x50);
     }
 
-    // Hold to aim: the game's zoom is a toggle on R3 (action "zoommode"). With [Input] AimMode=Hold the zoom key is
-    // not sent to the pad; R3 is pulsed whenever the game's zoom state (ctl+0x454 == 1) differs from the key state.
+    // Hold to aim: the game's zoom is a toggle on R3 (action "zoommode"). With [Input] AimMode=Hold the zoom key or the
+    // controller's R3 is not sent to the pad as such; R3 is pulsed whenever the game's zoom state (ctl+0x454 != 0)
+    // differs from the held state. This holds for keyboard/mouse and controller alike, so switching device cannot leave
+    // zoom on: the wanted state is read from whichever device holds the button, every frame. (The input side strips the
+    // real R3 in this mode, so a pad press is not toggled twice: issue #6.)
     void updateHoldAim(const uint8_t *rdram, uint32_t ctl)
     {
         static std::chrono::steady_clock::time_point nextPulse{};
         static int attempts = 0;
-        // A gamepad keeps the original toggle on R3: the setting is for the mouse/keyboard zoom key only. (Applied to a
-        // pad it pulsed R3 off again right after the player toggled zoom on, so the pad had to hold R3: issue #6.)
-        if (!kzConfig().holdAim || !kzInputUsingKeyboardMouse())
+        if (!kzConfig().holdAim)
             return;
         const uint32_t mode = rd32(rdram, ctl + 0x454);
         if (mode > 2u)
