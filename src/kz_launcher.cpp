@@ -304,6 +304,8 @@ namespace
                         }
                         toggleRow("V-Sync", "Removes tearing; adds a little input delay.", cfg.vsync);
                         toggleRow("Show FPS", "Frame-rate counter in the top-left corner while playing.", cfg.showFps);
+                        toggleRow("Threaded graphics", "Faster, but can cause graphics corruption or crashes on some missions.",
+                                  cfg.threadedGraphics, "On (faster, less stable)", "Off (stable)");
                         toggleRow("Skip intro movies", "Skips the long intro movie after the logos. Story cutscenes still play.", cfg.skipIntro);
                         toggleRow("Skip logos", "Runs the Sony and Guerrilla logo screens at startup through in a moment.", cfg.skipLogos);
                         ImGui::EndTable();
@@ -431,7 +433,7 @@ namespace
                         row("Sensitivity", "1.0 = 0.05 degrees per mouse count, same on both axes.");
                         ImGui::SliderFloat("##sens", &cfg.mouseSensitivity, 0.1f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
                         toggleRow("Invert vertical look", nullptr, cfg.invertY);
-                        toggleRow("Aim", "Right mouse button by default.", cfg.holdAim, "Hold to aim", "Press to toggle (as on PS2)");
+                        toggleRow("Aim", "Hold the zoom button to aim: right mouse button, or R3 on a controller.", cfg.holdAim, "Hold to aim", "Press to toggle (as on PS2)");
                         toggleRow("Sprint", "Left Shift / L3. Toggle: press once, sprint stops when you stop moving or press again. Also applies to controllers.",
                                   cfg.toggleSprint, "Press to toggle", "Hold to sprint (as on PS2)");
                         toggleRow("Button prompts", "The game's on-screen button pictures. Auto shows your keys and mouse buttons while you use them and the PlayStation buttons after controller input.",

@@ -310,6 +310,16 @@ int main(int argc, char *argv[])
         const bool automation = headless;
         _putenv_s("PS2X_HEADLESS", "1");
 
+        // VIF1/VU1/GIF worker thread: read from the environment when runtime.initialize() binds it, so decide here, before the
+        // runtime exists. An explicitly set PS2X_VIF1_THREAD (automation) wins over the ini option.
+        if (const char *t = std::getenv("PS2X_VIF1_THREAD"); t && *t)
+            std::cout << "[kz] threaded graphics (VIF1 worker): PS2X_VIF1_THREAD=" << t << " (environment)" << std::endl;
+        else
+        {
+            _putenv_s("PS2X_VIF1_THREAD", cfg.threadedGraphics ? "1" : "0");
+            std::cout << "[kz] threaded graphics (VIF1 worker): " << (cfg.threadedGraphics ? "on" : "off") << std::endl;
+        }
+
         SDL_Window *window = nullptr;
         void *hwnd = nullptr;
         int winW = 1280, winH = 896;
