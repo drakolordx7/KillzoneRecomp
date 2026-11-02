@@ -304,8 +304,10 @@ namespace
                         }
                         toggleRow("V-Sync", "Removes tearing; adds a little input delay.", cfg.vsync);
                         toggleRow("Show FPS", "Frame-rate counter in the top-left corner while playing.", cfg.showFps);
-                        toggleRow("Threaded graphics", "Faster, but can cause graphics corruption or crashes on some missions.",
-                                  cfg.threadedGraphics, "On (faster, less stable)", "Off (stable)");
+                        row("Threaded graphics", "Faster, but can cause graphics corruption or crashes on some missions. "
+                                                 "Auto: on for the US disc, off for the European disc.");
+                        enumCombo<int>("##threaded", cfg.threadedGraphics,
+                                       {{-1, "Auto"}, {1, "On (faster, less stable)"}, {0, "Off (stable, slower)"}});
                         toggleRow("Skip intro movies", "Skips the long intro movie after the logos. Story cutscenes still play.", cfg.skipIntro);
                         toggleRow("Skip logos", "Runs the Sony and Guerrilla logo screens at startup through in a moment.", cfg.skipLogos);
                         ImGui::EndTable();
