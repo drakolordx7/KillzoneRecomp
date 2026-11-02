@@ -41,7 +41,7 @@ struct KzConfig
     int fpsLimit = 0; // 0 = unlimited (display refresh with vsync); otherwise a cap, e.g. 120, 144, 240
     // VIF1/VU1/GIF on a worker thread (runtime env PS2X_VIF1_THREAD). Faster, but it has a race that corrupts graphics/memory
     // in some runs, so it is off by default. An explicitly set PS2X_VIF1_THREAD wins over this.
-    bool threadedGraphics = false;
+    int threadedGraphics = -1; // VIF1 worker thread: -1 auto (on for the US disc, off for the European disc), 0 off, 1 on
 
     // Graphics
     KzRenderer renderer = KzRenderer::D3D11;

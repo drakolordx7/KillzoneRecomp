@@ -316,8 +316,11 @@ int main(int argc, char *argv[])
             std::cout << "[kz] threaded graphics (VIF1 worker): PS2X_VIF1_THREAD=" << t << " (environment)" << std::endl;
         else
         {
-            _putenv_s("PS2X_VIF1_THREAD", cfg.threadedGraphics ? "1" : "0");
-            std::cout << "[kz] threaded graphics (VIF1 worker): " << (cfg.threadedGraphics ? "on" : "off") << std::endl;
+            // Auto: on for the US disc; off for the European disc, where the worker's race corrupts memory in some runs.
+            const bool on = cfg.threadedGraphics < 0 ? region == KzRegion::Us : cfg.threadedGraphics != 0;
+            _putenv_s("PS2X_VIF1_THREAD", on ? "1" : "0");
+            std::cout << "[kz] threaded graphics (VIF1 worker): " << (on ? "on" : "off") << (cfg.threadedGraphics < 0 ? " (auto)" : "")
+                      << std::endl;
         }
 
         SDL_Window *window = nullptr;
