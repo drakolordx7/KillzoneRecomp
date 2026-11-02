@@ -6,7 +6,7 @@
 # The first run copies build\RelWithDebInfo's FFmpeg prefix and shader cache (no re-download) and points FetchContent at its
 # dependency sources (read only).
 param([string]$Name = 'clang', [string]$Cmake = '', [int]$Jobs = 12, [string]$LlvmBin = 'D:\LLVM\bin')
-$wd = 'D:\KillzoneRecomp'; $ref = "$wd\build\RelWithDebInfo"; $b = "$wd\build\$Name"
+$wd = (Resolve-Path "$PSScriptRoot\..\..").Path; $ref = "$wd\build\RelWithDebInfo"; $b = "$wd\build\$Name"
 $tmp = "$wd\work\tmp"; New-Item -ItemType Directory -Force $tmp, "$b\ThirdParty" | Out-Null
 $env:TEMP = $tmp; $env:TMP = $tmp
 if (-not (Test-Path "$b\ThirdParty\ffmpeg-prefix")) { Copy-Item -Recurse "$ref\ThirdParty\ffmpeg-prefix" "$b\ThirdParty\ffmpeg-prefix" }

@@ -253,7 +253,7 @@ Applied on top of `ext/PS2Recomp` (upstream ran-j/PS2Recomp @ 75d729c). Re-apply
   a regen with `PS2X_CODEGEN=locals`, and a full rebuild). An alternative code generator; the classic output is unchanged
   when `PS2X_CODEGEN` is unset (verified byte for byte against `generated/`). `tools/scripts/regen.py` takes
   `KZ_GEN_DIR` / `KZ_GEN_TMP` / `KZ_MERGED` / `KZ_RECOMP_EXE` / `KZ_RECOMP_LOG` so the output can go elsewhere, e.g.
-  `PS2X_CODEGEN=locals KZ_GEN_DIR=D:/KillzoneRecomp/work/generated_cg python tools/scripts/regen.py`.
+  `PS2X_CODEGEN=locals KZ_GEN_DIR=work/generated_cg python tools/scripts/regen.py`.
   `PS2X_CODEGEN_FUNCS=<file>` (one hex function start per line) restricts it to those functions; the rest stay classic
   (both kinds share translation units, all new macros are `L_`/`ps2Cg` prefixed).
   - **Guest GPRs are C++ locals.** Every function loads the low 64 bits of the registers it touches (`gprN`; `gprhN`

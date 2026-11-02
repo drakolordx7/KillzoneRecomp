@@ -1,10 +1,11 @@
 # Builds a public release zip from a build folder: program files, resources, the Visual C++ runtime DLLs (app-local,
 # so players need no redistributable) and tools\release\README.txt. No player data (ini, memory cards, disc files,
 # shader cache) goes in.
-# Usage: make_release.ps1 -Version 0.1.0 [-From D:\KillzoneRecomp\dist\Killzone]
-param([Parameter(Mandatory)][string]$Version, [string]$From = 'D:\KillzoneRecomp\dist\Killzone')
+# Usage: make_release.ps1 -Version 0.1.0 [-From dist\Killzone]
+param([Parameter(Mandatory)][string]$Version, [string]$From = '')
 $ErrorActionPreference = 'Stop'
-$root = 'D:\KillzoneRecomp'
+$root = (Resolve-Path "$PSScriptRoot\..\..").Path
+if (-not $From) { $From = "$root\dist\Killzone" }
 $name = "Killzone-PC-v$Version-alpha"
 $stage = "$root\work\release\$name"
 $zip = "$root\work\release\$name.zip"

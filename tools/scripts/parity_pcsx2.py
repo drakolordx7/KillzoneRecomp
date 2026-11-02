@@ -12,11 +12,11 @@ sampling starts). tools/pcsx2_par is a copy of tools/pcsx2 (own PINE slot, the p
 """
 import argparse, os, re, struct, sys, time
 
-sys.path.insert(0, r'D:\KillzoneRecomp\tools\scripts')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pine import Pine
 from pcsx2_hidden import HiddenProcess
 
-ROOT = r'D:\KillzoneRecomp'
+ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
 PCSX2 = os.path.join(ROOT, 'tools', 'pcsx2_par')
 ISO = os.environ.get('KZ_ISO') or next((l.split('=', 1)[1].strip() for l in open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'dist', 'Killzone', 'killzone.ini'), encoding='utf-8', errors='replace') if l.startswith('ISO=')), '')
 PORT = 28111

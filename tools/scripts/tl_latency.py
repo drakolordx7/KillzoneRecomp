@@ -9,8 +9,8 @@ list (only in a vblank); done = DONE_POST (VIF1 worker finished the list); prese
 (GS_VSYNC_E) of the first vsync the producer pushes after `done` (i-th push = i-th GS frame). latency = present - start (host time, ms). Queue depth = the kzgs frame count after each
 push (GS_QUEUED, 1 = nothing waiting) and the time the producer waited for the GS thread (GS_THROTTLE).
 """
-import bisect, statistics, sys
-sys.path.insert(0, r'D:\KillzoneRecomp\tools\scripts')
+import bisect, os, statistics, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tl_analyze import load, pct
 
 LIMITER = 1834768

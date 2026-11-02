@@ -1,7 +1,7 @@
 # Usage: run.ps1 -Name run2 -Seconds 45 -Shots "10,25,45" -Extra "--sample 10"
 # Boots killzone.exe against the user's ISO, captures window shots at the given second marks, then kills it.
 param([string]$Name = "run", [int]$Seconds = 45, [string]$Shots = "10,25,45", [string]$Config = "RelWithDebInfo", [string]$Extra = "")
-$wd = 'D:\KillzoneRecomp'; $iso = $(if ($env:KZ_ISO) { $env:KZ_ISO } else { (Select-String 'D:\KillzoneRecomp\dist\Killzone\killzone.ini' -Pattern '^ISO=(.*)').Matches[0].Groups[1].Value })
+$wd = (Resolve-Path "$PSScriptRoot\..\..").Path; $iso = $(if ($env:KZ_ISO) { $env:KZ_ISO } else { (Select-String "$wd\dist\Killzone\killzone.ini" -Pattern '^ISO=(.*)').Matches[0].Groups[1].Value })
 $out = "$wd\work\$Name"; New-Item -ItemType Directory -Force $out | Out-Null
 $p = Start-Process "$wd\build\$Config\killzone.exe" -ArgumentList (@('--elf', 'game\SCUS_974.02', '--iso', "`"$iso`"") + ($Extra -split " " | Where-Object { $_ })) -WorkingDirectory $wd `
     -RedirectStandardOutput "$out\stdout.log" -RedirectStandardError "$out\stderr.log" -PassThru

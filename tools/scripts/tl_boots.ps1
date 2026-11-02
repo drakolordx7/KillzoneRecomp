@@ -2,8 +2,8 @@
 #   tl_boots.ps1 -Tag b -N 12 -Seconds 50 [-Parallel 3] [-Config tl] [-EnvSet 'KZ_FPS=120']
 # Boots run Parallel at a time (more than one instance also stresses the start-up race the IOP module loader has under load).
 param([string]$Tag = 'boot', [int]$N = 12, [int]$Seconds = 50, [int]$Parallel = 3, [string]$Config = 'tl', [string]$EnvSet = 'KZ_FPS=120')
-$wd = 'D:\KillzoneRecomp'
-$iso = $(if ($env:KZ_ISO) { $env:KZ_ISO } else { (Select-String 'D:\KillzoneRecomp\dist\Killzone\killzone.ini' -Pattern '^ISO=(.*)').Matches[0].Groups[1].Value })
+$wd = (Resolve-Path "$PSScriptRoot\..\..").Path
+$iso = $(if ($env:KZ_ISO) { $env:KZ_ISO } else { (Select-String "$wd\dist\Killzone\killzone.ini" -Pattern '^ISO=(.*)').Matches[0].Groups[1].Value })
 $sb = {
     param($wd, $iso, $name, $seconds, $config, $envset)
     $out = "$wd\work\$name"; Remove-Item -Recurse -Force $out -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force $out | Out-Null
