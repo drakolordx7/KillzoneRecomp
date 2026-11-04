@@ -6,6 +6,7 @@
 #include "ps2_runtime.h"
 #include "runtime/ps2_host_ipu.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_mpeg_pacing.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -296,9 +297,56 @@ namespace
     }
 }
 
+// Movie picture pacing (issues #25, #26, #32). FUN_002df080 (PAL 0x2DFB80) is the movie object's per-frame step (vtable
+// +0x20; a0 = movie object, the player and its sceMpeg handle at a0 + 0x28). Its third argument says whether to show the
+// current picture again (non-zero, once there is one) or fetch a new one (0: FUN_002df6e8 -> sceMpegGetPicture). Both
+// callers, the blocking player FUN_0026ECC8 and the front end's background movie (0x1A8EBC), pass "vsync counter parity
+// differs from the parity latched at the first call", i.e. a new picture every other vblank:
+// 29.97 pictures per second at the PS2's 59.94 Hz. Here the guest vblank runs at the frame-rate setting, so they asked
+// for 30..120 pictures per second (60 at 120 Hz, 120 at 240 Hz). The libmpeg HLE then parked the thread inside
+// GetPicture until each picture's presentation tick, so the loop that also feeds the movie audio to the SPU2 and draws
+// the menu missed vblanks (intro at 120 Hz: ~24 waits per second, gaps between pictures up to 19 ticks instead of 4,
+// 28.9 pictures per second). The flag now comes from the HLE's movie clock (the MPEG stream's own timestamps on the vsync tick):
+// a new picture exactly when it is due, otherwise the current one, and GetPicture no longer has to wait.
+// KZ_MOVIE_PACE=0 restores the game's own flag.
+namespace
+{
+    PS2Runtime::RecompiledFunction g_movieStepOrig = nullptr;
+    constexpr uint32_t kMovieStepFromInputEnd = 0x780u; // FUN_002df800 - FUN_002df080 (PAL 0x2E0300 - 0x2DFB80)
+    constexpr uint32_t kMoviePlayerOffset = 0x28u;
+
+    void moviePacedStep(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
+    {
+        const uint32_t movie = getRegU32(ctx, 4);
+        const bool due = ps2_stubs::mpegPictureDue(movie + kMoviePlayerOffset, rt->eeScheduler().currentVSyncTick());
+        ctx->r[6] = _mm_set_epi64x(0, due ? 0 : 1); // $a2: 0 = fetch a new picture, 1 = keep the current one
+        g_movieStepOrig(rdram, ctx, rt);
+    }
+
+    void installMoviePacing(PS2Runtime &runtime)
+    {
+        const char *v = std::getenv("KZ_MOVIE_PACE");
+        if (v && *v == '0')
+        {
+            std::cout << "[kz] movie pacing: the game's own (KZ_MOVIE_PACE=0)" << std::endl;
+            return;
+        }
+        const uint32_t step = kzAddrs().movieInputEnd - kMovieStepFromInputEnd;
+        if (!runtime.hasFunction(step))
+        {
+            std::cerr << "[kz] movie pacing hook FAILED" << std::endl;
+            return;
+        }
+        g_movieStepOrig = runtime.lookupFunction(step);
+        runtime.replaceFunction(step, &moviePacedStep);
+    }
+}
+
 void kzIpuBindRuntime(PS2Runtime &runtime)
 {
     g_runtime = &runtime;
+    if (g_active)
+        installMoviePacing(runtime);
     const uint32_t kMovieRead = kzAddrs().movieRead;
     const uint32_t kInputEnd = kzAddrs().movieInputEnd;
     if (g_active && runtime.hasFunction(kMovieRead) && runtime.hasFunction(kInputEnd))
