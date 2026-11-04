@@ -22,7 +22,8 @@ Controls (defaults; listed in the launcher's Controls tab, change them in killzo
 - Left mouse: fire              - Right mouse: hold to aim       - Middle mouse: secondary fire
   (while zoomed, 1 and 3 change the zoom level; hold to aim can be switched to toggle in the launcher)
 - W A S D: move                 - Left Shift: sprint             - C / Left Ctrl: crouch
-- R: reload                     - G: throw grenade               - Q / mouse wheel: switch weapon
+- R: reload                     - G: throw grenade               - Q: switch weapon (the game's own button, cycles forward)
+- Mouse wheel up / down: next / previous weapon (bind NextWeapon and PrevWeapon to any key in killzone.ini under [Bindings])
 - E / F: use (ladders, mounted guns, pick up)                    - X / Mouse4: special item
 - Escape: pause                 - Tab: objectives
 Menus: arrow keys or W/S/A/D to move, Enter / Space / E to select, Backspace to go back.

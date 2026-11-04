@@ -31,6 +31,9 @@ enum class KzVirtualAxis
     LookUp, LookDown, LookLeft, LookRight,
     // D-pad presses that only act outside gameplay (menus). In gameplay the D-pad is the scope zoom axis.
     MenuUp, MenuDown, MenuLeft, MenuRight,
+    // Weapon cycling in either direction (kz_weapons.cpp). Not axes: a press (key down, mouse button down, wheel notch)
+    // queues one step, taken by kzInputPeekWeaponStep().
+    NextWeapon, PrevWeapon,
 };
 
 void kzInputInit(const std::filesystem::path &bindingsIni);
@@ -61,6 +64,12 @@ void kzInputPulseButton(uint16_t padMask, uint32_t milliseconds);
 
 // When the engine aim patch is active, mouse motion goes there; otherwise it is mapped onto the right stick.
 void kzInputSetAimPatchActive(bool active);
+
+// Next / previous weapon (bindings NextWeapon / PrevWeapon, or KZ_INPUT_SCRIPT "t:nextweapon" / "t:prevweapon"). Each press
+// queues one step; a step the game could not take (a weapon change is still running) stays queued for 0.4 s, then is dropped.
+// Peek returns the oldest live step (+1 next, -1 previous, 0 none) without removing it; Pop removes it.
+int kzInputPeekWeaponStep();
+void kzInputPopWeaponStep();
 
 // Text entry (the game's on-screen keyboard, e.g. the profile name). The game thread calls kzInputSetTextEntryActive()
 // every frame the keyboard screen is open; while it is, typing keys are queued as text instead of driving pad buttons.

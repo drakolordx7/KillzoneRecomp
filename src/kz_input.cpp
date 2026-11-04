@@ -58,6 +58,7 @@ namespace
         {"LookLeft", KzVirtualAxis::LookLeft}, {"LookRight", KzVirtualAxis::LookRight},
         {"MenuUp", KzVirtualAxis::MenuUp}, {"MenuDown", KzVirtualAxis::MenuDown},
         {"MenuLeft", KzVirtualAxis::MenuLeft}, {"MenuRight", KzVirtualAxis::MenuRight},
+        {"NextWeapon", KzVirtualAxis::NextWeapon}, {"PrevWeapon", KzVirtualAxis::PrevWeapon},
     };
 
     // PC defaults, derived from the game's own default controller map (profile settings +0xEC, docs/findings.md
@@ -66,7 +67,7 @@ namespace
     // Every entry is overridable in killzone.ini [Bindings].
     constexpr std::pair<const char *, const char *> kDefaultBindings[] = {
         {"Mouse1", "R1"}, {"Mouse2", "R3"}, {"Mouse3", "R2"}, {"R", "Triangle"}, {"G", "L1"},
-        {"E", "Cross"}, {"F", "Cross"}, {"Q", "Circle"}, {"WheelUp", "Circle"}, {"WheelDown", "Circle"},
+        {"E", "Cross"}, {"F", "Cross"}, {"Q", "Circle"}, {"WheelUp", "NextWeapon"}, {"WheelDown", "PrevWeapon"},
         {"C", "L2"}, {"Left Ctrl", "L2"}, {"Left Shift", "L3"}, {"X", "Square"}, {"Mouse4", "Square"},
         {"Space", "Cross"}, {"Return", "Cross"},
         {"W", "MoveForward"}, {"S", "MoveBack"}, {"A", "StrafeLeft"}, {"D", "StrafeRight"},
@@ -81,8 +82,9 @@ namespace
     };
 
     // [Bindings] Version=<n>. Sections written before a version are upgraded by appending that version's additions.
-    // Version 2 added the menu D-pad keys; version 3 made them menu-only (MenuUp ... instead of Up ...).
-    constexpr int kBindingsVersion = 3;
+    // Version 2 added the menu D-pad keys; version 3 made them menu-only (MenuUp ... instead of Up ...); version 4 moved
+    // the mouse wheel from the game's weapon button (Circle, forward only) to NextWeapon / PrevWeapon.
+    constexpr int kBindingsVersion = 4;
     constexpr std::pair<const char *, const char *> kBindingsV2Additions[] = {
         {"Up", "MenuUp"}, {"Down", "MenuDown"}, {"Left", "MenuLeft"}, {"Right", "MenuRight"},
         {"W", "MenuUp"}, {"S", "MenuDown"}, {"A", "MenuLeft"}, {"D", "MenuRight"},
@@ -112,6 +114,8 @@ namespace
         // text entry (on-screen keyboard open in the game)
         uint64_t textEntryUntil = 0; // SDL ticks; active while now < this
         std::deque<uint16_t> textQueue;
+        // next / previous weapon steps (+1 / -1) with the SDL tick they were pressed at
+        std::deque<std::pair<int, uint64_t>> weaponSteps;
         std::array<bool, SDL_SCANCODE_COUNT> consumed{}; // held keys that must not act as pad buttons until released
         SDL_Gamepad *gamepad = nullptr;
         // latest gamepad snapshot, taken on the window thread
@@ -183,6 +187,10 @@ namespace
                 }
                 else if (_stricmp(what.c_str(), "zoomkey") == 0)
                     ev.axis = 8; // holds the zoom key (as a key bound to R3 would) for dur seconds
+                else if (_stricmp(what.c_str(), "nextweapon") == 0)
+                    ev.axis = 9; // one weapon step forward at t
+                else if (_stricmp(what.c_str(), "prevweapon") == 0)
+                    ev.axis = 10; // one weapon step back at t
                 else if (_stricmp(what.c_str(), "textenter") == 0)
                     ev.axis = 7, ev.text = std::string(1, static_cast<char>(KZ_TEXT_ENTER));
                 else if (_stricmp(what.c_str(), "textback") == 0)
@@ -325,6 +333,18 @@ namespace
                     if (_stricmp(pairs[i].first.c_str(), k) == 0 && _stricmp(pairs[i].second.c_str(), v + 4) == 0)
                         pairs[i].second = v;
         }
+        if (any && version < 4)
+        {
+            // The old defaults sent both wheel directions to the weapon button; now the wheel steps through the weapons.
+            for (size_t i : pendingUpgrade)
+                if (_stricmp(pairs[i].second.c_str(), "Circle") == 0)
+                {
+                    if (_stricmp(pairs[i].first.c_str(), "WheelUp") == 0)
+                        pairs[i].second = "NextWeapon";
+                    else if (_stricmp(pairs[i].first.c_str(), "WheelDown") == 0)
+                        pairs[i].second = "PrevWeapon";
+                }
+        }
         return pairs;
     }
 
@@ -405,6 +425,39 @@ namespace
         const float k = std::min(1.0f, (m - dz) / (1.0f - dz)) / m * range;
         ox = std::clamp(x * k, -1.0f, 1.0f);
         oy = std::clamp(y * k, -1.0f, 1.0f);
+    }
+
+    // A press of a source (key down, mouse button down, wheel notch): queue a weapon step for every NextWeapon / PrevWeapon
+    // binding on it. Caller holds the mutex.
+    void queueWeaponSteps(State &s, SourceKind kind, int code)
+    {
+        const uint64_t now = SDL_GetTicks();
+        for (const Binding &b : s.bindings)
+        {
+            if (b.kind != kind || (kind != SourceKind::WheelUp && kind != SourceKind::WheelDown && b.code != code))
+                continue;
+            if (b.axis != KzVirtualAxis::NextWeapon && b.axis != KzVirtualAxis::PrevWeapon)
+                continue;
+            if (s.weaponSteps.size() < 4)
+                s.weaponSteps.emplace_back(b.axis == KzVirtualAxis::NextWeapon ? 1 : -1, now);
+        }
+    }
+
+    constexpr uint64_t kWeaponStepLifeMs = 400;
+
+    // Script steps (KZ_INPUT_SCRIPT nextweapon / prevweapon) join the queue once their time has come. Caller holds the mutex.
+    void queueScriptWeaponSteps(State &s)
+    {
+        auto &events = script();
+        if (events.empty())
+            return;
+        const double t = g_scriptClock ? g_scriptClock() : SDL_GetTicks() / 1000.0;
+        for (ScriptEvent &e : events)
+            if ((e.axis == 9 || e.axis == 10) && !e.fired && t >= e.t)
+            {
+                e.fired = true;
+                s.weaponSteps.emplace_back(e.axis == 9 ? 1 : -1, SDL_GetTicks());
+            }
     }
 
     // Compose the 32-byte DualShock 2 reply from current state. Caller holds the mutex.
@@ -606,6 +659,25 @@ bool kzInputZoomHeld()
     return false;
 }
 
+int kzInputPeekWeaponStep()
+{
+    State &s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    queueScriptWeaponSteps(s);
+    const uint64_t now = SDL_GetTicks();
+    while (!s.weaponSteps.empty() && now - s.weaponSteps.front().second > kWeaponStepLifeMs)
+        s.weaponSteps.pop_front();
+    return s.weaponSteps.empty() ? 0 : s.weaponSteps.front().first;
+}
+
+void kzInputPopWeaponStep()
+{
+    State &s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!s.weaponSteps.empty())
+        s.weaponSteps.pop_front();
+}
+
 void kzInputPulseButton(uint16_t padMask, uint32_t milliseconds)
 {
     State &s = state();
@@ -636,6 +708,8 @@ void kzInputOnEvent(const SDL_Event &e)
                     s.consumed[e.key.scancode] = true;
                 }
             }
+            else if (!e.key.repeat)
+                queueWeaponSteps(s, SourceKind::Key, e.key.scancode);
         }
         s.usingKbm = true;
         s.kbmSeen = true;
@@ -644,14 +718,22 @@ void kzInputOnEvent(const SDL_Event &e)
     case SDL_EVENT_MOUSE_BUTTON_UP:
         if (e.button.button < s.mouseButtons.size())
             s.mouseButtons[e.button.button] = e.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+        if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN)
+            queueWeaponSteps(s, SourceKind::MouseButton, e.button.button);
         s.usingKbm = true;
         s.kbmSeen = true;
         break;
     case SDL_EVENT_MOUSE_WHEEL:
         if (e.wheel.y > 0)
+        {
             s.wheelUpUntil = SDL_GetTicks() + kWheelPulseMs;
+            queueWeaponSteps(s, SourceKind::WheelUp, 0);
+        }
         else if (e.wheel.y < 0)
+        {
             s.wheelDownUntil = SDL_GetTicks() + kWheelPulseMs;
+            queueWeaponSteps(s, SourceKind::WheelDown, 0);
+        }
         break;
     case SDL_EVENT_MOUSE_MOTION:
         if (s.captured)
@@ -811,10 +893,13 @@ int kzInputSelfTest()
     check((pressed & KZ_PAD_R1) != 0, "Mouse1 -> R1");
     s.wheelUpUntil = 100;
     compose(s, d, 50);
-    check((static_cast<uint16_t>(~(d[2] | (d[3] << 8))) & KZ_PAD_CIRCLE) != 0, "WheelUp pulse -> Circle (switch weapon)");
+    check((static_cast<uint16_t>(~(d[2] | (d[3] << 8))) & KZ_PAD_CIRCLE) == 0, "WheelUp is not the weapon button");
     check(d[17] == 0xFF, "R1 pressure byte");
-    compose(s, d, 200);
-    check((static_cast<uint16_t>(~(d[2] | (d[3] << 8))) & KZ_PAD_CIRCLE) == 0, "WheelUp pulse expires");
+    queueWeaponSteps(s, SourceKind::WheelUp, 0);
+    queueWeaponSteps(s, SourceKind::WheelDown, 0);
+    check(s.weaponSteps.size() == 2 && s.weaponSteps[0].first == 1 && s.weaponSteps[1].first == -1,
+          "wheel up / down -> next / previous weapon step");
+    s.weaponSteps.clear();
     s.keys.fill(false);
     s.mouseButtons.fill(false);
     s.keys[SDL_SCANCODE_UP] = true;
@@ -845,7 +930,7 @@ std::vector<std::pair<std::string, std::string>> kzInputDescribeBindings(const s
         {"MoveForward", "Move forward"}, {"MoveBack", "Move back"}, {"StrafeLeft", "Strafe left"},
         {"StrafeRight", "Strafe right"}, {"LookUp", "Look up"}, {"LookDown", "Look down"}, {"LookLeft", "Look left"},
         {"LookRight", "Look right"}, {"R1", "Fire"}, {"R2", "Secondary fire"}, {"Cross", "Use / confirm"},
-        {"Circle", "Switch weapon"}, {"L1", "Throw grenade"}, {"Square", "Special item"}, {"Triangle", "Reload / back"},
+        {"Circle", "Switch weapon"}, {"NextWeapon", "Next weapon"}, {"PrevWeapon", "Previous weapon"}, {"L1", "Throw grenade"}, {"Square", "Special item"}, {"Triangle", "Reload / back"},
         {"L2", "Crouch"}, {"L3", "Sprint"}, {"R3", "Zoom"}, {"Start", "Pause"}, {"Select", "Objectives"},
         {"Up", "D-pad up"}, {"Down", "D-pad down"}, {"Left", "D-pad left"}, {"Right", "D-pad right"},
         {"MenuUp", "Menu up"}, {"MenuDown", "Menu down"}, {"MenuLeft", "Menu left"}, {"MenuRight", "Menu right"},
