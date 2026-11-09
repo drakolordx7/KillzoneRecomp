@@ -2,7 +2,9 @@
 
 A native Windows port of Killzone (PlayStation 2, 2004) by [drakolordx7](https://github.com/drakolordx7). The game's code is recompiled to C++ with [PS2Recomp](https://github.com/ran-j/PS2Recomp), so it runs as a PC program with mouse and keyboard aim, high frame rates, higher resolutions and ultrawide support.
 
-[Download the latest build](https://github.com/drakolordx7/KillzoneRecomp/releases/latest)
+> **This project is abandoned.** It is no longer maintained and the repository is archived, so issues and pull requests are closed. The code is free to fork and continue under the license below.
+
+[Download the last build (v0.1.7)](https://github.com/drakolordx7/KillzoneRecomp/releases/latest)
 
 No game files are included; you need your own disc image of Killzone: the US version (SCUS-97402) or, from v0.1.6, the European version (SCES-52893, English/Russian/Greek). The game detects which one you have. Not affiliated with Sony or Guerrilla Games.
 
@@ -18,18 +20,18 @@ No game files are included; you need your own disc image of Killzone: the US ver
 2. In the launcher, browse to your Killzone `.iso`.
 3. Pick your settings and press Play.
 
-Settings are in `killzone.ini` and saves in `disc\mc0` (US) or `disc_pal\mc0` (Europe), all next to `killzone.exe`. To update, unzip a new build over the old one; settings and saves stay.
+Settings are in `killzone.ini` and saves in `disc\mc0` (US) or `disc_pal\mc0` (Europe), all next to `killzone.exe`. Unzipping a build over an older one keeps settings and saves.
 
 Mouse and keyboard work out of the box, and so do controllers with the original PS2 layout. The launcher's Controls tab lists the keys; change them in `killzone.ini` under `[Bindings]`. Ultrawide, intro skip, toggle sprint and the graphics options are in the launcher too; `README.txt` in the zip lists the controls.
 
 ## Reporting problems
 
-[Open an issue](https://github.com/drakolordx7/KillzoneRecomp/issues) with `killzone.log` from the game folder (the next start overwrites it; the one before is kept as `killzone.prev.log`). Say which level you were on and what you were doing.
+The project is archived, so new issues can't be opened. The [closed and open issues](https://github.com/drakolordx7/KillzoneRecomp/issues?q=is%3Aissue) list the known problems. `killzone.log` in the game folder (and `killzone.prev.log` for the run before) shows what happened in a run.
 
 ## Contributing
 
-- `master` is the main branch and what releases are built from. Open pull requests against it.
-- `ext/PS2Recomp` is the `killzone` branch of [drakolordx7/PS2Recomp](https://github.com/drakolordx7/PS2Recomp). General runtime fixes also go upstream as pull requests.
+- The repository is archived and takes no pull requests. Fork it to continue the work; `master` is what the releases were built from.
+- `ext/PS2Recomp` is the `killzone` branch of [drakolordx7/PS2Recomp](https://github.com/drakolordx7/PS2Recomp). General runtime fixes belong upstream in PS2Recomp.
 - Building needs Windows x64, Visual Studio 2022 or later, CMake, Ninja and Python 3:
   1. `git clone --recursive https://github.com/drakolordx7/KillzoneRecomp`
   2. Put the PCSX2 source in `ext/pcsx2` (commit `646df006a4`), the [PCSX2 Windows dependencies](https://github.com/PCSX2/pcsx2-windows-dependencies/releases/tag/latest-windows-dependencies) in `ext/kzgs/deps` and the SDL3 VC development package in `ext/sdl3`.
@@ -50,4 +52,4 @@ Third-party: PCSX2, SDL3, Dear ImGui, FFmpeg, PCSX2's Windows dependencies and K
 
 ## License
 
-GPL-3.0, see [LICENSE](LICENSE). PCSX2 is GPL-3.0-or-later and PS2Recomp is GPL-3.0. Killzone is a trademark of Sony Interactive Entertainment.
+This repository's own code is MIT, see [LICENSE](LICENSE). The PCSX2 glue in `ext/kz*`, the PS2Recomp submodule, Ash01Live's field of view code and every released build stay GPL-3.0 ([LICENSE-GPL-3.0](LICENSE-GPL-3.0)), because the builds link PCSX2 (GPL-3.0-or-later) and PS2Recomp (GPL-3.0). Killzone is a trademark of Sony Interactive Entertainment.
