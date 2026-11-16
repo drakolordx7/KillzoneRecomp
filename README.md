@@ -1,12 +1,15 @@
 # Killzone for Windows (native PC port)
 
-## Continuation of this project: [KillzoneRecomp-Extended](https://github.com/Tzeentchnet/KillzoneRecomp-Extended)
+## This project is abandoned
 
-## Killzone HD (PS3) recomp: [Project Vekta](https://github.com/gustavomorinaga/project-vekta)
+It is no longer maintained and the repository is archived, so issues and pull requests are closed. Use one of these instead:
+
+- **[KillzoneRecomp-Extended](https://github.com/Tzeentchnet/KillzoneRecomp-Extended)**: continues this port where it stopped.
+- **[Project Vekta](https://github.com/gustavomorinaga/project-vekta)**: a separate PC port of Killzone HD, the PS3 remaster.
+
+---
 
 A native Windows port of Killzone (PlayStation 2, 2004) by [drakolordx7](https://github.com/drakolordx7). The game's code is recompiled to C++ with [PS2Recomp](https://github.com/ran-j/PS2Recomp), so it runs as a PC program with mouse and keyboard aim, high frame rates, higher resolutions and ultrawide support.
-
-> **This project is abandoned.** It is no longer maintained and the repository is archived, so issues and pull requests are closed. The code is free to fork and continue under the license below.
 
 [Download the last build (v0.1.7)](https://github.com/drakolordx7/KillzoneRecomp/releases/latest)
 
